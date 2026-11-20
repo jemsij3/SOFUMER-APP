@@ -1,0 +1,41 @@
+name = "sofumer-marketplace"
+main = "cloudflare/worker.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[vars]
+TELEGRAM_BOT_NAME = "SOFUMER"
+TELEGRAM_BOT_USERNAME = "SofumerBot"
+ALLOW_DEV_SANDBOX = "false"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sofumer-db"
+database_id = "REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "sofumer-media"
+
+[ai]
+binding = "AI"
+
+[[queues.producers]]
+binding = "SOFUMER_QUEUE"
+queue = "sofumer-notifications"
+
+[[queues.consumers]]
+queue = "sofumer-notifications"
+max_batch_size = 10
+max_batch_timeout = 5
+
+[env.development]
+name = "sofumer-marketplace-dev"
+[env.development.vars]
+ALLOW_DEV_SANDBOX = "true"
