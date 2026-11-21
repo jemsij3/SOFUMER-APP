@@ -9,7 +9,7 @@
 
 - **Frontend**: React 19 + TypeScript + Tailwind CSS v4 + Telegram Mini Apps SDK (`https://telegram.org/js/telegram-web-app.js`).
 - **Development / Node.js Runtime**: `server.ts` (Express + Vite + SQLite `better-sqlite3` running the exact D1 SQL migrations + local R2 mirror `storage/r2/` + Cloudflare Workers AI REST adapter).
-- **Production Edge Target**: Cloudflare Workers (`cloudflare/worker.ts`) + Cloudflare D1 (`DB`) + Cloudflare R2 (`MEDIA_BUCKET`) + **Cloudflare Workers AI (`env.AI` binding)** + Cloudflare Queues (`SOFUMER_QUEUE`) + GitHub Actions CI/CD (`.github/workflows/deploy.yml`).
+- **Production Edge Target**: Cloudflare Workers (`cloudflare/worker.ts`) + Cloudflare D1 (`DB`) + Cloudflare R2 (`MEDIA_BUCKET`, Free Tier 10 GB/mo) + **Cloudflare Workers AI (`env.AI` binding)** + GitHub Actions CI/CD (`.github/workflows/deploy.yml`).
 
 ---
 
@@ -54,13 +54,12 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 ---
 
-## 4. Cloudflare D1, R2, Workers AI, Queues & Deployment
+## 4. Cloudflare D1, R2, Workers AI & Deployment
 
-1. **Create Cloudflare resources**:
+1. **Create Cloudflare resources (Free Tier compatible, no Paid Queues plan required)**:
    ```bash
    npx wrangler d1 create sofumer-db
    npx wrangler r2 bucket create sofumer-media
-   npx wrangler queues create sofumer-notifications
    ```
 2. Update `database_id` in `wrangler.toml` with the output ID from `d1 create`.
 3. Verify the Workers AI binding in `wrangler.toml`:

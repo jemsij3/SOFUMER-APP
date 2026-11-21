@@ -27,15 +27,6 @@ bucket_name = "sofumer-media"
 [ai]
 binding = "AI"
 
-[[queues.producers]]
-binding = "SOFUMER_QUEUE"
-queue = "sofumer-notifications"
-
-[[queues.consumers]]
-queue = "sofumer-notifications"
-max_batch_size = 10
-max_batch_timeout = 5
-
 [env.development]
 name = "sofumer-marketplace-dev"
 [env.development.vars]

@@ -269,16 +269,36 @@ async function runTests() {
     assert.equal(rev.status, 201);
   });
 
-  await test('Cloudflare Worker env.AI executes buyer discovery, comparison, seller assist & support using @cf/meta/llama-3.1-8b-instruct', async () => {
+  await test('Cloudflare Worker env.AI & R2 MEDIA_BUCKET execute AI routes and media uploads on Free-tier bindings (no Queues)', async () => {
     const botToken = '123456:EDGE_TEST_TOKEN';
     const sessionSecret = 'edge-test-secret';
     const aiCalls: Array<{ model: string; userPrompt: string }> = [];
+    const r2Objects = new Map<string, { data: ArrayBuffer; contentType: string }>();
 
     const mockEnv: WorkerEnv = {
       DB: createSqliteD1Adapter(),
       MEDIA_BUCKET: {
-        put: async () => ({}),
-        get: async () => null,
+        put: async (key, value, options) => {
+          const data =
+            value instanceof ArrayBuffer
+              ? value
+              : typeof value === 'string'
+              ? new TextEncoder().encode(value).buffer
+              : await new Response(value).arrayBuffer();
+          r2Objects.set(key, {
+            data,
+            contentType: options?.httpMetadata?.contentType || 'application/octet-stream',
+          });
+          return {};
+        },
+        get: async (key) => {
+          const found = r2Objects.get(key);
+          if (!found) return null;
+          return {
+            body: new Response(found.data).body!,
+            httpMetadata: { contentType: found.contentType },
+          };
+        },
       },
       AI: {
         async run(model, inputs) {
@@ -315,7 +335,6 @@ async function runTests() {
           return { response: 'Cloudflare Workers AI response based on real catalog data.' };
         },
       },
-      SOFUMER_QUEUE: { send: async () => {} },
       ASSETS: { fetch: async () => new Response('ok') },
       TELEGRAM_BOT_NAME: 'SOFUMER',
       TELEGRAM_BOT_USERNAME: 'SofumerBot',
@@ -338,6 +357,32 @@ async function runTests() {
     assert.equal(authResp.status, 200);
     const authJson = (await authResp.json()) as { token: string };
     const edgeToken = authJson.token;
+
+    // 0. R2 Media Upload + Retrieval
+    const unauthUpload = await worker.fetch(
+      new Request('https://sofumer.example/api/uploads', { method: 'POST' }),
+      mockEnv
+    );
+    assert.equal(unauthUpload.status, 401);
+
+    const fd = new FormData();
+    fd.append('file', new File([new Uint8Array([137, 80, 78, 71])], 'sample.png', { type: 'image/png' }));
+    const uploadResp = await worker.fetch(
+      new Request('https://sofumer.example/api/uploads', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${edgeToken}` },
+        body: fd,
+      }),
+      mockEnv
+    );
+    assert.equal(uploadResp.status, 201);
+    const uploaded = (await uploadResp.json()) as { url: string; mimeType: string };
+    assert.ok(uploaded.url.startsWith('/r2/'));
+    assert.equal(uploaded.mimeType, 'image/png');
+
+    const r2Get = await worker.fetch(new Request(`https://sofumer.example${uploaded.url}`), mockEnv);
+    assert.equal(r2Get.status, 200);
+    assert.equal(r2Get.headers.get('Content-Type'), 'image/png');
 
     // 1. Buyer discovery
     const r1 = await worker.fetch(

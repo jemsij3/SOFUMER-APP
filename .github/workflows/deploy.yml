@@ -6,7 +6,8 @@ on:
       - main
 
 jobs:
-  build-and-deploy:
+  ci:
+    name: Lint & Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,13 +18,44 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run build
+
+  deploy:
+    name: Deploy to Cloudflare
+    needs: ci
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - name: Check Cloudflare deployment readiness
+        id: cf_ready
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ]; then
+            echo "::notice::Skipping Cloudflare deploy: set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in GitHub Repository Secrets to enable automatic deployment."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -q "REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID" wrangler.toml; then
+            echo "::error::wrangler.toml still has database_id = REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID. Run 'npx wrangler d1 create sofumer-db' and update wrangler.toml."
+            exit 1
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
       - name: Apply D1 Migrations
+        if: steps.cf_ready.outputs.ready == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: d1 migrations apply sofumer-db --remote
       - name: Deploy Cloudflare Worker & Assets
+        if: steps.cf_ready.outputs.ready == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

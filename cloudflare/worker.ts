@@ -4,7 +4,6 @@
  * - DB: Cloudflare D1 Relational Database
  * - MEDIA_BUCKET: Cloudflare R2 Object Storage
  * - AI: Cloudflare Workers AI (`env.AI`)
- * - SOFUMER_QUEUE: Cloudflare Queues for asynchronous Telegram/in-app notifications
  * - ASSETS: Static React SPA build (./dist)
  * - Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, SESSION_SECRET, ADMIN_BOOTSTRAP_SECRET
  */
@@ -13,7 +12,6 @@ export interface Env {
   DB: D1Database;
   MEDIA_BUCKET: R2Bucket;
   AI: WorkersAiBinding;
-  SOFUMER_QUEUE: Queue<NotificationJob>;
   ASSETS: Fetcher;
   TELEGRAM_BOT_NAME: string;
   TELEGRAM_BOT_USERNAME: string;
@@ -24,13 +22,6 @@ export interface Env {
   ADMIN_BOOTSTRAP_SECRET: string;
   CLOUDFLARE_AI_MODEL?: string;
   ALLOW_DEV_SANDBOX?: string;
-}
-
-interface NotificationJob {
-  userId: string;
-  title: string;
-  body: string;
-  telegramId?: string;
 }
 
 export interface D1Database {
@@ -65,13 +56,18 @@ export interface WorkersAiBinding {
   ): Promise<{ response?: string; result?: { response?: string } }>;
 }
 
-interface Queue<T> {
-  send(message: T): Promise<void>;
-}
-
 interface Fetcher {
   fetch(request: Request): Promise<Response>;
 }
+
+const ALLOWED_UPLOAD_MIME: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+};
+
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 
 function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -323,8 +319,11 @@ export default {
     }
 
     // R2 media retrieval
-    if (url.pathname.startsWith('/r2/')) {
-      const key = url.pathname.slice(4);
+    if (url.pathname.startsWith('/r2/') && (request.method === 'GET' || request.method === 'HEAD')) {
+      const key = decodeURIComponent(url.pathname.slice(4)).replace(/^\/+/, '');
+      if (!key || key.includes('..') || !env.MEDIA_BUCKET) {
+        return new Response('Not found', { status: 404 });
+      }
       const obj = await env.MEDIA_BUCKET.get(key);
       if (!obj) return new Response('Not found', { status: 404 });
       return new Response(obj.body, {
@@ -333,6 +332,45 @@ export default {
           'Cache-Control': 'public, max-age=31536000, immutable',
         },
       });
+    }
+
+    // Authenticated R2 media upload (compatible with R2 Free Tier)
+    if (url.pathname === '/api/uploads' && request.method === 'POST') {
+      const userId = await authenticateEdgeRequest(request, env);
+      if (!userId) {
+        return json({ error: 'Authentication required. Please launch SOFUMER via Telegram.' }, 401);
+      }
+      if (!env.MEDIA_BUCKET) {
+        return json({ error: 'Cloudflare R2 bucket (MEDIA_BUCKET) is not bound.' }, 503);
+      }
+
+      const formData = await request.formData().catch(() => null);
+      const uploaded = formData?.get('file');
+      if (!uploaded || typeof uploaded === 'string') {
+        return json({ error: 'No file provided.' }, 400);
+      }
+
+      const ext = ALLOWED_UPLOAD_MIME[uploaded.type];
+      if (!ext) {
+        return json({ error: 'Unsupported file type. Allowed: JPEG, PNG, WebP, GIF (max 5MB).' }, 400);
+      }
+      if (uploaded.size <= 0 || uploaded.size > MAX_UPLOAD_BYTES) {
+        return json({ error: 'File must be between 1 byte and 5MB.' }, 400);
+      }
+
+      const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      const key = `${Date.now()}-${randomHex}${ext}`;
+
+      await env.MEDIA_BUCKET.put(key, await uploaded.arrayBuffer(), {
+        httpMetadata: { contentType: uploaded.type },
+      });
+
+      return json(
+        { url: `/r2/${key}`, size: uploaded.size, mimeType: uploaded.type },
+        201
+      );
     }
 
     // Telegram Bot Webhook with Secret Verification & D1 Deduplication
@@ -688,22 +726,5 @@ export default {
 
     // Serve SPA Assets
     return env.ASSETS.fetch(request);
-  },
-
-  async queue(batch: { messages: Array<{ body: NotificationJob }> }, env: Env): Promise<void> {
-    for (const msg of batch.messages) {
-      const job = msg.body;
-      if (job.telegramId && env.TELEGRAM_BOT_TOKEN) {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: job.telegramId,
-            text: `<b>${job.title}</b>\n${job.body}`,
-            parse_mode: 'HTML',
-          }),
-        });
-      }
-    }
   },
 };
