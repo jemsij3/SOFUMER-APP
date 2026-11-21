@@ -9,7 +9,7 @@
 
 - **Frontend**: React 19 + TypeScript + Tailwind CSS v4 + Telegram Mini Apps SDK (`https://telegram.org/js/telegram-web-app.js`).
 - **Development / Node.js Runtime**: `server.ts` (Express + Vite + SQLite `better-sqlite3` running the exact D1 SQL migrations + local R2 mirror `storage/r2/` + Cloudflare Workers AI REST adapter).
-- **Production Edge Target**: Cloudflare Workers (`cloudflare/worker.ts`) + Cloudflare D1 (`DB`) + Cloudflare R2 (`MEDIA_BUCKET`, Free Tier 10 GB/mo) + **Cloudflare Workers AI (`env.AI` binding)** + GitHub Actions CI/CD (`.github/workflows/deploy.yml`).
+- **Production Edge Target**: Cloudflare Workers (`cloudflare/worker.ts`) + Cloudflare D1 (`DB` / `sofumer-db`) + **Cloudflare Workers AI (`env.AI` binding)** + GitHub Actions CI/CD (`.github/workflows/deploy.yml`). (R2 media bucket omitted for now; can be enabled later.)
 
 ---
 
@@ -45,29 +45,21 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 | `MINI_APP_URL` | Env Var | Yes | Public HTTPS URL of the SOFUMER Mini App |
 | `SESSION_SECRET` | Server Secret | Yes (Prod) | Signs user and admin session token hashes |
 | `ADMIN_BOOTSTRAP_SECRET` | Server Secret | Yes | Server-side passcode to authenticate the initial Owner Admin |
-| `CLOUDFLARE_AI_MODEL` | `wrangler.toml` Var | Yes | Cloudflare Workers AI model (default: `@cf/meta/llama-3.1-8b-instruct`) |
+| `CLOUDFLARE_AI_MODEL` | `wrangler.jsonc` Var | Yes | Cloudflare Workers AI model (default: `@cf/meta/llama-3.1-8b-instruct`) |
 | `CLOUDFLARE_ACCOUNT_ID` | Local Dev Only | Optional | Used only when running Node.js `server.ts` outside Cloudflare Workers |
 | `CLOUDFLARE_AI_API_TOKEN` | Local Dev Only | Optional | Workers AI REST token when testing AI from Node.js outside Wrangler |
 | `ALLOW_DEV_SANDBOX` | Env Var | Prod: `false` | Enables cryptographic preview sandbox outside Telegram in dev only |
 
-> **Note:** In Cloudflare Workers production, AI runs natively via the `[ai]` binding (`env.AI`) declared in `wrangler.toml`. No external AI API key is needed in production.
+> **Note:** In Cloudflare Workers production, AI runs natively via the `ai` binding (`env.AI`) declared in `wrangler.jsonc`. No external AI API key is needed in production.
 
 ---
 
-## 4. Cloudflare D1, R2, Workers AI & Deployment
+## 4. Cloudflare D1, Workers AI & Deployment
 
-1. **Create Cloudflare resources (Free Tier compatible, no Paid Queues plan required)**:
-   ```bash
-   npx wrangler d1 create sofumer-db
-   npx wrangler r2 bucket create sofumer-media
-   ```
-2. Update `database_id` in `wrangler.toml` with the output ID from `d1 create`.
-3. Verify the Workers AI binding in `wrangler.toml`:
-   ```toml
-   [ai]
-   binding = "AI"
-   ```
-4. **Apply version-controlled D1 migrations**:
+1. **D1 Database (`sofumer-db`)**:
+   - Configured in `wrangler.jsonc` with `database_id: "37387526-bf6a-4a2d-bf61-70dece9eb2f5"` (`WEUR`).
+   - R2 bucket (`MEDIA_BUCKET`) is intentionally excluded for now and can be added later.
+2. **Apply version-controlled D1 migrations**:
    ```bash
    npx wrangler d1 migrations apply sofumer-db --remote
    ```

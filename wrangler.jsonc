@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sofumer-app",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-21",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "vars": {
+    "TELEGRAM_BOT_NAME": "SOFUMER",
+    "TELEGRAM_BOT_USERNAME": "SofumerBot",
+    "CLOUDFLARE_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct",
+    "ALLOW_DEV_SANDBOX": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sofumer-db",
+      "database_id": "37387526-bf6a-4a2d-bf61-70dece9eb2f5",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}

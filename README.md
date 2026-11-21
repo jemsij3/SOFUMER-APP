@@ -5,7 +5,7 @@
 SOFUMER is an independent global multi-vendor Telegram Mini App marketplace connecting buyers, sellers, individuals, and businesses across physical products, digital downloads, software licenses, and professional services.
 
 - **Production Worker**: `sofumer-app`
-- **Cloudflare Runtime**: Cloudflare Workers (`src/index.js` → `cloudflare/worker.ts`) + Cloudflare D1 (`DB`) + Cloudflare R2 (`MEDIA_BUCKET`) + Cloudflare Workers AI (`env.AI`) + Static Assets (`./dist`)
+- **Cloudflare Runtime**: Cloudflare Workers (`src/index.js` → `cloudflare/worker.ts`) + Cloudflare D1 (`DB` / `sofumer-db`) + Cloudflare Workers AI (`env.AI`) + Static Assets (`./dist`)
 - **Frontend**: React 19 + TypeScript + Tailwind CSS v4 + Telegram Mini Apps SDK
 
 ---
@@ -33,7 +33,7 @@ sofumer-app/
 │   └── worker.test.js          # Vitest + @cloudflare/vitest-pool-workers Worker test suite
 ├── tests/
 │   └── integration.ts          # Full end-to-end API & D1 SQLite adapter test suite
-├── wrangler.toml               # Worker config (`name = "sofumer-app"`, `main = "src/index.js"`)
+├── wrangler.jsonc              # Worker config (`name: "sofumer-app"`, D1 `sofumer-db`, AI)
 ├── vitest.config.ts            # Cloudflare Workers pool test configuration
 ├── eslint.config.mjs           # ESLint configuration
 ├── .dev.vars.example           # Local Wrangler secret template (never commit `.dev.vars`)
@@ -80,22 +80,17 @@ npm run build
 npm test
 ```
 
-## 4. Cloudflare Resource & Secret Setup
+## 4. Cloudflare D1, Secrets & Remote Migrations
 
-Create the Cloudflare D1 database and R2 bucket (Free Tier compatible, no Paid Queues plan required):
+D1 database `sofumer-db` (`37387526-bf6a-4a2d-bf61-70dece9eb2f5`, region `WEUR`) is already configured in `wrangler.jsonc`. R2 object storage is intentionally omitted for now and can be added later.
 
-```bash
-npx wrangler d1 create sofumer-db
-npx wrangler r2 bucket create sofumer-media
-```
-
-Update `database_id` in `wrangler.toml` with the UUID printed by `wrangler d1 create`, then apply remote migrations:
+Apply the version-controlled D1 schema migrations remotely:
 
 ```bash
 npx wrangler d1 migrations apply sofumer-db --remote
 ```
 
-Configure production secrets (never stored in `wrangler.toml` or Git):
+Configure production secrets (never stored in `wrangler.jsonc` or Git):
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN

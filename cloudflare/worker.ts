@@ -24,16 +24,7 @@ import { handleCommerceAndAccountRoutes } from './routes-commerce.ts';
 import { handleAdminRoutes } from './routes-admin.ts';
 import { handleAiRoutes } from './routes-ai.ts';
 
-export type { Env, D1Database, R2Bucket, WorkersAiBinding } from './helpers.ts';
-
-const ALLOWED_UPLOAD_MIME: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/webp': '.webp',
-  'image/gif': '.gif',
-};
-
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+export type { Env, D1Database, WorkersAiBinding } from './helpers.ts';
 
 const SOFUMER_FALLBACK_HTML = `<!doctype html>
 <html lang="en">
@@ -366,54 +357,17 @@ async function handleMediaRoutes(
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return methodNotAllowed(['GET', 'HEAD']);
     }
-    const key = decodeURIComponent(url.pathname.slice(4)).replace(/^\/+/, '');
-    if (!key || key.includes('..') || !env.MEDIA_BUCKET) {
-      return json({ error: 'Media object not found.' }, 404);
-    }
-    const obj = await env.MEDIA_BUCKET.get(key);
-    if (!obj) return json({ error: 'Media object not found.' }, 404);
-    return new Response(obj.body, {
-      status: 200,
-      headers: {
-        'Content-Type': obj.httpMetadata?.contentType || 'application/octet-stream',
-        'Cache-Control': 'public, max-age=31536000, immutable',
-        'X-Content-Type-Options': 'nosniff',
-      },
-    });
+    return json({ error: 'Media storage (R2) is currently disabled and will be added later.' }, 404);
   }
 
   if (url.pathname === '/api/uploads') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
-    if (!env.MEDIA_BUCKET) {
-      return json({ error: 'Cloudflare R2 bucket (MEDIA_BUCKET) is not bound.' }, 503);
-    }
-
-    const formData = await request.formData().catch(() => null);
-    const uploaded = formData?.get('file');
-    if (!uploaded || typeof uploaded === 'string') {
-      return json({ error: 'No file provided.' }, 400);
-    }
-
-    const ext = ALLOWED_UPLOAD_MIME[uploaded.type];
-    if (!ext) {
-      return json({ error: 'Unsupported file type. Allowed: JPEG, PNG, WebP, GIF (max 5MB).' }, 400);
-    }
-    if (uploaded.size <= 0 || uploaded.size > MAX_UPLOAD_BYTES) {
-      return json({ error: 'File must be between 1 byte and 5MB.' }, 400);
-    }
-
-    const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(8)))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-    const key = `${Date.now()}-${randomHex}${ext}`;
-
-    await env.MEDIA_BUCKET.put(key, await uploaded.arrayBuffer(), {
-      httpMetadata: { contentType: uploaded.type },
-    });
-
-    return json({ url: `/r2/${key}`, size: uploaded.size, mimeType: uploaded.type }, 201);
+    return json(
+      { error: 'Media upload storage (R2) is temporarily disabled and will be added later.' },
+      503
+    );
   }
 
   return null;
@@ -465,7 +419,6 @@ export default {
           aiModel: env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
           telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
           dbBound: Boolean(env.DB),
-          r2Bound: Boolean(env.MEDIA_BUCKET),
           aiBound: Boolean(env.AI),
           status: 'ok',
         });

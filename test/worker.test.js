@@ -24,6 +24,12 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     expect(body.service).toBe('SOFUMER');
     expect(body.status).toBe('ok');
     expect(body.runtime).toBe('cloudflare-workers');
+    expect(body.dbBound).toBe(true);
+    expect(body.r2Bound).toBeUndefined();
+
+    const r2Res = await SELF.fetch('https://sofumer-app.derartuaman8.workers.dev/r2/sample.png');
+    expect(r2Res.status).toBe(404);
+    expect(r2Res.headers.get('Content-Type')).toBe('application/json;charset=UTF-8');
   });
 
   it('2 & 3. Main application responds with real SOFUMER HTML and text/html;charset=UTF-8', async () => {

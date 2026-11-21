@@ -63,14 +63,15 @@ async function runTests() {
   await test('No Gemini SDK or GEMINI_API_KEY references remain in codebase config/source', async () => {
     const pkg = fs.readFileSync('package.json', 'utf-8');
     const envEx = fs.readFileSync('.env.example', 'utf-8');
-    const wrangler = fs.readFileSync('wrangler.toml', 'utf-8');
+    const wrangler = fs.readFileSync('wrangler.jsonc', 'utf-8');
     const workerSrc = fs.readFileSync('cloudflare/worker.ts', 'utf-8');
     const serverAi = fs.readFileSync('server/ai.ts', 'utf-8');
     assert.ok(!pkg.includes('@google/genai'));
     assert.ok(!envEx.includes('GEMINI_API_KEY'));
     assert.ok(!workerSrc.includes('GEMINI_API_KEY'));
     assert.ok(!serverAi.includes('@google/genai'));
-    assert.ok(wrangler.includes('[ai]') && wrangler.includes('binding = "AI"'));
+    assert.ok(wrangler.includes('"binding": "AI"') && wrangler.includes('"binding": "DB"'));
+    assert.ok(!wrangler.includes('r2_buckets'));
     assert.ok(wrangler.includes('@cf/meta/llama-3.1-8b-instruct'));
   });
 
@@ -269,37 +270,13 @@ async function runTests() {
     assert.equal(rev.status, 201);
   });
 
-  await test('Cloudflare Worker env.AI & R2 MEDIA_BUCKET execute AI routes and media uploads on Free-tier bindings (no Queues)', async () => {
+  await test('Cloudflare Worker env.AI executes AI routes on D1 without R2 or Queues', async () => {
     const botToken = '123456:EDGE_TEST_TOKEN';
     const sessionSecret = 'edge-test-secret';
     const aiCalls: Array<{ model: string; userPrompt: string }> = [];
-    const r2Objects = new Map<string, { data: ArrayBuffer; contentType: string }>();
 
     const mockEnv: WorkerEnv = {
       DB: createSqliteD1Adapter(),
-      MEDIA_BUCKET: {
-        put: async (key, value, options) => {
-          const data =
-            value instanceof ArrayBuffer
-              ? value
-              : typeof value === 'string'
-              ? new TextEncoder().encode(value).buffer
-              : await new Response(value).arrayBuffer();
-          r2Objects.set(key, {
-            data,
-            contentType: options?.httpMetadata?.contentType || 'application/octet-stream',
-          });
-          return {};
-        },
-        get: async (key) => {
-          const found = r2Objects.get(key);
-          if (!found) return null;
-          return {
-            body: new Response(found.data).body!,
-            httpMetadata: { contentType: found.contentType },
-          };
-        },
-      },
       AI: {
         async run(model, inputs) {
           const userMsg = inputs.messages.find((m) => m.role === 'user')?.content || '';
@@ -358,13 +335,7 @@ async function runTests() {
     const authJson = (await authResp.json()) as { token: string };
     const edgeToken = authJson.token;
 
-    // 0. R2 Media Upload + Retrieval
-    const unauthUpload = await worker.fetch(
-      new Request('https://sofumer.example/api/uploads', { method: 'POST' }),
-      mockEnv
-    );
-    assert.equal(unauthUpload.status, 401);
-
+    // 0. R2 is disabled for now -> /api/uploads returns 503 safely and /r2/* returns 404
     const fd = new FormData();
     fd.append('file', new File([new Uint8Array([137, 80, 78, 71])], 'sample.png', { type: 'image/png' }));
     const uploadResp = await worker.fetch(
@@ -375,14 +346,10 @@ async function runTests() {
       }),
       mockEnv
     );
-    assert.equal(uploadResp.status, 201);
-    const uploaded = (await uploadResp.json()) as { url: string; mimeType: string };
-    assert.ok(uploaded.url.startsWith('/r2/'));
-    assert.equal(uploaded.mimeType, 'image/png');
+    assert.equal(uploadResp.status, 503);
 
-    const r2Get = await worker.fetch(new Request(`https://sofumer.example${uploaded.url}`), mockEnv);
-    assert.equal(r2Get.status, 200);
-    assert.equal(r2Get.headers.get('Content-Type'), 'image/png');
+    const r2Get = await worker.fetch(new Request('https://sofumer.example/r2/sample.png'), mockEnv);
+    assert.equal(r2Get.status, 404);
 
     // 1. Buyer discovery
     const r1 = await worker.fetch(

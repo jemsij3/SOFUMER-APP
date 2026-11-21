@@ -8,7 +8,7 @@ export default defineConfig(async () => {
     plugins: [
       cloudflareTest({
         remoteBindings: false,
-        wrangler: { configPath: './wrangler.toml' },
+        wrangler: { configPath: './wrangler.jsonc' },
         miniflare: {
           compatibilityDate: '2026-08-15',
           bindings: {

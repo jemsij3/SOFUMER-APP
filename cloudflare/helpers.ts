@@ -14,15 +14,6 @@ export interface D1Database {
   prepare(query: string): D1PreparedStatement;
 }
 
-export interface R2Bucket {
-  put(
-    key: string,
-    value: ReadableStream | ArrayBuffer | string,
-    options?: { httpMetadata?: { contentType?: string } }
-  ): Promise<unknown>;
-  get(key: string): Promise<{ body: ReadableStream; httpMetadata?: { contentType?: string } } | null>;
-}
-
 export interface WorkersAiBinding {
   run(
     model: string,
@@ -46,7 +37,6 @@ export interface ExecutionContextLike {
 
 export interface Env {
   DB?: D1Database;
-  MEDIA_BUCKET?: R2Bucket;
   AI?: WorkersAiBinding;
   ASSETS?: Fetcher;
   TELEGRAM_BOT_NAME?: string;
