@@ -1,25 +1,103 @@
-import { GoogleGenAI, Type } from '@google/genai';
 import { db, newId } from './db.ts';
 
-const VALID_MODELS = new Set([
-  'gemini-4-hydrogen',
-  'gemini-3.1-flash-lite',
-  'gemini-4-neon',
-  'gemini-4-carbon',
-  'gemini-4-argon',
+export const DEFAULT_CLOUDFLARE_AI_MODEL =
+  process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct';
+
+const VALID_CF_MODELS = new Set([
+  '@cf/meta/llama-3.1-8b-instruct',
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/qwen/qwen2.5-7b-instruct',
+  '@cf/mistral/mistral-7b-instruct-v0.2',
 ]);
 
-function getAiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') return null;
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
+export interface WorkersAiBinding {
+  run(
+    model: string,
+    inputs: {
+      messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+      max_tokens?: number;
+      temperature?: number;
+      response_format?: { type: 'json_object' };
+    }
+  ): Promise<{ response?: string; result?: { response?: string } }>;
+}
+
+let registeredAiBinding: WorkersAiBinding | null = null;
+
+export function setWorkersAiBinding(binding: WorkersAiBinding | null) {
+  registeredAiBinding = binding;
+}
+
+function extractJsonObject(raw: string): Record<string, unknown> {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced ? fenced[1] : trimmed).trim();
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    return JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>;
+  }
+  return JSON.parse(candidate) as Record<string, unknown>;
+}
+
+async function invokeCloudflareWorkersAi(
+  modelName: string,
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  expectJson = false
+): Promise<string> {
+  if (registeredAiBinding) {
+    const out = await registeredAiBinding.run(modelName, {
+      messages,
+      max_tokens: 900,
+      temperature: 0.2,
+      ...(expectJson ? { response_format: { type: 'json_object' } } : {}),
+    });
+    const text = out?.response ?? out?.result?.response ?? '';
+    if (!text) throw new Error('Empty response returned by Cloudflare Workers AI binding.');
+    return text;
+  }
+
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const apiToken = process.env.CLOUDFLARE_AI_API_TOKEN;
+  if (!accountId || !apiToken) {
+    throw new Error(
+      'Cloudflare Workers AI is not bound in this local Node.js process. Run via Cloudflare Workers (`env.AI` binding) or configure CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_AI_API_TOKEN for local Workers AI REST execution.'
+    );
+  }
+
+  const resp = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${modelName}`,
+    {
+      method: 'POST',
       headers: {
-        'User-Agent': 'aistudio-build',
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
       },
-    },
-  });
+      body: JSON.stringify({
+        messages,
+        max_tokens: 900,
+        temperature: 0.2,
+        ...(expectJson ? { response_format: { type: 'json_object' } } : {}),
+      }),
+    }
+  );
+
+  const payload = (await resp.json().catch(() => ({}))) as {
+    success?: boolean;
+    errors?: Array<{ message?: string }>;
+    result?: { response?: string };
+  };
+
+  if (!resp.ok || payload.success === false) {
+    const errMsg = payload.errors?.[0]?.message || `Cloudflare Workers AI request failed (${resp.status})`;
+    throw new Error(errMsg);
+  }
+
+  const text = payload.result?.response || '';
+  if (!text) {
+    throw new Error('Empty response returned from Cloudflare Workers AI.');
+  }
+  return text;
 }
 
 export interface AiAccessCheck {
@@ -35,11 +113,13 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     .prepare("SELECT is_enabled, model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'")
     .get() as { is_enabled: number; model_name: string } | undefined;
 
+  const fallbackModel = DEFAULT_CLOUDFLARE_AI_MODEL;
+
   if (!globalSetting || !globalSetting.is_enabled) {
     return {
       allowed: false,
       reason: 'AI services are currently disabled globally by platform administrators.',
-      modelName: globalSetting?.model_name || 'gemini-4-hydrogen',
+      modelName: globalSetting?.model_name || fallbackModel,
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -53,7 +133,7 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: `The "${featureKey}" AI feature is currently disabled by administrators.`,
-      modelName: featureSetting.model_name,
+      modelName: featureSetting.model_name || fallbackModel,
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -67,13 +147,12 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: userPerm.reason || 'Your AI access has been restricted by an administrator.',
-      modelName: featureSetting?.model_name || globalSetting.model_name,
+      modelName: featureSetting?.model_name || globalSetting.model_name || fallbackModel,
       dailyLimit: 0,
       usedToday: 0,
     };
   }
 
-  // Determine daily limit from subscription plan or feature default
   const subRow = db
     .prepare(
       `SELECT sp.ai_daily_limit
@@ -101,14 +180,15 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: `Daily AI usage limit reached (${usedRow.cnt}/${dailyLimit}). Upgrade your seller plan or wait until tomorrow.`,
-      modelName: featureSetting?.model_name || globalSetting.model_name,
+      modelName: featureSetting?.model_name || globalSetting.model_name || fallbackModel,
       dailyLimit,
       usedToday: usedRow.cnt,
     };
   }
 
-  const rawModel = featureSetting?.model_name || globalSetting.model_name || 'gemini-4-hydrogen';
-  const modelName = VALID_MODELS.has(rawModel) ? rawModel : 'gemini-4-hydrogen';
+  const configuredEnvModel = process.env.CLOUDFLARE_AI_MODEL;
+  const rawModel = configuredEnvModel || featureSetting?.model_name || globalSetting.model_name || fallbackModel;
+  const modelName = VALID_CF_MODELS.has(rawModel) ? rawModel : DEFAULT_CLOUDFLARE_AI_MODEL;
 
   return {
     allowed: true,
@@ -152,7 +232,6 @@ export async function runBuyerDiscoveryAi(userId: string, query: string) {
     throw Object.assign(new Error(perm.reason || 'AI access denied'), { statusCode: 403 });
   }
 
-  // Fetch all published real marketplace products + shops
   const catalog = db
     .prepare(
       `SELECT p.id, p.title, p.description, p.price, p.currency, p.listing_type, p.condition,
@@ -168,45 +247,24 @@ export async function runBuyerDiscoveryAi(userId: string, query: string) {
     )
     .all() as Record<string, unknown>[];
 
-  const ai = getAiClient();
-  if (!ai) {
-    const err = 'GEMINI_API_KEY is not configured on the server. Set GEMINI_API_KEY in Settings > Secrets.';
-    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, err);
-    throw Object.assign(new Error(err), { statusCode: 503 });
-  }
-
   try {
-    const response = await ai.models.generateContent({
-      model: perm.modelName,
-      contents: `User query: "${query}"\n\nReal SOFUMER published catalog records (JSON):\n${JSON.stringify(catalog)}`,
-      config: {
-        systemInstruction:
-          'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, sellers, or availability. If the catalog is empty or no items match, say so honestly and clearly explain what is missing.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            answer: {
-              type: Type.STRING,
-              description: 'Helpful, concise marketplace answer grounded strictly in the catalog JSON.',
-            },
-            matchedProductIds: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: 'Exact product id strings from the catalog JSON that match the buyer request.',
-            },
-            suggestedFollowUps: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: '2-3 helpful follow-up questions the buyer can ask.',
-            },
-          },
-          required: ['answer', 'matchedProductIds', 'suggestedFollowUps'],
+    const raw = await invokeCloudflareWorkersAi(
+      perm.modelName,
+      [
+        {
+          role: 'system',
+          content:
+            'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, sellers, or availability. If the catalog is empty or no items match, say so honestly. Respond ONLY with a valid JSON object matching: {"answer": string, "matchedProductIds": string[], "suggestedFollowUps": string[]}.',
         },
-      },
-    });
+        {
+          role: 'user',
+          content: `Buyer query: "${query}"\n\nPublished SOFUMER catalog JSON:\n${JSON.stringify(catalog)}`,
+        },
+      ],
+      true
+    );
 
-    const parsed = JSON.parse((response.text || '{}').trim());
+    const parsed = extractJsonObject(raw);
     const validIds = new Set(catalog.map((c) => String(c.id)));
     const matchedIds = Array.isArray(parsed.matchedProductIds)
       ? parsed.matchedProductIds.filter((id: unknown) => validIds.has(String(id)))
@@ -214,18 +272,22 @@ export async function runBuyerDiscoveryAi(userId: string, query: string) {
     const matchedProducts = catalog.filter((c) => matchedIds.includes(String(c.id)));
 
     const latency = Date.now() - start;
-    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'success', latency, Math.ceil((response.text?.length || 100) / 4));
+    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'success', latency, Math.ceil(raw.length / 4));
 
     return {
       answer: String(parsed.answer || ''),
       matchedProducts,
-      suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps) ? parsed.suggestedFollowUps.slice(0, 3) : [],
+      suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps)
+        ? parsed.suggestedFollowUps.slice(0, 3).map(String)
+        : [],
       catalogCount: catalog.length,
+      provider: 'cloudflare-workers-ai',
+      model: perm.modelName,
     };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'AI generation failed';
+    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI generation failed';
     logAiUsage(userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 502 });
+    throw Object.assign(new Error(msg), { statusCode: 503 });
   }
 }
 
@@ -256,28 +318,25 @@ export async function runBuyerCompareAi(userId: string, productIds: string[], fo
     throw Object.assign(new Error('No published listings found for comparison.'), { statusCode: 404 });
   }
 
-  const ai = getAiClient();
-  if (!ai) {
-    const err = 'GEMINI_API_KEY is not configured on the server.';
-    logAiUsage(userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, err);
-    throw Object.assign(new Error(err), { statusCode: 503 });
-  }
-
   try {
-    const response = await ai.models.generateContent({
-      model: perm.modelName,
-      contents: `Compare these SOFUMER listings objectively.${focusQuestion ? ` Focus: ${focusQuestion}` : ''}\n\nListings JSON:\n${JSON.stringify(products)}`,
-      config: {
-        systemInstruction:
+    const comparison = await invokeCloudflareWorkersAi(perm.modelName, [
+      {
+        role: 'system',
+        content:
           'You compare real SOFUMER marketplace listings strictly using the provided JSON fields. Highlight price, currency, delivery/shipping, return policy, and seller country without inventing unstated specs.',
       },
-    });
-    logAiUsage(userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, 250);
-    return { comparison: response.text || '', products };
+      {
+        role: 'user',
+        content: `Compare these SOFUMER listings objectively.${focusQuestion ? ` Focus: ${focusQuestion}` : ''}\n\nListings JSON:\n${JSON.stringify(products)}`,
+      },
+    ]);
+
+    logAiUsage(userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, Math.ceil(comparison.length / 4));
+    return { comparison, products, provider: 'cloudflare-workers-ai', model: perm.modelName };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'AI comparison failed';
+    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI comparison failed';
     logAiUsage(userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 502 });
+    throw Object.assign(new Error(msg), { statusCode: 503 });
   }
 }
 
@@ -306,32 +365,25 @@ export async function runSellerListingAi(
     throw Object.assign(new Error(perm.reason || 'AI access denied'), { statusCode: 403 });
   }
 
-  const ai = getAiClient();
-  if (!ai) {
-    const err = 'GEMINI_API_KEY is not configured on the server.';
-    logAiUsage(userId, featureKey, perm.modelName, payload.action, 'error', Date.now() - start, 0, err);
-    throw Object.assign(new Error(err), { statusCode: 503 });
-  }
-
   try {
     if (payload.action === 'translate') {
-      const response = await ai.models.generateContent({
-        model: perm.modelName,
-        contents: `Translate this marketplace listing into ${payload.targetLanguage || 'French'} while keeping commercial clarity.\nTitle: ${payload.title || ''}\nDescription: ${payload.notes || ''}`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              translatedTitle: { type: Type.STRING },
-              translatedDescription: { type: Type.STRING },
-            },
-            required: ['translatedTitle', 'translatedDescription'],
+      const raw = await invokeCloudflareWorkersAi(
+        perm.modelName,
+        [
+          {
+            role: 'system',
+            content:
+              'Translate marketplace listings accurately into the requested target language. Respond ONLY with JSON: {"translatedTitle": string, "translatedDescription": string}.',
           },
-        },
-      });
-      logAiUsage(userId, featureKey, perm.modelName, `translate:${payload.targetLanguage}`, 'success', Date.now() - start, 180);
-      return JSON.parse((response.text || '{}').trim());
+          {
+            role: 'user',
+            content: `Target Language: ${payload.targetLanguage || 'French'}\nTitle: ${payload.title || ''}\nDescription: ${payload.notes || ''}`,
+          },
+        ],
+        true
+      );
+      logAiUsage(userId, featureKey, perm.modelName, `translate:${payload.targetLanguage}`, 'success', Date.now() - start, Math.ceil(raw.length / 4));
+      return extractJsonObject(raw);
     }
 
     if (payload.action === 'analytics') {
@@ -346,55 +398,46 @@ export async function runSellerListingAi(
            FROM shops s WHERE s.user_id = ? LIMIT 1`
         )
         .get(userId);
-      const response = await ai.models.generateContent({
-        model: perm.modelName,
-        contents: `Explain these real SOFUMER shop metrics and suggest concrete improvements for the seller:\n${JSON.stringify(shopStats || {})}`,
-        config: {
-          systemInstruction: 'Provide clear, actionable analytics interpretation based ONLY on the provided real shop numbers. Never invent metrics.',
+
+      const insights = await invokeCloudflareWorkersAi(perm.modelName, [
+        {
+          role: 'system',
+          content:
+            'Provide clear, actionable analytics interpretation based ONLY on the provided real SOFUMER shop metrics. Never invent metrics.',
         },
-      });
-      logAiUsage(userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, 200);
-      return { insights: response.text || '', stats: shopStats };
+        {
+          role: 'user',
+          content: `Explain these real SOFUMER shop metrics and suggest concrete improvements:\n${JSON.stringify(shopStats || {})}`,
+        },
+      ]);
+
+      logAiUsage(userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, Math.ceil(insights.length / 4));
+      return { insights, stats: shopStats, provider: 'cloudflare-workers-ai', model: perm.modelName };
     }
 
-    // generate_listing
     const categories = db.prepare('SELECT id, name FROM categories WHERE is_active = 1').all();
-    const response = await ai.models.generateContent({
-      model: perm.modelName,
-      contents: `Generate a structured marketplace listing draft for review by the seller.\nListing Type: ${payload.listingType || 'physical'}\nDraft Title: ${payload.title || ''}\nSeller Notes: ${payload.notes || ''}\nAvailable Categories: ${JSON.stringify(categories)}`,
-      config: {
-        systemInstruction:
-          'You assist SOFUMER sellers in drafting accurate, clear, trustworthy listings. All output is a draft for seller review before publishing. Never invent fake certifications or deceptive claims.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            suggestedTitle: { type: Type.STRING },
-            improvedDescription: { type: Type.STRING },
-            suggestedCategoryId: { type: Type.STRING },
-            keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
-            faqs: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  question: { type: Type.STRING },
-                  answer: { type: Type.STRING },
-                },
-                required: ['question', 'answer'],
-              },
-            },
-          },
-          required: ['suggestedTitle', 'improvedDescription', 'suggestedCategoryId', 'keywords', 'faqs'],
+    const raw = await invokeCloudflareWorkersAi(
+      perm.modelName,
+      [
+        {
+          role: 'system',
+          content:
+            'You assist SOFUMER sellers in drafting accurate, clear, trustworthy listings for seller review before publication. Never invent fake certifications. Respond ONLY with valid JSON: {"suggestedTitle": string, "improvedDescription": string, "suggestedCategoryId": string, "keywords": string[], "faqs": [{"question": string, "answer": string}]}.',
         },
-      },
-    });
-    logAiUsage(userId, featureKey, perm.modelName, payload.title || 'listing_draft', 'success', Date.now() - start, 300);
-    return JSON.parse((response.text || '{}').trim());
+        {
+          role: 'user',
+          content: `Listing Type: ${payload.listingType || 'physical'}\nDraft Title: ${payload.title || ''}\nSeller Notes: ${payload.notes || ''}\nAvailable Categories: ${JSON.stringify(categories)}`,
+        },
+      ],
+      true
+    );
+
+    logAiUsage(userId, featureKey, perm.modelName, payload.title || 'listing_draft', 'success', Date.now() - start, Math.ceil(raw.length / 4));
+    return extractJsonObject(raw);
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Seller AI failed';
+    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI seller assist failed';
     logAiUsage(userId, featureKey, perm.modelName, payload.action, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 502 });
+    throw Object.assign(new Error(msg), { statusCode: 503 });
   }
 }
 
@@ -406,27 +449,24 @@ export async function runPlatformSupportAi(userId: string, question: string) {
     throw Object.assign(new Error(perm.reason || 'AI access denied'), { statusCode: 403 });
   }
 
-  const ai = getAiClient();
-  if (!ai) {
-    const err = 'GEMINI_API_KEY is not configured on the server.';
-    logAiUsage(userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, err);
-    throw Object.assign(new Error(err), { statusCode: 503 });
-  }
-
   try {
-    const response = await ai.models.generateContent({
-      model: perm.modelName,
-      contents: question,
-      config: {
-        systemInstruction:
+    const reply = await invokeCloudflareWorkersAi(perm.modelName, [
+      {
+        role: 'system',
+        content:
           'You are SOFUMER Platform Support AI. Explain SOFUMER marketplace features accurately: SOFUMER connects buyers and sellers globally via Telegram Mini App; transactions are direct buyer-to-seller arrangements (SOFUMER does not hold escrow or process mandatory platform payments); sellers can list Physical products, Digital products, and Professional Services under Free, Pro, or Business plans; users can report suspicious listings for human review.',
       },
-    });
-    logAiUsage(userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, 180);
-    return { reply: response.text || '' };
+      {
+        role: 'user',
+        content: question,
+      },
+    ]);
+
+    logAiUsage(userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, Math.ceil(reply.length / 4));
+    return { reply, provider: 'cloudflare-workers-ai', model: perm.modelName };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Platform support AI failed';
+    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI support failed';
     logAiUsage(userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 502 });
+    throw Object.assign(new Error(msg), { statusCode: 503 });
   }
 }

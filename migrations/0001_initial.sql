@@ -518,7 +518,7 @@ CREATE TABLE IF NOT EXISTS ai_feature_settings (
   label TEXT NOT NULL,
   description TEXT DEFAULT '',
   is_enabled INTEGER NOT NULL DEFAULT 1,
-  model_name TEXT NOT NULL DEFAULT 'gemini-4-hydrogen',
+  model_name TEXT NOT NULL DEFAULT '@cf/meta/llama-3.1-8b-instruct',
   daily_limit_per_user INTEGER NOT NULL DEFAULT 30,
   updated_by TEXT DEFAULT 'system',
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))

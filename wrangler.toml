@@ -11,6 +11,7 @@ not_found_handling = "single-page-application"
 [vars]
 TELEGRAM_BOT_NAME = "SOFUMER"
 TELEGRAM_BOT_USERNAME = "SofumerBot"
+CLOUDFLARE_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
 ALLOW_DEV_SANDBOX = "false"
 
 [[d1_databases]]
@@ -38,4 +39,5 @@ max_batch_timeout = 5
 [env.development]
 name = "sofumer-marketplace-dev"
 [env.development.vars]
+CLOUDFLARE_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
 ALLOW_DEV_SANDBOX = "true"

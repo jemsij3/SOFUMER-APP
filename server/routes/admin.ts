@@ -548,7 +548,10 @@ adminRouter.get('/ai', requireAdmin, (_req, res) => {
 
 adminRouter.patch('/ai/features/:featureKey', requireAdmin, (req, res) => {
   const isEnabled = req.body?.isEnabled ? 1 : 0;
-  const modelName = sanitizeText(req.body?.modelName || 'gemini-4-hydrogen', 64);
+  const modelName = sanitizeText(
+    req.body?.modelName || process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
+    64
+  );
   const dailyLimitPerUser = Math.max(0, Number(req.body?.dailyLimitPerUser ?? 30));
 
   db.prepare(

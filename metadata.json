@@ -2,5 +2,5 @@
   "name": "SOFUMER",
   "description": "SOFUMER — AI-Powered Global Marketplace. Buy Smarter. Sell Faster.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }
