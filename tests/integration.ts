@@ -36,11 +36,19 @@ function createSqliteD1Adapter(): D1Database {
           return { results: rows };
         },
         async run() {
-          db.prepare(query).run(...bound);
-          return { success: true };
+          const info = db.prepare(query).run(...bound);
+          return { success: true, meta: { changes: info.changes } };
         },
       };
       return stmtApi;
+    },
+    async batch<T = unknown>(statements: Array<{ run(): Promise<{ success: boolean; meta?: { changes?: number } }> }>) {
+      const results: Array<{ success: boolean; results?: T[]; meta?: { changes?: number } }> = [];
+      for (const stmt of statements) {
+        const res = await stmt.run();
+        results.push({ success: res.success, meta: res.meta });
+      }
+      return results;
     },
   };
 }
@@ -194,9 +202,10 @@ async function runTests() {
       CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct',
     };
 
-    const sellerInit = buildSignedTelegramInitData({ id: 888101, first_name: 'EdgeSeller', username: 'edge_seller' }, botToken);
-    const buyerInit = buildSignedTelegramInitData({ id: 888102, first_name: 'EdgeBuyer', username: 'edge_buyer' }, botToken);
-    const intruderInit = buildSignedTelegramInitData({ id: 888103, first_name: 'Intruder', username: 'edge_intruder' }, botToken);
+    const runSuffix = Number(crypto.randomInt(100000, 899999));
+    const sellerInit = buildSignedTelegramInitData({ id: 1000000 + runSuffix, first_name: 'EdgeSeller', username: `edge_seller_${runSuffix}` }, botToken);
+    const buyerInit = buildSignedTelegramInitData({ id: 2000000 + runSuffix, first_name: 'EdgeBuyer', username: `edge_buyer_${runSuffix}` }, botToken);
+    const intruderInit = buildSignedTelegramInitData({ id: 3000000 + runSuffix, first_name: 'Intruder', username: `edge_intruder_${runSuffix}` }, botToken);
     const adminInit = buildSignedTelegramInitData({ id: 999001, first_name: 'EdgeAdmin', username: 'edge_admin' }, botToken);
 
     const authCall = async (initData: string) => {

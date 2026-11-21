@@ -108,6 +108,9 @@ export async function handleAdminRoutes(
         : null;
     const reason = sanitizeText(body.data.reason || '', 300);
 
+    const userExists = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
+    if (!userExists) return json({ error: 'User not found.' }, 404);
+
     await env.DB.prepare(
       `INSERT INTO ai_permissions (user_id, ai_enabled, custom_daily_limit, reason, updated_by, updated_at)
        VALUES (?, ?, ?, ?, ?, datetime('now'))
@@ -262,6 +265,8 @@ export async function handleAdminRoutes(
     const categoryId = sanitizeText(body.data.categoryId || '', 64);
     const name = sanitizeText(body.data.name || '', 80);
     if (!categoryId || !name) return json({ error: 'Parent category and name required.' }, 400);
+    const parentCat = await env.DB.prepare('SELECT id FROM categories WHERE id = ?').bind(categoryId).first();
+    if (!parentCat) return json({ error: 'Parent category not found.' }, 404);
     const id = newId('sub');
     await env.DB.prepare(`INSERT INTO subcategories (id, category_id, slug, name, sort_order) VALUES (?, ?, ?, ?, 50)`)
       .bind(id, categoryId, `${slugify(name)}-${id.slice(-4)}`, name)
@@ -301,11 +306,22 @@ export async function handleAdminRoutes(
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const status = String(body.data.status || 'resolved');
+    if (!['open', 'investigating', 'resolved', 'dismissed'].includes(status)) {
+      return json({ error: 'Invalid report status.' }, 400);
+    }
     const notes = sanitizeText(body.data.resolutionNotes || '', 500);
+    const isResolved = status === 'resolved' || status === 'dismissed';
     await env.DB.prepare(
-      `UPDATE reports SET status = ?, resolution_notes = ?, reviewed_by = ?, updated_at = datetime('now') WHERE id = ?`
+      `UPDATE reports
+       SET status = ?,
+           resolution_notes = ?,
+           reviewed_by = ?,
+           resolved_by = CASE WHEN ? = 1 THEN ? ELSE resolved_by END,
+           resolved_at = CASE WHEN ? = 1 THEN datetime('now') ELSE resolved_at END,
+           updated_at = datetime('now')
+       WHERE id = ?`
     )
-      .bind(status, notes, admin.adminIdentifier, repId)
+      .bind(status, notes, admin.adminIdentifier, isResolved ? 1 : 0, admin.adminIdentifier, isResolved ? 1 : 0, repId)
       .run();
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'report.resolved', 'report', repId, { status, notes }, ip);
     return json({ updated: true });

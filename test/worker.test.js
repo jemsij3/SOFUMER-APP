@@ -7,6 +7,7 @@ import {
 } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index.js';
+import { ensureD1Schema, resetD1BootstrapCacheForTests } from '../cloudflare/d1-bootstrap.ts';
 
 async function signTelegramInitData(tgUser, botToken) {
   const enc = new TextEncoder();
@@ -62,6 +63,7 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     expect(body.status).toBe('ok');
     expect(body.runtime).toBe('cloudflare-workers');
     expect(body.dbBound).toBe(true);
+    expect(body.dbInitialized).toBe(true);
     expect(body.r2Bound).toBeUndefined();
 
     const r2Res = await SELF.fetch('https://sofumer-app.derartuaman8.workers.dev/r2/sample.png');
@@ -357,5 +359,134 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
       .bind(102)
       .first();
     expect(stored?.update_id).toBe(102);
+  });
+
+  it('9. Seller registration, product creation, FK validation, and FK-safe product deletion work cleanly on D1', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const sellerInitData = await signTelegramInitData(
+      { id: 700001, first_name: 'Seller', username: 'tg_seller' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: sellerInitData }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    expect(loginRes.status).toBe(200);
+    const { token } = await loginRes.json();
+
+    // Register seller & shop
+    const regCtx = createExecutionContext();
+    const regRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Test Merchant',
+          shopName: 'D1 Safe Shop',
+          countryCode: 'US',
+          defaultCurrency: 'USD',
+        }),
+      }),
+      testEnv,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+    expect(regRes.status).toBe(201);
+
+    // Invalid currency returns clean 400 (not 500 D1 FK error)
+    const badProdCtx = createExecutionContext();
+    const badProdRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Bad Currency Item',
+          description: 'Testing FK validation',
+          categoryId: 'cat_electronics',
+          price: 25,
+          currency: 'ZZZ',
+        }),
+      }),
+      testEnv,
+      badProdCtx
+    );
+    await waitOnExecutionContext(badProdCtx);
+    expect(badProdRes.status).toBe(400);
+
+    // Create valid product (creates product + product_inventory row)
+    const prodCtx = createExecutionContext();
+    const prodRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'D1 Test Laptop',
+          description: 'Clean D1 test listing with inventory',
+          categoryId: 'cat_electronics',
+          price: 499,
+          currency: 'USD',
+          stockQuantity: 5,
+          status: 'published',
+        }),
+      }),
+      testEnv,
+      prodCtx
+    );
+    await waitOnExecutionContext(prodCtx);
+    expect(prodRes.status).toBe(201);
+    const { product } = await prodRes.json();
+
+    // Delete product cleanly without D1 FOREIGN KEY constraint failed
+    const delCtx = createExecutionContext();
+    const delRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${product.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      testEnv,
+      delCtx
+    );
+    await waitOnExecutionContext(delCtx);
+    expect(delRes.status).toBe(200);
+    const delJson = await delRes.json();
+    expect(delJson.deleted).toBe(true);
+    expect(delJson.archived).toBe(false);
+  });
+
+  it('10. D1 auto-bootstrap initializes missing tables and system seeds cleanly on empty/unmigrated D1', async () => {
+    await env.DB.prepare('DROP TABLE IF EXISTS platform_settings').run();
+    resetD1BootstrapCacheForTests();
+
+    const ok = await ensureD1Schema(env.DB);
+    expect(ok).toBe(true);
+
+    const row = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'auto_approve_products'").first();
+    expect(row?.value).toBe('true');
   });
 });

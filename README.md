@@ -80,17 +80,13 @@ npm run build
 npm test
 ```
 
-## 4. Cloudflare D1, Secrets & Remote Migrations
+## 4. Cloudflare D1 Auto-Provisioning & Secrets
 
-D1 database `sofumer-db` (`37387526-bf6a-4a2d-bf61-70dece9eb2f5`, region `WEUR`) is already configured in `wrangler.jsonc`. R2 object storage is intentionally omitted for now and can be added later.
+`wrangler.jsonc` intentionally omits `database_id` while specifying `"database_name": "sofumer-db"` so Cloudflare Workers Builds / Wrangler automatically creates and binds `sofumer-db` during deployment (and reuses it by name on future deploys). R2 object storage is intentionally omitted for now and can be added later.
 
-Apply the version-controlled D1 schema migrations remotely:
+The Worker also includes an idempotent auto-bootstrapper (`cloudflare/d1-bootstrap.ts`) that creates all 40 tables, indexes, and system lookup seeds on first `/api/*` request if a fresh empty D1 database is bound.
 
-```bash
-npx wrangler d1 migrations apply sofumer-db --remote
-```
-
-Configure production secrets (never stored in `wrangler.jsonc` or Git):
+Configure production secrets in Cloudflare (never stored in `wrangler.jsonc` or Git):
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
@@ -99,11 +95,12 @@ npx wrangler secret put JWT_SECRET
 npx wrangler secret put ADMIN_TELEGRAM_IDS
 ```
 
-## 5. Deploy to Existing `sofumer-app` Worker
+## 5. Deploy `sofumer-app` Worker
 
 ```bash
 npm run build
-npx wrangler deploy
+npx wrangler deploy --x-provision
+npx wrangler d1 migrations apply sofumer-db --remote
 ```
 
 ## 6. Secure Telegram Webhook Registration

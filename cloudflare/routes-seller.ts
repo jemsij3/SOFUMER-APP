@@ -61,6 +61,17 @@ export async function handleSellerRoutes(
       return json({ error: 'Seller name and shop name are required.' }, 400);
     }
 
+    const [validCountry, validCurrency] = await Promise.all([
+      env.DB.prepare('SELECT code, default_currency FROM countries WHERE code = ?')
+        .bind(countryCode)
+        .first<{ code: string; default_currency: string }>(),
+      env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(defaultCurrency).first<{ code: string }>(),
+    ]);
+    if (!validCountry) {
+      return json({ error: `Unsupported country code "${countryCode}".` }, 400);
+    }
+    const resolvedCurrency = validCurrency?.code || validCountry.default_currency || 'USD';
+
     const sellerId = newId('sel');
     const shopId = newId('shop');
     const baseSlug = slugify(shopName);
@@ -78,7 +89,7 @@ export async function handleSellerRoutes(
       `INSERT INTO shops (id, seller_id, user_id, slug, name, description, country_code, logo_url, banner_url, default_currency)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-      .bind(shopId, sellerId, user.id, shopSlug, shopName, description, countryCode, logoUrl, bannerUrl, defaultCurrency)
+      .bind(shopId, sellerId, user.id, shopSlug, shopName, description, countryCode, logoUrl, bannerUrl, resolvedCurrency)
       .run();
 
     await env.DB.prepare(
@@ -176,6 +187,13 @@ export async function handleSellerRoutes(
     const shippingPolicy = sanitizeText(body.data.shippingPolicy ?? shop.shipping_policy, 600);
     const defaultCurrency = sanitizeText(body.data.defaultCurrency ?? shop.default_currency, 6).toUpperCase();
     const countryCode = sanitizeText(body.data.countryCode ?? shop.country_code, 4).toUpperCase();
+
+    const [validCountry, validCurrency] = await Promise.all([
+      env.DB.prepare('SELECT code FROM countries WHERE code = ?').bind(countryCode).first(),
+      env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(defaultCurrency).first(),
+    ]);
+    if (!validCountry) return json({ error: `Unsupported country code "${countryCode}".` }, 400);
+    if (!validCurrency) return json({ error: `Unsupported currency code "${defaultCurrency}".` }, 400);
 
     await env.DB.prepare(
       `UPDATE shops
@@ -298,10 +316,21 @@ export async function handleSellerRoutes(
         return json({ error: 'Title, description, category, and valid price are required.' }, 400);
       }
 
-      const catExists = await env.DB.prepare('SELECT id FROM categories WHERE id = ? AND is_active = 1')
-        .bind(categoryId)
-        .first();
+      const productCountry = sanitizeText(body.data.countryCode || String(shop.country_code || 'US'), 4).toUpperCase();
+      const [catExists, subcatExists, validCurrency, validCountry] = await Promise.all([
+        env.DB.prepare('SELECT id FROM categories WHERE id = ? AND is_active = 1').bind(categoryId).first(),
+        subcategoryId
+          ? env.DB.prepare('SELECT id FROM subcategories WHERE id = ? AND category_id = ? AND is_active = 1')
+              .bind(subcategoryId, categoryId)
+              .first()
+          : Promise.resolve(true),
+        env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(currency).first(),
+        env.DB.prepare('SELECT code FROM countries WHERE code = ?').bind(productCountry).first(),
+      ]);
       if (!catExists) return json({ error: 'Selected category does not exist.' }, 400);
+      if (subcategoryId && !subcatExists) return json({ error: 'Selected subcategory does not belong to this category.' }, 400);
+      if (!validCurrency) return json({ error: `Unsupported currency code "${currency}".` }, 400);
+      if (!validCountry) return json({ error: `Unsupported country code "${productCountry}".` }, 400);
 
       const flaggedWords = await checkProhibitedKeywordsEdge(env, `${title} ${description}`);
       const autoApproveRow = await env.DB.prepare(
@@ -361,7 +390,7 @@ export async function handleSellerRoutes(
           price,
           currency,
           condition,
-          sanitizeText(body.data.countryCode || String(shop.country_code), 4).toUpperCase(),
+          productCountry,
           sanitizeText(body.data.locationText || '', 120),
           sanitizeText(body.data.shippingInfo || '', 500),
           body.data.internationalShipping ? 1 : 0,
@@ -423,6 +452,8 @@ export async function handleSellerRoutes(
       const description = sanitizeText(body.data.description ?? existing.description, 4000);
       const price = body.data.price !== undefined ? Number(body.data.price) : Number(existing.price);
       const currency = sanitizeText(body.data.currency ?? existing.currency, 6).toUpperCase();
+      const validCurrency = await env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(currency).first();
+      if (!validCurrency) return json({ error: `Unsupported currency code "${currency}".` }, 400);
       const nextStatusInput = body.data.status ? String(body.data.status) : String(existing.status);
 
       let finalStatus = String(existing.status);
@@ -464,9 +495,14 @@ export async function handleSellerRoutes(
         const qty = Math.max(0, Math.floor(Number(body.data.stockQuantity)));
         const avail = qty > 3 ? 'in_stock' : qty > 0 ? 'low_stock' : 'out_of_stock';
         await env.DB.prepare(
-          `UPDATE product_inventory SET stock_quantity = ?, availability_status = ?, updated_at = datetime('now') WHERE product_id = ?`
+          `INSERT INTO product_inventory (id, product_id, stock_quantity, unlimited_digital, availability_status, updated_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(product_id) DO UPDATE SET
+             stock_quantity = excluded.stock_quantity,
+             availability_status = excluded.availability_status,
+             updated_at = datetime('now')`
         )
-          .bind(qty, avail, existing.id)
+          .bind(newId('inv'), existing.id, qty, existing.listing_type === 'digital' ? 1 : 0, avail)
           .run();
       }
 
@@ -490,13 +526,43 @@ export async function handleSellerRoutes(
     if (request.method === 'DELETE') {
       const auth = await requireEdgeSeller(request, env);
       if ('error' in auth) return auth.error;
-      const res = await env.DB.prepare('DELETE FROM products WHERE id = ? AND seller_user_id = ?')
+
+      const existing = await env.DB.prepare('SELECT id FROM products WHERE id = ? AND seller_user_id = ?')
         .bind(productId, auth.user.id)
-        .run();
-      if ((res.meta?.changes ?? 0) === 0) {
+        .first<{ id: string }>();
+      if (!existing) {
         return json({ error: 'Listing not found or unauthorized.' }, 404);
       }
-      return json({ deleted: true });
+
+      // Preserve transactional order/review history if the product has already been ordered or reviewed
+      const [hasOrderItem, hasReview] = await Promise.all([
+        env.DB.prepare('SELECT id FROM order_items WHERE product_id = ? LIMIT 1').bind(productId).first(),
+        env.DB.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').bind(productId).first(),
+      ]);
+
+      if (hasOrderItem || hasReview) {
+        await env.DB.batch([
+          env.DB.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(productId),
+          env.DB.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(productId),
+          env.DB.prepare("UPDATE products SET status = 'archived', updated_at = datetime('now') WHERE id = ? AND seller_user_id = ?").bind(productId, auth.user.id),
+        ]);
+        return json({ deleted: true, archived: true });
+      }
+
+      // Delete dependent non-transactional records in D1 foreign-key safe order
+      await env.DB.batch([
+        env.DB.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').bind(productId),
+        env.DB.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM inquiries WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM product_variants WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM product_images WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM product_inventory WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM products WHERE id = ? AND seller_user_id = ?').bind(productId, auth.user.id),
+      ]);
+
+      return json({ deleted: true, archived: false });
     }
 
     return methodNotAllowed(['PATCH', 'DELETE']);

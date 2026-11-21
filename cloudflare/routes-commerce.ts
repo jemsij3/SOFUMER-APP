@@ -335,6 +335,8 @@ export async function handleCommerceAndAccountRoutes(
     if (!targetUserId || targetUserId === auth.user.id) {
       return json({ error: 'Valid target user ID required.' }, 400);
     }
+    const targetExists = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(targetUserId).first();
+    if (!targetExists) return json({ error: 'Target user not found.' }, 404);
     await env.DB.prepare(
       `INSERT OR IGNORE INTO user_blocks (id, blocker_user_id, blocked_user_id, reason) VALUES (?, ?, ?, ?)`
     )
@@ -418,6 +420,15 @@ export async function handleCommerceAndAccountRoutes(
         return json({ error: 'Buyer and seller cannot be the same account.' }, 400);
       }
 
+      const [buyerExists, currencyExists, convExists] = await Promise.all([
+        env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(buyerUserId).first(),
+        env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(currency).first(),
+        conversationId ? env.DB.prepare('SELECT id FROM conversations WHERE id = ?').bind(conversationId).first() : Promise.resolve(true),
+      ]);
+      if (!buyerExists) return json({ error: 'Buyer account not found.' }, 404);
+      if (!currencyExists) return json({ error: `Unsupported currency code "${currency}".` }, 400);
+      const validConversationId = convExists ? conversationId : null;
+
       const orderId = newId('ord');
       const orderNumber = `SFM-${Date.now().toString(36).toUpperCase()}-${orderId.slice(-4).toUpperCase()}`;
       const unitPrice = Number((agreedTotal / quantity).toFixed(2));
@@ -428,7 +439,7 @@ export async function handleCommerceAndAccountRoutes(
           status, agreed_total, currency, payment_arrangement, delivery_arrangement, notes
         ) VALUES (?, ?, ?, ?, ?, ?, 'Pending Confirmation', ?, ?, ?, ?, ?)`
       )
-        .bind(orderId, orderNumber, buyerUserId, userId, product.shop_id, conversationId, agreedTotal, currency, paymentArrangement, deliveryArrangement, notes)
+        .bind(orderId, orderNumber, buyerUserId, userId, product.shop_id, validConversationId, agreedTotal, currency, paymentArrangement, deliveryArrangement, notes)
         .run();
 
       await env.DB.prepare(
@@ -445,14 +456,14 @@ export async function handleCommerceAndAccountRoutes(
         .bind(newId('osh'), orderId, userId, `Seller recorded agreed order (${currency} ${agreedTotal}). Awaiting buyer confirmation.`)
         .run();
 
-      if (conversationId) {
+      if (validConversationId) {
         await env.DB.prepare(
           `INSERT INTO messages (id, conversation_id, sender_user_id, body, message_type)
            VALUES (?, ?, ?, ?, 'order_proposal')`
         )
           .bind(
             newId('msg'),
-            conversationId,
+            validConversationId,
             userId,
             `Recorded Order ${orderNumber}: ${String(product.title)} x${quantity} — ${currency} ${agreedTotal}. Delivery: ${deliveryArrangement || 'Direct arrangement'}.`
           )
@@ -460,7 +471,7 @@ export async function handleCommerceAndAccountRoutes(
         await env.DB.prepare(
           `UPDATE conversation_participants SET unread_count = unread_count + 1 WHERE conversation_id = ? AND user_id = ?`
         )
-          .bind(conversationId, buyerUserId)
+          .bind(validConversationId, buyerUserId)
           .run();
       }
 
@@ -651,6 +662,16 @@ export async function handleCommerceAndAccountRoutes(
     if (!body.ok) return body.error;
     const u = auth.user;
 
+    const countryCode = sanitizeText(body.data.countryCode ?? u.country_code, 4).toUpperCase();
+    const preferredCurrency = sanitizeText(body.data.preferredCurrency ?? u.preferred_currency, 6).toUpperCase();
+
+    const [validCountry, validCurrency] = await Promise.all([
+      env.DB.prepare('SELECT code FROM countries WHERE code = ?').bind(countryCode).first(),
+      env.DB.prepare('SELECT code FROM currencies WHERE code = ?').bind(preferredCurrency).first(),
+    ]);
+    if (!validCountry) return json({ error: `Unsupported country code "${countryCode}".` }, 400);
+    if (!validCurrency) return json({ error: `Unsupported currency code "${preferredCurrency}".` }, 400);
+
     await env.DB.prepare(
       `UPDATE users
        SET display_name = ?, bio = ?, phone = ?, country_code = ?, preferred_currency = ?, preferred_language = ?, updated_at = datetime('now')
@@ -660,8 +681,8 @@ export async function handleCommerceAndAccountRoutes(
         sanitizeText(body.data.displayName ?? u.display_name, 80),
         sanitizeText(body.data.bio ?? u.bio, 500),
         sanitizeText(body.data.phone ?? u.phone, 32),
-        sanitizeText(body.data.countryCode ?? u.country_code, 4).toUpperCase(),
-        sanitizeText(body.data.preferredCurrency ?? u.preferred_currency, 6).toUpperCase(),
+        countryCode,
+        preferredCurrency,
         sanitizeText(body.data.preferredLanguage ?? u.preferred_language, 10),
         u.id
       )

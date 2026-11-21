@@ -12,6 +12,9 @@ export interface D1PreparedStatement {
 
 export interface D1Database {
   prepare(query: string): D1PreparedStatement;
+  batch<T = unknown>(
+    statements: D1PreparedStatement[]
+  ): Promise<Array<{ success: boolean; results?: T[]; meta?: { changes?: number } }>>;
 }
 
 export interface WorkersAiBinding {
@@ -622,7 +625,7 @@ export async function notifyUserAndTelegramEdge(
   type: string,
   title: string,
   body: string,
-  originUrl = 'https://sofumer-app.derartuaman8.workers.dev'
+  originUrl = ''
 ) {
   if (!env.DB) return;
   const notifId = newId('notif');
@@ -639,11 +642,12 @@ export async function notifyUserAndTelegramEdge(
 
   if (user?.telegram_id && /^\d+$/.test(user.telegram_id)) {
     const miniAppUrl = env.MINI_APP_URL || originUrl;
+    const button = miniAppUrl ? { label: 'Open SOFUMER', url: miniAppUrl } : undefined;
     const sent = await sendTelegramBotMessageEdge(
       env,
       user.telegram_id,
       `<b>${escapeHtml(title)}</b>\n${escapeHtml(body)}`,
-      { label: 'Open SOFUMER', url: miniAppUrl }
+      button
     );
     if (sent) {
       await env.DB.prepare('UPDATE notifications SET telegram_delivered = 1 WHERE id = ?')

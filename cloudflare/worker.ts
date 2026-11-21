@@ -26,6 +26,7 @@ import { handleSellerRoutes } from './routes-seller.ts';
 import { handleCommerceAndAccountRoutes } from './routes-commerce.ts';
 import { handleAdminRoutes } from './routes-admin.ts';
 import { handleAiRoutes } from './routes-ai.ts';
+import { ensureD1Schema, isD1Initialized } from './d1-bootstrap.ts';
 
 export type { Env, D1Database, WorkersAiBinding } from './helpers.ts';
 
@@ -416,8 +417,13 @@ export default {
     try {
       const url = new URL(request.url);
 
+      if (env.DB && url.pathname.startsWith('/api/')) {
+        await ensureD1Schema(env.DB);
+      }
+
       if (url.pathname === '/api/health') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
+        const dbInitialized = await isD1Initialized(env.DB);
         return json({
           service: 'SOFUMER',
           slogan: 'BUY SMARTER. SELL FASTER.',
@@ -426,6 +432,7 @@ export default {
           aiModel: env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
           telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
           dbBound: Boolean(env.DB),
+          dbInitialized,
           aiBound: Boolean(env.AI),
           status: 'ok',
         });

@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sofumer-app",
   "main": "src/index.js",
-  "compatibility_date": "2026-11-21",
+  "compatibility_date": "2026-08-15",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "./dist",
@@ -16,7 +16,6 @@
     {
       "binding": "DB",
       "database_name": "sofumer-db",
-      "database_id": "37387526-bf6a-4a2d-bf61-70dece9eb2f5",
       "migrations_dir": "migrations"
     }
   ],
