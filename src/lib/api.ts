@@ -1,5 +1,4 @@
 const USER_TOKEN_KEY = 'sofumer_session_token';
-const ADMIN_TOKEN_KEY = 'sofumer_admin_token';
 
 export function getUserToken(): string | null {
   try {
@@ -18,29 +17,12 @@ export function setUserToken(token: string | null) {
   }
 }
 
-export function getAdminToken(): string | null {
-  try {
-    return sessionStorage.getItem(ADMIN_TOKEN_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setAdminToken(token: string | null) {
-  try {
-    if (token) sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
-    else sessionStorage.removeItem(ADMIN_TOKEN_KEY);
-  } catch {
-    // Ignore storage errors
-  }
-}
-
 export async function apiFetch<T>(
   url: string,
   options: RequestInit & { isAdmin?: boolean } = {}
 ): Promise<T> {
-  const { isAdmin, headers, body, ...rest } = options;
-  const token = isAdmin ? getAdminToken() : getUserToken();
+  const { isAdmin: _isAdmin, headers, body, ...rest } = options;
+  const token = getUserToken();
   const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
 
   const mergedHeaders: Record<string, string> = {

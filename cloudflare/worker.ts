@@ -5,8 +5,10 @@
 import {
   type Env,
   type ExecutionContextLike,
-  hashSessionToken,
+  getTelegramBotInfoEdge,
+  hashSessionIdentifier,
   html,
+  isTelegramIdAdmin,
   json,
   methodNotAllowed,
   newId,
@@ -15,6 +17,7 @@ import {
   resolveEdgeUserSession,
   sanitizeText,
   sendTelegramBotMessageEdge,
+  signJwtEdge,
   timingSafeEqualStr,
   verifyTelegramInitDataEdge,
 } from './helpers.ts';
@@ -152,12 +155,14 @@ async function handleAuthRoutes(
 
   if (url.pathname === '/api/auth/config') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const botInfo = await getTelegramBotInfoEdge(env);
     return json({
-      botName: env.TELEGRAM_BOT_NAME || 'SOFUMER',
-      botUsername: env.TELEGRAM_BOT_USERNAME || 'SofumerBot',
+      botName: botInfo.botName,
+      botUsername: botInfo.botUsername,
       miniAppUrl: env.MINI_APP_URL || url.origin,
-      sandboxAvailable: env.ALLOW_DEV_SANDBOX === 'true',
       telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
+      jwtConfigured: Boolean(env.JWT_SECRET),
+      telegramOnly: true,
     });
   }
 
@@ -166,6 +171,12 @@ async function handleAuthRoutes(
     if (!env.TELEGRAM_BOT_TOKEN) {
       return json(
         { error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.' },
+        503
+      );
+    }
+    if (!env.JWT_SECRET) {
+      return json(
+        { error: 'JWT_SECRET is not configured on the Worker.' },
         503
       );
     }
@@ -183,6 +194,7 @@ async function handleAuthRoutes(
       );
       const tgUser = verified.user;
       const tgId = String(tgUser.id);
+      const isAdmin = isTelegramIdAdmin(tgId, env.ADMIN_TELEGRAM_IDS);
 
       const existing = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?')
         .bind(tgId)
@@ -240,11 +252,8 @@ async function handleAuthRoutes(
           .run();
       }
 
-      const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
-      const rawToken = Array.from(tokenBytes)
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      const tokenHash = await hashSessionToken(rawToken, env);
+      const sessionId = newId('sess');
+      const tokenHash = await hashSessionIdentifier(sessionId, env.JWT_SECRET);
       const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
 
       await env.DB.prepare(
@@ -252,7 +261,7 @@ async function handleAuthRoutes(
          VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
       )
         .bind(
-          newId('sess'),
+          sessionId,
           userId,
           tokenHash,
           request.headers.get('CF-Connecting-IP') || '',
@@ -261,11 +270,17 @@ async function handleAuthRoutes(
         )
         .run();
 
+      const jwtToken = await signJwtEdge(
+        { sub: userId, tid: tgId, sid: sessionId, adm: isAdmin },
+        env.JWT_SECRET,
+        7 * 86400
+      );
+
       return json(
-        { authenticated: true, token: rawToken, expiresAt },
+        { authenticated: true, token: jwtToken, expiresAt, isAdmin },
         200,
         {
-          'Set-Cookie': `sofumer_session=${rawToken}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=604800`,
+          'Set-Cookie': `sofumer_session=${jwtToken}; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=604800`,
         }
       );
     } catch (err) {
@@ -274,14 +289,6 @@ async function handleAuthRoutes(
         401
       );
     }
-  }
-
-  if (url.pathname === '/api/auth/dev-sandbox') {
-    if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    if (env.ALLOW_DEV_SANDBOX !== 'true') {
-      return json({ error: 'Sandbox authentication is disabled in production.' }, 403);
-    }
-    return json({ error: 'Use Telegram Mini App authentication in Workers production.' }, 403);
   }
 
   if (url.pathname === '/api/auth/me') {
@@ -341,7 +348,7 @@ async function handleAuthRoutes(
     return json(
       { loggedOut: true },
       200,
-      { 'Set-Cookie': 'sofumer_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0' }
+      { 'Set-Cookie': 'sofumer_session=; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=0' }
     );
   }
 

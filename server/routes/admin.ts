@@ -1,10 +1,6 @@
 import { Router } from 'express';
-import crypto from 'crypto';
 import { db, newId, slugify } from '../db.ts';
 import {
-  getAdminBootstrapSecret,
-  hashToken,
-  rateLimit,
   recordAdminAudit,
   requireAdmin,
   sanitizeText,
@@ -14,73 +10,8 @@ import { notifyUserAndTelegram } from '../telegram.ts';
 export const adminRouter = Router();
 
 // ============================================================================
-// DEDICATED ADMIN AUTHENTICATION (INDEPENDENT FROM ORDINARY BUYER LOGIN)
+// ADMIN AUTHENTICATION (TELEGRAM JWT + ADMIN_TELEGRAM_IDS)
 // ============================================================================
-
-adminRouter.post('/auth/login', rateLimit(10, 60_000, 'admin_auth'), (req, res) => {
-  const passcode = String(req.body?.passcode || '');
-  const adminLabel = sanitizeText(req.body?.adminName || 'Platform Owner', 64) || 'Platform Owner';
-  const expected = getAdminBootstrapSecret();
-
-  if (!expected) {
-    return res.status(503).json({
-      error: 'ADMIN_BOOTSTRAP_SECRET is not configured on the server.',
-    });
-  }
-
-  const a = Buffer.from(passcode);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({ error: 'Invalid administrator credentials.' });
-  }
-
-  // Ensure a dedicated server-provisioned owner account exists
-  let owner = db
-    .prepare("SELECT * FROM users WHERE telegram_id = 'admin_owner_bootstrap'")
-    .get() as Record<string, unknown> | undefined;
-
-  if (!owner) {
-    const ownerId = newId('adm');
-    db.transaction(() => {
-      db.prepare(
-        `INSERT INTO users (id, telegram_id, telegram_username, first_name, display_name, status)
-         VALUES (?, 'admin_owner_bootstrap', 'sofumer_owner', ?, ?, 'active')`
-      ).run(ownerId, adminLabel, adminLabel);
-
-      db.prepare(
-        `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'super_admin', 'server_bootstrap')`
-      ).run(newId('role'), ownerId);
-    })();
-    owner = db.prepare('SELECT * FROM users WHERE id = ?').get(ownerId) as Record<string, unknown>;
-  }
-
-  const rawToken = crypto.randomBytes(32).toString('hex');
-  const tokenHash = hashToken(rawToken);
-  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
-
-  db.prepare(
-    `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
-     VALUES (?, ?, ?, 'admin', ?, ?, ?)`
-  ).run(
-    newId('asess'),
-    owner.id,
-    tokenHash,
-    req.ip || '',
-    String(req.headers['user-agent'] || '').slice(0, 200),
-    expiresAt
-  );
-
-  recordAdminAudit(adminLabel, 'admin.login', 'session', String(owner.id), { role: 'super_admin' }, req.ip || '');
-
-  res.cookie('sofumer_admin_session', rawToken, {
-    httpOnly: true,
-    sameSite: 'none',
-    secure: true,
-    maxAge: 12 * 60 * 60 * 1000,
-  });
-
-  res.json({ authenticated: true, token: rawToken, adminIdentifier: adminLabel, role: 'super_admin' });
-});
 
 adminRouter.get('/auth/me', requireAdmin, (req, res) => {
   res.json({ authenticated: true, admin: req.adminSession });
@@ -90,7 +21,7 @@ adminRouter.post('/auth/logout', requireAdmin, (req, res) => {
   db.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE id = ?").run(
     req.adminSession!.sessionId
   );
-  res.clearCookie('sofumer_admin_session', { sameSite: 'none', secure: true });
+  res.clearCookie('sofumer_session', { sameSite: 'none', secure: true, partitioned: true });
   res.json({ loggedOut: true });
 });
 
@@ -102,7 +33,7 @@ adminRouter.get('/overview', requireAdmin, (_req, res) => {
   const counts = db
     .prepare(
       `SELECT
-         (SELECT COUNT(*) FROM users WHERE telegram_id != 'admin_owner_bootstrap') as total_users,
+         (SELECT COUNT(*) FROM users) as total_users,
          (SELECT COUNT(*) FROM seller_profiles) as total_sellers,
          (SELECT COUNT(*) FROM shops) as total_shops,
          (SELECT COUNT(*) FROM products) as total_products,
@@ -132,7 +63,6 @@ adminRouter.get('/users', requireAdmin, (_req, res) => {
               (SELECT GROUP_CONCAT(role) FROM user_roles ur WHERE ur.user_id = u.id) as roles
        FROM users u
        LEFT JOIN ai_permissions ap ON ap.user_id = u.id
-       WHERE u.telegram_id != 'admin_owner_bootstrap'
        ORDER BY u.created_at DESC`
     )
     .all();

@@ -12,10 +12,7 @@ export default defineConfig(async () => {
         miniflare: {
           compatibilityDate: '2026-08-15',
           bindings: {
-            TELEGRAM_BOT_NAME: 'SOFUMER',
-            TELEGRAM_BOT_USERNAME: 'SofumerBot',
             CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct',
-            ALLOW_DEV_SANDBOX: 'false',
             TEST_MIGRATIONS: migrations,
           },
         },

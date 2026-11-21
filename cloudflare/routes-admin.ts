@@ -1,6 +1,5 @@
 import {
   type Env,
-  hashSessionToken,
   json,
   methodNotAllowed,
   newId,
@@ -10,7 +9,6 @@ import {
   requireEdgeAdmin,
   sanitizeText,
   slugify,
-  timingSafeEqualStr,
 } from './helpers.ts';
 
 export async function handleAdminRoutes(
@@ -23,60 +21,6 @@ export async function handleAdminRoutes(
 
   const sub = url.pathname.slice('/api/admin'.length);
   const ip = request.headers.get('CF-Connecting-IP') || '';
-
-  if (sub === '/auth/login') {
-    if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const body = await parseJsonBody(request);
-    if (!body.ok) return body.error;
-
-    const passcode = String(body.data.passcode || '');
-    const adminLabel = sanitizeText(body.data.adminName || 'Platform Owner', 64) || 'Platform Owner';
-    const expected = env.ADMIN_BOOTSTRAP_SECRET || '';
-    if (!expected) {
-      return json({ error: 'ADMIN_BOOTSTRAP_SECRET is not configured on the Worker.' }, 503);
-    }
-    if (!timingSafeEqualStr(passcode, expected)) {
-      return json({ error: 'Invalid administrator credentials.' }, 401);
-    }
-
-    let owner = await env.DB.prepare("SELECT * FROM users WHERE telegram_id = 'admin_owner_bootstrap'")
-      .first<Record<string, unknown>>();
-    if (!owner) {
-      const ownerId = newId('adm');
-      await env.DB.prepare(
-        `INSERT INTO users (id, telegram_id, telegram_username, first_name, display_name, status)
-         VALUES (?, 'admin_owner_bootstrap', 'sofumer_owner', ?, ?, 'active')`
-      )
-        .bind(ownerId, adminLabel, adminLabel)
-        .run();
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'super_admin', 'server_bootstrap')`
-      )
-        .bind(newId('role'), ownerId)
-        .run();
-      owner = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(ownerId).first<Record<string, unknown>>();
-    }
-
-    const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
-    const rawToken = Array.from(tokenBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
-    const tokenHash = await hashSessionToken(rawToken, env);
-    const expiresAt = new Date(Date.now() + 12 * 3600_000).toISOString();
-
-    await env.DB.prepare(
-      `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
-       VALUES (?, ?, ?, 'admin', ?, ?, ?)`
-    )
-      .bind(newId('asess'), owner!.id, tokenHash, ip, (request.headers.get('User-Agent') || '').slice(0, 200), expiresAt)
-      .run();
-
-    await recordEdgeAdminAudit(env, adminLabel, 'admin.login', 'session', String(owner!.id), { role: 'super_admin' }, ip);
-
-    return json(
-      { authenticated: true, token: rawToken, adminIdentifier: adminLabel, role: 'super_admin' },
-      200,
-      { 'Set-Cookie': `sofumer_admin_session=${rawToken}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=43200` }
-    );
-  }
 
   if (sub === '/auth/me') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
@@ -95,7 +39,7 @@ export async function handleAdminRoutes(
     return json(
       { loggedOut: true },
       200,
-      { 'Set-Cookie': 'sofumer_admin_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0' }
+      { 'Set-Cookie': 'sofumer_session=; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=0' }
     );
   }
 
@@ -107,7 +51,7 @@ export async function handleAdminRoutes(
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const counts = await env.DB.prepare(
       `SELECT
-         (SELECT COUNT(*) FROM users WHERE telegram_id != 'admin_owner_bootstrap') as total_users,
+         (SELECT COUNT(*) FROM users) as total_users,
          (SELECT COUNT(*) FROM seller_profiles) as total_sellers,
          (SELECT COUNT(*) FROM shops) as total_shops,
          (SELECT COUNT(*) FROM products) as total_products,
@@ -130,7 +74,7 @@ export async function handleAdminRoutes(
       `SELECT u.*, COALESCE(ap.ai_enabled, 1) as ai_enabled, ap.custom_daily_limit,
               (SELECT GROUP_CONCAT(role) FROM user_roles ur WHERE ur.user_id = u.id) as roles
        FROM users u LEFT JOIN ai_permissions ap ON ap.user_id = u.id
-       WHERE u.telegram_id != 'admin_owner_bootstrap' ORDER BY u.created_at DESC`
+       ORDER BY u.created_at DESC`
     ).all();
     return json({ users: users.results });
   }

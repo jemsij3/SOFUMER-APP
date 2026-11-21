@@ -206,7 +206,9 @@ export function AccountPage() {
           { icon: Bell, label: 'Notifications', sub: `${unreadNotifications} unread alerts`, action: () => navigate({ type: 'notifications' }) },
           { icon: HelpCircle, label: 'Help and Support', sub: 'Submit & track support tickets', action: () => navigate({ type: 'support' }) },
           { icon: FileText, label: 'Terms and Policies', sub: 'Direct transaction & prohibited item rules', action: () => navigate({ type: 'policies' }) },
-          { icon: Shield, label: 'Admin Portal (Authorized Personnel)', sub: 'Independent marketplace governance dashboard', action: () => navigate({ type: 'admin' }) },
+          ...(user?.isAdmin
+            ? [{ icon: Shield, label: 'Admin Portal (Authorized Personnel)', sub: 'Independent marketplace governance dashboard', action: () => navigate({ type: 'admin' }) }]
+            : []),
         ].map((row) => (
           <button
             key={row.label}

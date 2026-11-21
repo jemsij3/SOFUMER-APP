@@ -1,8 +1,8 @@
 # Copy this file to `.dev.vars` for local `npx wrangler dev` testing.
 # NEVER commit `.dev.vars` or real credentials to GitHub.
-# In production, set these using `npx wrangler secret put <KEY>`.
+# In production, configure all four secrets in Cloudflare Workers (`npx wrangler secret put <KEY>`).
 
-TELEGRAM_BOT_TOKEN="123456:REPLACE_WITH_YOUR_SOFUMER_BOT_TOKEN"
-TELEGRAM_WEBHOOK_SECRET="REPLACE_WITH_RANDOM_32_CHAR_WEBHOOK_SECRET"
-SESSION_SECRET="REPLACE_WITH_RANDOM_64_CHAR_SESSION_SECRET"
-ADMIN_BOOTSTRAP_SECRET="REPLACE_WITH_STRONG_ADMIN_PASSCODE"
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_WEBHOOK_SECRET=""
+JWT_SECRET=""
+ADMIN_TELEGRAM_IDS=""

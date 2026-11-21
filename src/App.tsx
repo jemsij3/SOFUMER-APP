@@ -1,4 +1,4 @@
-import { Bot, Compass, Home, MessageSquare, PlusCircle, User as UserIcon } from 'lucide-react';
+import { Bot, Compass, ExternalLink, Home, Lock, MessageSquare, PlusCircle, RefreshCw, ShieldCheck, User as UserIcon } from 'lucide-react';
 import { AppProvider, useApp } from './context/AppContext';
 import { t } from './lib/i18n';
 import { AuthGateModal } from './components/AuthGateModal';
@@ -18,17 +18,99 @@ import {
 import { AdminPage } from './pages/AdminPage';
 import type { NavTab } from './types';
 
+function TelegramOnlyGate() {
+  const { authError, botName, botUsername, retryTelegramAuth } = useApp();
+
+  return (
+    <div className="min-h-screen bg-[#070B14] text-slate-100 flex items-center justify-center p-4">
+      <div className="w-full max-w-md rounded-3xl bg-[#0E1525] border border-slate-800/90 p-7 shadow-2xl space-y-6">
+        <div className="flex items-center gap-3.5">
+          <img
+            src="/src/assets/images/sofumer_brand_mark_1795188643094.jpg"
+            alt="SOFUMER"
+            className="w-11 h-11 rounded-2xl object-cover border border-slate-700/80 shrink-0"
+          />
+          <div>
+            <h1 className="text-xl font-extrabold tracking-tight text-white font-display">SOFUMER</h1>
+            <p className="text-xs text-slate-400">AI-Powered Global Marketplace</p>
+          </div>
+        </div>
+
+        <div className="p-4 rounded-2xl bg-[#070B14] border border-slate-800 space-y-2.5">
+          <div className="flex items-center gap-2 text-sm font-semibold text-white">
+            <Lock className="w-4 h-4 text-blue-400 shrink-0" />
+            <span>Telegram Mini App Access Only</span>
+          </div>
+          <p className="text-xs text-slate-400 leading-relaxed">
+            SOFUMER runs exclusively inside Telegram. Standard browser access without verified Telegram Mini App authentication is disabled.
+          </p>
+          {authError && (
+            <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-800/50 text-xs text-red-200">
+              {authError}
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-3">
+          {botUsername ? (
+            <a
+              href={`https://t.me/${botUsername}`}
+              target="_blank"
+              rel="noreferrer"
+              className="w-full h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+            >
+              <span>Open {botName || 'SOFUMER'} (@{botUsername})</span>
+              <ExternalLink className="w-4 h-4" />
+            </a>
+          ) : (
+            <div className="p-3.5 rounded-xl bg-[#131C31]/70 border border-slate-800 flex items-center gap-2.5 text-xs text-slate-300">
+              <ShieldCheck className="w-4 h-4 text-blue-400 shrink-0" />
+              <span>Launch this Mini App directly from the official SOFUMER Telegram bot.</span>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => retryTelegramAuth()}
+            className="w-full h-10 px-4 rounded-xl bg-[#131C31] hover:bg-slate-800 border border-slate-700/80 text-xs font-medium text-slate-200 flex items-center justify-center gap-2 transition-colors"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Retry Telegram Verification</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AppShell() {
   const {
     user,
+    authLoading,
     language,
     announcement,
     unreadMessages,
     view,
     switchTab,
     navigate,
-    requireUserOrPrompt,
   } = useApp();
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#070B14] text-slate-100 flex items-center justify-center p-6">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <div className="w-10 h-10 rounded-2xl bg-[#0E1525] border border-slate-800 flex items-center justify-center animate-pulse">
+            <ShieldCheck className="w-5 h-5 text-blue-400" />
+          </div>
+          <p className="text-sm font-medium text-slate-300">Verifying Telegram Mini App session...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <TelegramOnlyGate />;
+  }
 
   const isAdminView = view.type === 'admin';
   const activeTab: NavTab | null = view.type === 'tab' ? view.tab : null;
@@ -101,24 +183,14 @@ function AppShell() {
 
             {/* Zone 3: Primary Action */}
             <div className="flex items-center gap-2 shrink-0">
-              {!user ? (
-                <button
-                  type="button"
-                  onClick={() => requireUserOrPrompt()}
-                  className="h-9 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold whitespace-nowrap shrink-0 transition-colors"
-                >
-                  Connect
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => navigate({ type: 'seller' })}
-                  className="h-9 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
-                >
-                  <PlusCircle className="w-3.5 h-3.5" />
-                  <span>{t(language, 'sell')}</span>
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => navigate({ type: 'seller' })}
+                className="h-9 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+              >
+                <PlusCircle className="w-3.5 h-3.5" />
+                <span>{t(language, 'sell')}</span>
+              </button>
             </div>
           </div>
         </header>

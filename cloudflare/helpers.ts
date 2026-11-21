@@ -1,5 +1,5 @@
 /**
- * Shared Edge types, cryptography, Telegram verification, and D1 authorization helpers
+ * Shared Edge types, cryptography, JWT auth, Telegram verification, and D1 authorization helpers
  * for the SOFUMER Cloudflare Worker runtime.
  */
 
@@ -39,15 +39,12 @@ export interface Env {
   DB?: D1Database;
   AI?: WorkersAiBinding;
   ASSETS?: Fetcher;
-  TELEGRAM_BOT_NAME?: string;
-  TELEGRAM_BOT_USERNAME?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  JWT_SECRET?: string;
+  ADMIN_TELEGRAM_IDS?: string;
   MINI_APP_URL?: string;
-  SESSION_SECRET?: string;
-  ADMIN_BOOTSTRAP_SECRET?: string;
   CLOUDFLARE_AI_MODEL?: string;
-  ALLOW_DEV_SANDBOX?: string;
 }
 
 export interface EdgeAuthUser {
@@ -64,20 +61,30 @@ export interface EdgeAuthUser {
   preferred_currency: string;
   preferred_language: string;
   status: string;
+  isAdmin: boolean;
   sessionId: string;
   sessionType: string;
 }
 
 export interface EdgeAdminSession {
   sessionId: string;
+  userId: string;
+  telegramId: string;
   adminIdentifier: string;
   role: string;
+}
+
+export interface TelegramBotPublicInfo {
+  botName: string | null;
+  botUsername: string | null;
 }
 
 const BASE_SECURITY_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
+
+const botInfoCache = new Map<string, { info: TelegramBotPublicInfo; expiresAt: number }>();
 
 export function json(
   data: unknown,
@@ -174,9 +181,164 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export async function hashSessionToken(token: string, env: Env): Promise<string> {
-  const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN || 'sofumer-edge-ephemeral-session-key';
-  return toHex(await hmacSha256(secret, token));
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function base64UrlToBytes(str: string): Uint8Array | null {
+  try {
+    const padded = str.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (str.length % 4)) % 4);
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export interface JwtClaims {
+  sub: string;
+  tid: string;
+  sid: string;
+  adm: boolean;
+  iat: number;
+  exp: number;
+}
+
+export async function signJwtEdge(
+  claims: Omit<JwtClaims, 'iat' | 'exp'>,
+  jwtSecret: string,
+  ttlSeconds = 7 * 86400
+): Promise<string> {
+  if (!jwtSecret) {
+    throw new Error('JWT_SECRET is required to sign authentication tokens.');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const fullClaims: JwtClaims = {
+    ...claims,
+    iat: now,
+    exp: now + ttlSeconds,
+  };
+  const enc = new TextEncoder();
+  const headerB64 = bytesToBase64Url(enc.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const payloadB64 = bytesToBase64Url(enc.encode(JSON.stringify(fullClaims)));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const sigBuf = await hmacSha256(jwtSecret, signingInput);
+  const sigB64 = bytesToBase64Url(new Uint8Array(sigBuf));
+  return `${signingInput}.${sigB64}`;
+}
+
+export async function verifyJwtEdge(token: string, jwtSecret: string): Promise<JwtClaims | null> {
+  if (!token || !jwtSecret) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  if (!headerB64 || !payloadB64 || !sigB64) return null;
+
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const expectedSigBuf = await hmacSha256(jwtSecret, signingInput);
+  const expectedSigB64 = bytesToBase64Url(new Uint8Array(expectedSigBuf));
+  if (!timingSafeEqualStr(sigB64, expectedSigB64)) return null;
+
+  const headerBytes = base64UrlToBytes(headerB64);
+  const payloadBytes = base64UrlToBytes(payloadB64);
+  if (!headerBytes || !payloadBytes) return null;
+
+  try {
+    const dec = new TextDecoder();
+    const header = JSON.parse(dec.decode(headerBytes)) as { alg?: string; typ?: string };
+    if (header.alg !== 'HS256') return null;
+
+    const claims = JSON.parse(dec.decode(payloadBytes)) as Partial<JwtClaims>;
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      typeof claims.sub !== 'string' ||
+      typeof claims.tid !== 'string' ||
+      typeof claims.sid !== 'string' ||
+      typeof claims.exp !== 'number' ||
+      claims.exp <= now
+    ) {
+      return null;
+    }
+    return {
+      sub: claims.sub,
+      tid: claims.tid,
+      sid: claims.sid,
+      adm: Boolean(claims.adm),
+      iat: Number(claims.iat || 0),
+      exp: claims.exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function hashSessionIdentifier(sessionId: string, jwtSecret: string): Promise<string> {
+  return toHex(await hmacSha256(jwtSecret, sessionId));
+}
+
+export function isTelegramIdAdmin(telegramId: string, adminTelegramIdsRaw?: string): boolean {
+  if (!telegramId || !adminTelegramIdsRaw) return false;
+  const normalizedTarget = telegramId.trim();
+  if (!/^\d+$/.test(normalizedTarget)) return false;
+
+  const configuredIds = adminTelegramIdsRaw
+    .split(',')
+    .map((id) => id.trim())
+    .filter((id) => /^\d+$/.test(id));
+
+  for (const allowedId of configuredIds) {
+    if (timingSafeEqualStr(normalizedTarget, allowedId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function getTelegramBotInfoEdge(env: Env): Promise<TelegramBotPublicInfo> {
+  const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (!botToken) {
+    return { botName: null, botUsername: null };
+  }
+
+  const cacheKeyBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(botToken));
+  const cacheKey = toHex(cacheKeyBuffer);
+  const cached = botInfoCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.info;
+  }
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
+      method: 'GET',
+      signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(3500) : undefined,
+    });
+    if (!resp.ok) {
+      return { botName: null, botUsername: null };
+    }
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      result?: { first_name?: string; username?: string };
+    };
+    if (!data?.ok || !data.result) {
+      return { botName: null, botUsername: null };
+    }
+    const info: TelegramBotPublicInfo = {
+      botName: data.result.first_name ? sanitizeText(data.result.first_name, 80) : null,
+      botUsername: data.result.username ? sanitizeText(data.result.username, 64) : null,
+    };
+    botInfoCache.set(cacheKey, { info, expiresAt: Date.now() + 10 * 60_000 });
+    return info;
+  } catch {
+    return { botName: null, botUsername: null };
+  }
 }
 
 export function extractBearerOrCookie(request: Request, cookieName: string): string | null {
@@ -274,10 +436,12 @@ export async function resolveEdgeUserSession(
   request: Request,
   env: Env
 ): Promise<EdgeAuthUser | null> {
-  if (!env.DB) return null;
+  if (!env.DB || !env.JWT_SECRET) return null;
   const token = extractBearerOrCookie(request, 'sofumer_session');
   if (!token) return null;
-  const tokenHash = await hashSessionToken(token, env);
+
+  const claims = await verifyJwtEdge(token, env.JWT_SECRET);
+  if (!claims) return null;
 
   const row = await env.DB.prepare(
     `SELECT s.id as session_id, s.session_type, s.expires_at, s.revoked_at,
@@ -286,17 +450,21 @@ export async function resolveEdgeUserSession(
             u.preferred_currency, u.preferred_language, u.status
      FROM sessions s
      JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = ?`
+     WHERE s.id = ? AND s.user_id = ?`
   )
-    .bind(tokenHash)
+    .bind(claims.sid, claims.sub)
     .first<Record<string, string | null>>();
 
   if (!row || row.revoked_at) return null;
   if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
+  if (String(row.telegram_id) !== claims.tid) return null;
+
+  const tgId = String(row.telegram_id);
+  const isAdmin = isTelegramIdAdmin(tgId, env.ADMIN_TELEGRAM_IDS);
 
   return {
     id: String(row.id),
-    telegram_id: String(row.telegram_id),
+    telegram_id: tgId,
     telegram_username: String(row.telegram_username || ''),
     first_name: String(row.first_name || ''),
     last_name: String(row.last_name || ''),
@@ -308,6 +476,7 @@ export async function resolveEdgeUserSession(
     preferred_currency: String(row.preferred_currency || 'USD'),
     preferred_language: String(row.preferred_language || 'en'),
     status: String(row.status || 'active'),
+    isAdmin,
     sessionId: String(row.session_id),
     sessionType: String(row.session_type || 'telegram'),
   };
@@ -322,7 +491,12 @@ export async function requireEdgeUser(
   }
   const user = await resolveEdgeUserSession(request, env);
   if (!user) {
-    return { error: json({ error: 'Authentication required. Please launch SOFUMER via Telegram.' }, 401) };
+    return {
+      error: json(
+        { error: 'Telegram authentication required. Open SOFUMER inside its official Telegram Mini App.' },
+        401
+      ),
+    };
   }
   if (user.status === 'suspended') {
     return { error: json({ error: 'Your account is currently suspended.' }, 403) };
@@ -355,45 +529,27 @@ export async function requireEdgeAdmin(
   request: Request,
   env: Env
 ): Promise<{ admin: EdgeAdminSession } | { error: Response }> {
-  if (!env.DB) {
-    return { error: json({ error: 'Database binding (DB) is not configured.' }, 503) };
-  }
-  const adminToken = extractBearerOrCookie(request, 'sofumer_admin_session');
-  if (!adminToken) {
-    return { error: json({ error: 'Admin authentication required.' }, 401) };
-  }
-  const tokenHash = await hashSessionToken(adminToken, env);
-  const session = await env.DB.prepare(
-    `SELECT s.id, s.user_id, s.expires_at, s.revoked_at, u.display_name, u.telegram_username
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = ? AND s.session_type = 'admin'`
-  )
-    .bind(tokenHash)
-    .first<Record<string, string | null>>();
+  const auth = await requireEdgeUser(request, env);
+  if ('error' in auth) return auth;
 
-  if (!session || session.revoked_at) {
-    return { error: json({ error: 'Invalid or revoked admin session.' }, 401) };
-  }
-  if (session.expires_at && new Date(session.expires_at).getTime() < Date.now()) {
-    return { error: json({ error: 'Admin session expired.' }, 401) };
-  }
-
-  const rolesRes = await env.DB.prepare('SELECT role FROM user_roles WHERE user_id = ?')
-    .bind(session.user_id)
-    .all<{ role: string }>();
-  const adminRole = rolesRes.results.find((r) =>
-    ['super_admin', 'admin', 'moderator'].includes(r.role)
-  );
-  if (!adminRole) {
-    return { error: json({ error: 'Insufficient administrative privileges.' }, 403) };
+  if (!isTelegramIdAdmin(auth.user.telegram_id, env.ADMIN_TELEGRAM_IDS)) {
+    return {
+      error: json(
+        { error: 'Administrator privileges required. Your Telegram ID is not authorized in ADMIN_TELEGRAM_IDS.' },
+        403
+      ),
+    };
   }
 
   return {
     admin: {
-      sessionId: String(session.id),
-      adminIdentifier: String(session.telegram_username || session.display_name || session.user_id),
-      role: adminRole.role,
+      sessionId: auth.user.sessionId,
+      userId: auth.user.id,
+      telegramId: auth.user.telegram_id,
+      adminIdentifier: auth.user.telegram_username
+        ? `@${auth.user.telegram_username}`
+        : auth.user.display_name || auth.user.telegram_id,
+      role: 'super_admin',
     },
   };
 }
@@ -481,11 +637,7 @@ export async function notifyUserAndTelegramEdge(
     .bind(userId)
     .first<{ telegram_id: string }>();
 
-  if (
-    user?.telegram_id &&
-    !user.telegram_id.startsWith('admin_') &&
-    !user.telegram_id.startsWith('sandbox_')
-  ) {
+  if (user?.telegram_id && /^\d+$/.test(user.telegram_id)) {
     const miniAppUrl = env.MINI_APP_URL || originUrl;
     const sent = await sendTelegramBotMessageEdge(
       env,

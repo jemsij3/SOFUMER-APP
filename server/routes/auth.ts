@@ -1,17 +1,17 @@
 import { Router } from 'express';
-import crypto from 'crypto';
 import { db, newId } from '../db.ts';
 import {
-  buildSignedSandboxInitData,
-  getSessionSecret,
-  hashToken,
-  optionalAuth,
+  getJwtSecret,
+  hashSessionId,
+  isTelegramIdAdmin,
   rateLimit,
   requireAuth,
+  resolveUserSession,
   sanitizeText,
+  signJwt,
   verifyTelegramInitData,
 } from '../security.ts';
-import { getTelegramBotConfig } from '../telegram.ts';
+import { getTelegramBotConfig, getTelegramBotInfo } from '../telegram.ts';
 
 export const authRouter = Router();
 
@@ -24,7 +24,6 @@ function createSessionForTelegramUser(
     language_code?: string;
     photo_url?: string;
   },
-  sessionType: 'telegram' | 'sandbox',
   ipAddress: string,
   userAgent: string
 ) {
@@ -79,27 +78,32 @@ function createSessionForTelegramUser(
     );
   }
 
-  const rawToken = crypto.randomBytes(32).toString('hex');
-  const tokenHash = hashToken(rawToken);
+  const sessionId = newId('sess');
+  const tokenHash = hashSessionId(sessionId);
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
   db.prepare(
     `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(newId('sess'), userId, tokenHash, sessionType, ipAddress, userAgent.slice(0, 200), expiresAt);
+     VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
+  ).run(sessionId, userId, tokenHash, ipAddress, userAgent.slice(0, 200), expiresAt);
 
-  return { userId, rawToken, expiresAt };
+  const isAdmin = isTelegramIdAdmin(tgId);
+  const jwtToken = signJwt({ sub: userId, tid: tgId, sid: sessionId, adm: isAdmin }, 7 * 86400);
+
+  return { userId, jwtToken, expiresAt, isAdmin };
 }
 
-authRouter.get('/config', (_req, res) => {
+authRouter.get('/config', async (req, res) => {
   const cfg = getTelegramBotConfig();
-  const sandboxAllowed =
-    process.env.NODE_ENV !== 'production' && process.env.ALLOW_DEV_SANDBOX !== 'false';
+  const botInfo = await getTelegramBotInfo();
+  const origin = `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
   res.json({
-    botName: cfg.botName,
-    botUsername: cfg.botUsername,
-    miniAppUrl: cfg.miniAppUrl,
-    sandboxAvailable: sandboxAllowed,
+    botName: botInfo.botName,
+    botUsername: botInfo.botUsername,
+    miniAppUrl: cfg.miniAppUrl || origin,
+    telegramConfigured: Boolean(cfg.botToken),
+    jwtConfigured: Boolean(getJwtSecret()),
+    telegramOnly: true,
   });
 });
 
@@ -109,27 +113,32 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
   const botToken = getTelegramBotConfig().botToken;
   if (!botToken) {
     return res.status(503).json({
-      error: 'SOFUMER Telegram Bot token is not configured on the server yet.',
+      error: 'TELEGRAM_BOT_TOKEN is not configured on the server.',
+    });
+  }
+  if (!getJwtSecret()) {
+    return res.status(503).json({
+      error: 'JWT_SECRET is not configured on the server.',
     });
   }
 
   try {
     const verified = verifyTelegramInitData(initData, botToken);
-    const { rawToken, expiresAt } = createSessionForTelegramUser(
+    const { jwtToken, expiresAt, isAdmin } = createSessionForTelegramUser(
       verified.user,
-      'telegram',
       req.ip || '',
       String(req.headers['user-agent'] || '')
     );
 
-    res.cookie('sofumer_session', rawToken, {
+    res.cookie('sofumer_session', jwtToken, {
       httpOnly: true,
       sameSite: 'none',
       secure: true,
+      partitioned: true,
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ authenticated: true, token: rawToken, expiresAt });
+    return res.json({ authenticated: true, token: jwtToken, expiresAt, isAdmin });
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode || 401;
     return res.status(status).json({
@@ -138,54 +147,11 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
   }
 });
 
-// Non-production cryptographic Telegram sandbox session for browser preview testing
-authRouter.post('/dev-sandbox', rateLimit(20, 60_000, 'auth'), (req, res) => {
-  if (process.env.NODE_ENV === 'production' || process.env.ALLOW_DEV_SANDBOX === 'false') {
-    return res.status(403).json({ error: 'Sandbox authentication is disabled in production.' });
-  }
-
-  const label = sanitizeText(req.body?.name || 'Preview Buyer', 40) || 'Preview Buyer';
-  const handle = sanitizeText(req.body?.handle || 'preview_member', 32).replace(/[^a-zA-Z0-9_]/g, '') || 'preview_member';
-  const numericId = Number(
-    BigInt('0x' + crypto.createHash('sha256').update(handle).digest('hex').slice(0, 10)) % 900000000n + 100000000n
-  );
-
-  const sandboxBotSecret = getSessionSecret();
-  const signedInitData = buildSignedSandboxInitData(
-    {
-      id: numericId,
-      first_name: label.split(' ')[0] || 'Member',
-      last_name: label.split(' ').slice(1).join(' ') || '',
-      username: handle,
-      language_code: 'en',
-    },
-    sandboxBotSecret
-  );
-
-  // Verify through the exact same cryptographic HMAC-SHA256 verification function
-  const verified = verifyTelegramInitData(signedInitData, sandboxBotSecret);
-  const { rawToken, expiresAt } = createSessionForTelegramUser(
-    verified.user,
-    'sandbox',
-    req.ip || '',
-    String(req.headers['user-agent'] || '')
-  );
-
-  res.cookie('sofumer_session', rawToken, {
-    httpOnly: true,
-    sameSite: 'none',
-    secure: true,
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
-
-  res.json({ authenticated: true, token: rawToken, expiresAt, mode: 'sandbox' });
-});
-
-authRouter.get('/me', optionalAuth, (req, res) => {
-  if (!req.authUser) {
+authRouter.get('/me', (req, res) => {
+  const user = resolveUserSession(req);
+  if (!user) {
     return res.json({ authenticated: false, user: null });
   }
-  const user = req.authUser;
 
   const sellerProfile = db
     .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
@@ -200,7 +166,7 @@ authRouter.get('/me', optionalAuth, (req, res) => {
     .get(user.id) as { cnt: number };
 
   const unreadNotifsRow = db
-    .prepare('SELECT COUNT(*) as cnt FROM notifications WHERE (user_id = ? OR scope = \'global\') AND is_read = 0')
+    .prepare("SELECT COUNT(*) as cnt FROM notifications WHERE (user_id = ? OR scope = 'global') AND is_read = 0")
     .get(user.id) as { cnt: number };
 
   const favoriteRows = db
@@ -231,6 +197,6 @@ authRouter.post('/logout', requireAuth, (req, res) => {
       req.authUser.sessionId
     );
   }
-  res.clearCookie('sofumer_session', { sameSite: 'none', secure: true });
+  res.clearCookie('sofumer_session', { sameSite: 'none', secure: true, partitioned: true });
   res.json({ loggedOut: true });
 });

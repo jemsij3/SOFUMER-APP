@@ -67,6 +67,7 @@ export interface User {
   preferred_language: string;
   status: string;
   roles: string[];
+  isAdmin?: boolean;
   aiEnabled?: boolean;
 }
 

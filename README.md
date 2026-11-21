@@ -61,7 +61,7 @@ npm run dev
 
 ```bash
 cp .dev.vars.example .dev.vars
-# Fill in your TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, SESSION_SECRET, ADMIN_BOOTSTRAP_SECRET in .dev.vars
+# Fill in TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, JWT_SECRET, ADMIN_TELEGRAM_IDS in .dev.vars
 npm run build
 npx wrangler d1 migrations apply sofumer-db --local
 npx wrangler dev
@@ -95,8 +95,8 @@ Configure production secrets (never stored in `wrangler.jsonc` or Git):
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
-npx wrangler secret put SESSION_SECRET
-npx wrangler secret put ADMIN_BOOTSTRAP_SECRET
+npx wrangler secret put JWT_SECRET
+npx wrangler secret put ADMIN_TELEGRAM_IDS
 ```
 
 ## 5. Deploy to Existing `sofumer-app` Worker

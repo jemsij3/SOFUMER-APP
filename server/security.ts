@@ -2,27 +2,112 @@ import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { db, newId } from './db.ts';
 
-// Runtime-ephemeral secret fallback only for local dev when SESSION_SECRET env is omitted.
+// Runtime-ephemeral secret fallback only for local non-production dev when JWT_SECRET is omitted.
 const EPHEMERAL_DEV_SECRET = crypto.randomBytes(32).toString('hex');
 
-export function getSessionSecret(): string {
-  return process.env.SESSION_SECRET || EPHEMERAL_DEV_SECRET;
+export function getJwtSecret(): string {
+  const configured = (process.env.JWT_SECRET || '').trim();
+  if (configured) return configured;
+  return process.env.NODE_ENV === 'production' ? '' : EPHEMERAL_DEV_SECRET;
 }
 
-export function getAdminBootstrapSecret(): string {
-  if (process.env.ADMIN_BOOTSTRAP_SECRET) {
-    return process.env.ADMIN_BOOTSTRAP_SECRET;
+export function isTelegramIdAdmin(telegramId: string): boolean {
+  const raw = process.env.ADMIN_TELEGRAM_IDS || '';
+  const target = telegramId.trim();
+  if (!target || !/^\d+$/.test(target) || !raw) return false;
+
+  const allowedIds = raw
+    .split(',')
+    .map((id) => id.trim())
+    .filter((id) => /^\d+$/.test(id));
+
+  const targetBuf = Buffer.from(target, 'utf8');
+  for (const allowed of allowedIds) {
+    const allowedBuf = Buffer.from(allowed, 'utf8');
+    if (targetBuf.length === allowedBuf.length && crypto.timingSafeEqual(targetBuf, allowedBuf)) {
+      return true;
+    }
   }
-  // In development/AI Studio preview, derive a deterministic workspace admin passcode only when env is unset,
-  // and mark it clearly as requiring explicit production configuration.
-  return process.env.NODE_ENV === 'production' ? '' : 'SOFUMER-DEV-ADMIN-2026';
+  return false;
 }
 
-export function hashToken(token: string): string {
-  return crypto
-    .createHmac('sha256', getSessionSecret())
-    .update(token)
-    .digest('hex');
+export function hashSessionId(sessionId: string): string {
+  const secret = getJwtSecret() || EPHEMERAL_DEV_SECRET;
+  return crypto.createHmac('sha256', secret).update(sessionId).digest('hex');
+}
+
+export interface JwtClaims {
+  sub: string;
+  tid: string;
+  sid: string;
+  adm: boolean;
+  iat: number;
+  exp: number;
+}
+
+export function signJwt(
+  claims: Omit<JwtClaims, 'iat' | 'exp'>,
+  ttlSeconds = 7 * 86400
+): string {
+  const secret = getJwtSecret();
+  if (!secret) {
+    throw new Error('JWT_SECRET is not configured on the server.');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const fullClaims: JwtClaims = {
+    ...claims,
+    iat: now,
+    exp: now + ttlSeconds,
+  };
+  const headerB64 = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payloadB64 = Buffer.from(JSON.stringify(fullClaims)).toString('base64url');
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const sigB64 = crypto.createHmac('sha256', secret).update(signingInput).digest('base64url');
+  return `${signingInput}.${sigB64}`;
+}
+
+export function verifyJwt(token: string): JwtClaims | null {
+  const secret = getJwtSecret();
+  if (!token || !secret) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  if (!headerB64 || !payloadB64 || !sigB64) return null;
+
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const expectedSigB64 = crypto.createHmac('sha256', secret).update(signingInput).digest('base64url');
+  const a = Buffer.from(sigB64, 'utf8');
+  const b = Buffer.from(expectedSigB64, 'utf8');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return null;
+  }
+
+  try {
+    const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as { alg?: string };
+    if (header.alg !== 'HS256') return null;
+
+    const claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Partial<JwtClaims>;
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      typeof claims.sub !== 'string' ||
+      typeof claims.tid !== 'string' ||
+      typeof claims.sid !== 'string' ||
+      typeof claims.exp !== 'number' ||
+      claims.exp <= now
+    ) {
+      return null;
+    }
+    return {
+      sub: claims.sub,
+      tid: claims.tid,
+      sid: claims.sid,
+      adm: Boolean(claims.adm),
+      iat: Number(claims.iat || 0),
+      exp: claims.exp,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export interface TelegramInitUser {
@@ -111,17 +196,16 @@ export function verifyTelegramInitData(
 }
 
 /**
- * Generates a cryptographically valid signed Telegram initData payload for dev sandbox verification.
- * Uses the exact same HMAC-SHA256 signing procedure so the real verifier runs end-to-end.
+ * Generates a cryptographically signed Telegram initData payload (used by automated tests).
  */
-export function buildSignedSandboxInitData(
+export function buildSignedTelegramInitData(
   tgUser: TelegramInitUser,
   botToken: string
 ): string {
   const authDate = Math.floor(Date.now() / 1000);
   const params = new URLSearchParams();
   params.set('auth_date', String(authDate));
-  params.set('query_id', `sandbox_${crypto.randomBytes(6).toString('hex')}`);
+  params.set('query_id', `tg_${crypto.randomBytes(6).toString('hex')}`);
   params.set('user', JSON.stringify(tgUser));
 
   const pairs: string[] = [];
@@ -156,6 +240,7 @@ export interface AuthUser {
   preferred_currency: string;
   preferred_language: string;
   status: string;
+  isAdmin: boolean;
   roles: string[];
   sessionType: string;
   sessionId: string;
@@ -167,6 +252,8 @@ declare global {
       authUser?: AuthUser;
       adminSession?: {
         sessionId: string;
+        userId: string;
+        telegramId: string;
         adminIdentifier: string;
         role: string;
       };
@@ -200,7 +287,9 @@ export function extractBearerOrCookie(req: Request, cookieName: string): string 
 export function resolveUserSession(req: Request): AuthUser | null {
   const token = extractBearerOrCookie(req, 'sofumer_session');
   if (!token) return null;
-  const tokenHash = hashToken(token);
+
+  const claims = verifyJwt(token);
+  if (!claims) return null;
 
   const row = db
     .prepare(
@@ -210,22 +299,26 @@ export function resolveUserSession(req: Request): AuthUser | null {
               u.preferred_currency, u.preferred_language, u.status
        FROM sessions s
        JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ?`
+       WHERE s.id = ? AND s.user_id = ?`
     )
-    .get(tokenHash) as Record<string, string | null> | undefined;
+    .get(claims.sid, claims.sub) as Record<string, string | null> | undefined;
 
   if (!row || row.revoked_at) return null;
   if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) {
     return null;
   }
+  if (String(row.telegram_id) !== claims.tid) {
+    return null;
+  }
 
+  const tgId = String(row.telegram_id);
   const roleRows = db
     .prepare('SELECT role FROM user_roles WHERE user_id = ?')
     .all(row.id) as { role: string }[];
 
   return {
     id: String(row.id),
-    telegram_id: String(row.telegram_id),
+    telegram_id: tgId,
     telegram_username: String(row.telegram_username || ''),
     first_name: String(row.first_name || ''),
     last_name: String(row.last_name || ''),
@@ -237,21 +330,19 @@ export function resolveUserSession(req: Request): AuthUser | null {
     preferred_currency: String(row.preferred_currency || 'USD'),
     preferred_language: String(row.preferred_language || 'en'),
     status: String(row.status || 'active'),
+    isAdmin: isTelegramIdAdmin(tgId),
     roles: roleRows.map((r) => r.role),
     sessionType: String(row.session_type || 'telegram'),
     sessionId: String(row.session_id),
   };
 }
 
-export function optionalAuth(req: Request, _res: Response, next: NextFunction) {
-  req.authUser = resolveUserSession(req) || undefined;
-  next();
-}
-
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const user = resolveUserSession(req);
   if (!user) {
-    return res.status(401).json({ error: 'Authentication required. Please launch SOFUMER via Telegram.' });
+    return res
+      .status(401)
+      .json({ error: 'Telegram authentication required. Open SOFUMER inside its official Telegram Mini App.' });
   }
   if (user.status === 'suspended') {
     return res.status(403).json({ error: 'Your account is currently suspended.' });
@@ -277,43 +368,24 @@ export function requireSeller(req: Request, res: Response, next: NextFunction) {
 }
 
 export function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  const adminToken = extractBearerOrCookie(req, 'sofumer_admin_session');
-  if (!adminToken) {
-    return res.status(401).json({ error: 'Admin authentication required.' });
-  }
-  const tokenHash = hashToken(adminToken);
-  const session = db
-    .prepare(
-      `SELECT s.id, s.user_id, s.expires_at, s.revoked_at, u.display_name, u.telegram_username
-       FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ? AND s.session_type = 'admin'`
-    )
-    .get(tokenHash) as Record<string, string | null> | undefined;
-
-  if (!session || session.revoked_at) {
-    return res.status(401).json({ error: 'Invalid or revoked admin session.' });
-  }
-  if (session.expires_at && new Date(session.expires_at).getTime() < Date.now()) {
-    return res.status(401).json({ error: 'Admin session expired.' });
-  }
-
-  const roles = db
-    .prepare('SELECT role FROM user_roles WHERE user_id = ?')
-    .all(session.user_id) as { role: string }[];
-  const adminRole = roles.find((r) =>
-    ['super_admin', 'admin', 'moderator'].includes(r.role)
-  );
-  if (!adminRole) {
-    return res.status(403).json({ error: 'Insufficient administrative privileges.' });
-  }
-
-  req.adminSession = {
-    sessionId: String(session.id),
-    adminIdentifier: String(session.telegram_username || session.display_name || session.user_id),
-    role: adminRole.role,
-  };
-  next();
+  requireAuth(req, res, () => {
+    const user = req.authUser!;
+    if (!isTelegramIdAdmin(user.telegram_id)) {
+      return res.status(403).json({
+        error: 'Administrator privileges required. Your Telegram ID is not authorized in ADMIN_TELEGRAM_IDS.',
+      });
+    }
+    req.adminSession = {
+      sessionId: user.sessionId,
+      userId: user.id,
+      telegramId: user.telegram_id,
+      adminIdentifier: user.telegram_username
+        ? `@${user.telegram_username}`
+        : user.display_name || user.telegram_id,
+      role: 'super_admin',
+    };
+    next();
+  });
 }
 
 // Simple sliding-window in-memory rate limiter for API protection

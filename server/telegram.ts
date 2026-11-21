@@ -1,14 +1,57 @@
 import crypto from 'crypto';
 import { db, newId } from './db.ts';
+import { sanitizeText } from './security.ts';
+
+const botInfoCache = new Map<string, { botName: string | null; botUsername: string | null; expiresAt: number }>();
 
 export function getTelegramBotConfig() {
   return {
-    botName: process.env.TELEGRAM_BOT_NAME || 'SOFUMER',
-    botUsername: process.env.TELEGRAM_BOT_USERNAME || 'SofumerBot',
-    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
-    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
-    miniAppUrl: process.env.MINI_APP_URL || process.env.APP_URL || 'https://sofumer.app',
+    botToken: (process.env.TELEGRAM_BOT_TOKEN || '').trim(),
+    webhookSecret: (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim(),
+    miniAppUrl: process.env.MINI_APP_URL || process.env.APP_URL || '',
   };
+}
+
+export async function getTelegramBotInfo(): Promise<{
+  botName: string | null;
+  botUsername: string | null;
+}> {
+  const { botToken } = getTelegramBotConfig();
+  if (!botToken) {
+    return { botName: null, botUsername: null };
+  }
+
+  const cacheKey = crypto.createHash('sha256').update(botToken).digest('hex');
+  const cached = botInfoCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { botName: cached.botName, botUsername: cached.botUsername };
+  }
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(3500),
+    });
+    if (!resp.ok) {
+      return { botName: null, botUsername: null };
+    }
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      result?: { first_name?: string; username?: string };
+    };
+    if (!data?.ok || !data.result) {
+      return { botName: null, botUsername: null };
+    }
+    const info = {
+      botName: data.result.first_name ? sanitizeText(data.result.first_name, 80) : null,
+      botUsername: data.result.username ? sanitizeText(data.result.username, 64) : null,
+      expiresAt: Date.now() + 10 * 60_000,
+    };
+    botInfoCache.set(cacheKey, info);
+    return { botName: info.botName, botUsername: info.botUsername };
+  } catch {
+    return { botName: null, botUsername: null };
+  }
 }
 
 export async function sendTelegramBotMessage(

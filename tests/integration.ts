@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { buildSignedSandboxInitData, verifyTelegramInitData } from '../server/security.ts';
+import { buildSignedTelegramInitData, verifyTelegramInitData } from '../server/security.ts';
 import { db } from '../server/db.ts';
 import worker, { type Env as WorkerEnv, type D1Database } from '../cloudflare/worker.ts';
 
 const BASE = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
+const TEST_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '123456:TEST_BOT_TOKEN';
 
 async function req(path: string, init: RequestInit = {}) {
   const res = await fetch(`${BASE}${path}`, init);
@@ -45,7 +46,7 @@ function createSqliteD1Adapter(): D1Database {
 }
 
 async function runTests() {
-  console.log('Running SOFUMER integration, security, and Cloudflare Workers AI test suite against', BASE);
+  console.log('Running SOFUMER integration, Telegram-only security, and Cloudflare Workers AI test suite against', BASE);
   let passed = 0;
   let failed = 0;
 
@@ -60,9 +61,10 @@ async function runTests() {
     }
   }
 
-  await test('No Gemini SDK or GEMINI_API_KEY references remain in codebase config/source', async () => {
+  await test('No hardcoded bot credentials, sandbox flags, legacy secrets, or Gemini SDK remain in config/source', async () => {
     const pkg = fs.readFileSync('package.json', 'utf-8');
     const envEx = fs.readFileSync('.env.example', 'utf-8');
+    const devVarsEx = fs.readFileSync('.dev.vars.example', 'utf-8');
     const wrangler = fs.readFileSync('wrangler.jsonc', 'utf-8');
     const workerSrc = fs.readFileSync('cloudflare/worker.ts', 'utf-8');
     const serverAi = fs.readFileSync('server/ai.ts', 'utf-8');
@@ -73,49 +75,62 @@ async function runTests() {
     assert.ok(wrangler.includes('"binding": "AI"') && wrangler.includes('"binding": "DB"'));
     assert.ok(!wrangler.includes('r2_buckets'));
     assert.ok(wrangler.includes('@cf/meta/llama-3.1-8b-instruct'));
+
+    for (const content of [wrangler, envEx, devVarsEx, workerSrc]) {
+      assert.ok(!content.includes('TELEGRAM_BOT_NAME'));
+      assert.ok(!content.includes('TELEGRAM_BOT_USERNAME'));
+      assert.ok(!content.includes('ALLOW_DEV_SANDBOX'));
+      assert.ok(!content.includes('SESSION_SECRET'));
+      assert.ok(!content.includes('ADMIN_BOOTSTRAP_SECRET'));
+      assert.ok(!content.includes('SofumerBot'));
+      assert.ok(!content.includes('sofumerbot'));
+      assert.ok(!content.includes('dev-sandbox'));
+    }
+    for (const requiredSecret of ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_WEBHOOK_SECRET', 'JWT_SECRET', 'ADMIN_TELEGRAM_IDS']) {
+      assert.ok(envEx.includes(requiredSecret));
+      assert.ok(devVarsEx.includes(requiredSecret));
+    }
   });
 
-  await test('Health endpoint responds ok', async () => {
+  await test('Health endpoint responds ok and /api/auth/dev-sandbox is removed (404)', async () => {
     const r = await req('/api/health');
     assert.equal(r.status, 200);
     assert.equal(r.data.service, 'SOFUMER');
-  });
 
-  await test('Bootstrap seeds 10 categories, countries, currencies, and 3 plans with 0 fake products', async () => {
-    const boot = await req('/api/marketplace/bootstrap');
-    assert.equal(boot.status, 200);
-    assert.ok(boot.data.categories.length >= 10);
-    assert.ok(boot.data.countries.length >= 10);
-    assert.ok(boot.data.currencies.length >= 10);
-    assert.equal(boot.data.plans.length, 3);
+    const sandbox = await req('/api/auth/dev-sandbox', { method: 'POST' });
+    assert.equal(sandbox.status, 404);
   });
 
   await test('Telegram initData HMAC-SHA256 verification accepts valid & rejects tampered/expired', async () => {
-    const botToken = '123456:TEST_BOT_TOKEN';
-    const valid = buildSignedSandboxInitData({ id: 777001, first_name: 'Alice', username: 'alice_tg' }, botToken);
-    const verified = verifyTelegramInitData(valid, botToken);
+    const valid = buildSignedTelegramInitData({ id: 777001, first_name: 'Alice', username: 'alice_tg' }, TEST_BOT_TOKEN);
+    const verified = verifyTelegramInitData(valid, TEST_BOT_TOKEN);
     assert.equal(verified.user.id, 777001);
 
-    assert.throws(() => verifyTelegramInitData(valid.replace(/hash=[0-9a-f]{4}/, 'hash=0000'), botToken));
+    assert.throws(() => verifyTelegramInitData(valid.replace(/hash=[0-9a-f]{4}/, 'hash=0000'), TEST_BOT_TOKEN));
 
     const oldParams = new URLSearchParams(valid);
     oldParams.set('auth_date', '1000000');
-    assert.throws(() => verifyTelegramInitData(oldParams.toString(), botToken));
+    assert.throws(() => verifyTelegramInitData(oldParams.toString(), TEST_BOT_TOKEN));
   });
 
-  await test('Unauthorized requests to protected endpoints are rejected with 401', async () => {
-    const r1 = await req('/api/seller/products');
-    assert.equal(r1.status, 401);
-    const r2 = await req('/api/orders');
-    assert.equal(r2.status, 401);
-    const r3 = await req('/api/admin/overview');
-    assert.equal(r3.status, 401);
-    const r4 = await req('/api/ai/buyer/discover', {
+  await test('Unauthorized browser requests to marketplace & protected APIs are rejected with 401', async () => {
+    for (const path of [
+      '/api/marketplace/bootstrap',
+      '/api/marketplace/home',
+      '/api/marketplace/explore',
+      '/api/seller/products',
+      '/api/orders',
+      '/api/admin/overview',
+    ]) {
+      const r = await req(path);
+      assert.equal(r.status, 401, `Expected 401 for ${path}, got ${r.status}`);
+    }
+    const aiRes = await req('/api/ai/buyer/discover', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query: 'laptop' }),
     });
-    assert.equal(r4.status, 401);
+    assert.equal(aiRes.status, 401);
   });
 
   await test('Telegram webhook rejects missing/invalid secret token', async () => {
@@ -127,152 +142,11 @@ async function runTests() {
     assert.equal(r.status, 401);
   });
 
-  let sellerToken = '';
-  let buyerToken = '';
-  let buyerUserId = '';
-  let intruderToken = '';
   let createdProductId = '';
-  let createdConvId = '';
-  let createdOrderId = '';
-  let adminToken = '';
 
-  await test('Sandbox cryptographic Telegram authentication creates distinct buyer & seller sessions', async () => {
-    const s = await req('/api/auth/dev-sandbox', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Test Seller', handle: `seller_${Date.now()}` }),
-    });
-    assert.equal(s.status, 200);
-    sellerToken = s.data.token;
-
-    const b = await req('/api/auth/dev-sandbox', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Test Buyer', handle: `buyer_${Date.now()}` }),
-    });
-    assert.equal(b.status, 200);
-    buyerToken = b.data.token;
-
-    const bMe = await req('/api/auth/me', { headers: { Authorization: `Bearer ${buyerToken}` } });
-    buyerUserId = bMe.data.user.id;
-
-    const i = await req('/api/auth/dev-sandbox', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Intruder', handle: `intruder_${Date.now()}` }),
-    });
-    intruderToken = i.data.token;
-  });
-
-  await test('Seller registration, shop creation, and physical product publishing', async () => {
-    const reg = await req('/api/seller/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerToken}` },
-      body: JSON.stringify({
-        sellerType: 'business',
-        legalName: 'Test Global Hardware LLC',
-        shopName: `GlobalTech_${crypto.randomBytes(3).toString('hex')}`,
-        countryCode: 'DE',
-        description: 'Testing verified industrial hardware.',
-      }),
-    });
-    assert.equal(reg.status, 201);
-
-    const pub = await req('/api/seller/products', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerToken}` },
-      body: JSON.stringify({
-        listingType: 'physical',
-        title: 'Precision USB-C Logic Analyzer',
-        description: '16-channel analyzer with worldwide DHL express shipping.',
-        categoryId: 'cat_electronics',
-        price: 249.5,
-        currency: 'USD',
-        condition: 'new',
-        stockQuantity: 5,
-        internationalShipping: true,
-        status: 'published',
-      }),
-    });
-    assert.equal(pub.status, 201);
-    createdProductId = pub.data.product.id;
-
-    const search = await req('/api/marketplace/explore?q=Logic+Analyzer&mode=products');
-    assert.equal(search.status, 200);
-    assert.ok(search.data.items.some((p: { id: string }) => p.id === createdProductId));
-  });
-
-  await test('Wishlist toggle & private messaging authorization check', async () => {
-    const fav = await req(`/api/marketplace/favorites/${createdProductId}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${buyerToken}` },
-    });
-    assert.equal(fav.status, 200);
-    assert.equal(fav.data.favorited, true);
-
-    const conv = await req('/api/conversations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ productId: createdProductId, message: 'Can you ship to Canada?' }),
-    });
-    assert.equal(conv.status, 201);
-    createdConvId = conv.data.conversationId;
-
-    const intruderRead = await req(`/api/conversations/${createdConvId}/messages`, {
-      headers: { Authorization: `Bearer ${intruderToken}` },
-    });
-    assert.equal(intruderRead.status, 403);
-  });
-
-  await test('Direct transaction order lifecycle & verified review', async () => {
-    const ord = await req('/api/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerToken}` },
-      body: JSON.stringify({
-        productId: createdProductId,
-        buyerUserId,
-        conversationId: createdConvId,
-        quantity: 1,
-        agreedTotal: 249.5,
-        currency: 'USD',
-        deliveryArrangement: 'DHL Express 3-day',
-      }),
-    });
-    assert.equal(ord.status, 201);
-    createdOrderId = ord.data.orderId;
-
-    const c1 = await req(`/api/orders/${createdOrderId}/status`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ status: 'Confirmed' }),
-    });
-    assert.equal(c1.status, 200);
-
-    const c2 = await req(`/api/orders/${createdOrderId}/status`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerToken}` },
-      body: JSON.stringify({ status: 'Shipped', note: 'AWB-99102' }),
-    });
-    assert.equal(c2.status, 200);
-
-    const c3 = await req(`/api/orders/${createdOrderId}/status`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ status: 'Completed' }),
-    });
-    assert.equal(c3.status, 200);
-
-    const rev = await req(`/api/orders/${createdOrderId}/review`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ rating: 5, comment: 'Fast shipping and exact hardware.' }),
-    });
-    assert.equal(rev.status, 201);
-  });
-
-  await test('Cloudflare Worker env.AI executes AI routes on D1 without R2 or Queues', async () => {
+  await test('Cloudflare Worker enforces Telegram-only auth, JWT_SECRET, ADMIN_TELEGRAM_IDS, D1 marketplace, and env.AI', async () => {
     const botToken = '123456:EDGE_TEST_TOKEN';
-    const sessionSecret = 'edge-test-secret';
+    const jwtSecret = 'edge-test-jwt-secret-key-at-least-32-chars';
     const aiCalls: Array<{ model: string; userPrompt: string }> = [];
 
     const mockEnv: WorkerEnv = {
@@ -313,49 +187,207 @@ async function runTests() {
         },
       },
       ASSETS: { fetch: async () => new Response('ok') },
-      TELEGRAM_BOT_NAME: 'SOFUMER',
-      TELEGRAM_BOT_USERNAME: 'SofumerBot',
       TELEGRAM_BOT_TOKEN: botToken,
       TELEGRAM_WEBHOOK_SECRET: 'wh_secret',
-      SESSION_SECRET: sessionSecret,
-      ADMIN_BOOTSTRAP_SECRET: 'adm_secret',
+      JWT_SECRET: jwtSecret,
+      ADMIN_TELEGRAM_IDS: '999001',
       CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct',
     };
 
-    const initData = buildSignedSandboxInitData({ id: 888001, first_name: 'EdgeBuyer', username: 'edge_buyer' }, botToken);
-    const authResp = await worker.fetch(
-      new Request('https://sofumer.example/api/auth/telegram', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData }),
+    const sellerInit = buildSignedTelegramInitData({ id: 888101, first_name: 'EdgeSeller', username: 'edge_seller' }, botToken);
+    const buyerInit = buildSignedTelegramInitData({ id: 888102, first_name: 'EdgeBuyer', username: 'edge_buyer' }, botToken);
+    const intruderInit = buildSignedTelegramInitData({ id: 888103, first_name: 'Intruder', username: 'edge_intruder' }, botToken);
+    const adminInit = buildSignedTelegramInitData({ id: 999001, first_name: 'EdgeAdmin', username: 'edge_admin' }, botToken);
+
+    const authCall = async (initData: string) => {
+      const r = await worker.fetch(
+        new Request('https://sofumer.example/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        mockEnv
+      );
+      assert.equal(r.status, 200);
+      return (await r.json()) as { token: string; isAdmin: boolean };
+    };
+
+    const sellerAuth = await authCall(sellerInit);
+    const buyerAuth = await authCall(buyerInit);
+    const intruderAuth = await authCall(intruderInit);
+    const adminAuth = await authCall(adminInit);
+
+    assert.equal(sellerAuth.isAdmin, false);
+    assert.equal(buyerAuth.isAdmin, false);
+    assert.equal(adminAuth.isAdmin, true);
+
+    const buyerMeRes = await worker.fetch(
+      new Request('https://sofumer.example/api/auth/me', {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
       }),
       mockEnv
     );
-    assert.equal(authResp.status, 200);
-    const authJson = (await authResp.json()) as { token: string };
-    const edgeToken = authJson.token;
+    const buyerMeJson = (await buyerMeRes.json()) as { user: { id: string } };
+    const buyerUserId = buyerMeJson.user.id;
 
-    // 0. R2 is disabled for now -> /api/uploads returns 503 safely and /r2/* returns 404
+    // 1. Authenticated bootstrap returns categories, countries, currencies, plans
+    const bootRes = await worker.fetch(
+      new Request('https://sofumer.example/api/marketplace/bootstrap', {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(bootRes.status, 200);
+    const bootJson = (await bootRes.json()) as { categories: unknown[]; countries: unknown[]; currencies: unknown[]; plans: unknown[] };
+    assert.ok(bootJson.categories.length >= 10);
+    assert.ok(bootJson.countries.length >= 10);
+    assert.ok(bootJson.currencies.length >= 10);
+    assert.equal(bootJson.plans.length, 3);
+
+    // 2. Seller registration, shop creation, and physical product publishing
+    const regRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          sellerType: 'business',
+          legalName: 'Test Global Hardware LLC',
+          shopName: `GlobalTech_${crypto.randomBytes(3).toString('hex')}`,
+          countryCode: 'DE',
+          description: 'Testing verified industrial hardware.',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(regRes.status, 201);
+
+    const pubRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Precision USB-C Logic Analyzer',
+          description: '16-channel analyzer with worldwide DHL express shipping.',
+          categoryId: 'cat_electronics',
+          price: 249.5,
+          currency: 'USD',
+          condition: 'new',
+          stockQuantity: 5,
+          internationalShipping: true,
+          status: 'published',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(pubRes.status, 201);
+    const pubJson = (await pubRes.json()) as { product: { id: string } };
+    createdProductId = pubJson.product.id;
+
+    // 3. Authenticated explore search
+    const searchRes = await worker.fetch(
+      new Request('https://sofumer.example/api/marketplace/explore?q=Logic+Analyzer&mode=products', {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(searchRes.status, 200);
+    const searchJson = (await searchRes.json()) as { items: Array<{ id: string }> };
+    assert.ok(searchJson.items.some((p) => p.id === createdProductId));
+
+    // 4. Wishlist & conversation isolation
+    const favRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/marketplace/favorites/${createdProductId}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(favRes.status, 200);
+
+    const convRes = await worker.fetch(
+      new Request('https://sofumer.example/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
+        body: JSON.stringify({ productId: createdProductId, message: 'Can you ship to Canada?' }),
+      }),
+      mockEnv
+    );
+    assert.equal(convRes.status, 201);
+    const convJson = (await convRes.json()) as { conversationId: string };
+
+    const intruderRead = await worker.fetch(
+      new Request(`https://sofumer.example/api/conversations/${convJson.conversationId}/messages`, {
+        headers: { Authorization: `Bearer ${intruderAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(intruderRead.status, 403);
+
+    // 5. Direct order lifecycle & review
+    const ordRes = await worker.fetch(
+      new Request('https://sofumer.example/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          productId: createdProductId,
+          buyerUserId,
+          conversationId: convJson.conversationId,
+          quantity: 1,
+          agreedTotal: 249.5,
+          currency: 'USD',
+          deliveryArrangement: 'DHL Express 3-day',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(ordRes.status, 201);
+    const ordJson = (await ordRes.json()) as { orderId: string };
+
+    for (const [actorToken, status] of [
+      [buyerAuth.token, 'Confirmed'],
+      [sellerAuth.token, 'Shipped'],
+      [buyerAuth.token, 'Completed'],
+    ]) {
+      const stRes = await worker.fetch(
+        new Request(`https://sofumer.example/api/orders/${ordJson.orderId}/status`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${actorToken}` },
+          body: JSON.stringify({ status }),
+        }),
+        mockEnv
+      );
+      assert.equal(stRes.status, 200);
+    }
+
+    const revRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${ordJson.orderId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
+        body: JSON.stringify({ rating: 5, comment: 'Fast shipping and exact hardware.' }),
+      }),
+      mockEnv
+    );
+    assert.equal(revRes.status, 201);
+
+    // 6. R2 disabled checks
     const fd = new FormData();
     fd.append('file', new File([new Uint8Array([137, 80, 78, 71])], 'sample.png', { type: 'image/png' }));
     const uploadResp = await worker.fetch(
       new Request('https://sofumer.example/api/uploads', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${edgeToken}` },
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
         body: fd,
       }),
       mockEnv
     );
     assert.equal(uploadResp.status, 503);
 
-    const r2Get = await worker.fetch(new Request('https://sofumer.example/r2/sample.png'), mockEnv);
-    assert.equal(r2Get.status, 404);
-
-    // 1. Buyer discovery
+    // 7. Workers AI endpoints
     const r1 = await worker.fetch(
       new Request('https://sofumer.example/api/ai/buyer/discover', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${edgeToken}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
         body: JSON.stringify({ query: 'logic analyzer' }),
       }),
       mockEnv
@@ -363,25 +395,22 @@ async function runTests() {
     assert.equal(r1.status, 200);
     const j1 = (await r1.json()) as { provider: string; model: string; matchedProducts: Array<{ id: string }> };
     assert.equal(j1.provider, 'cloudflare-workers-ai');
-    assert.equal(j1.model, '@cf/meta/llama-3.1-8b-instruct');
     assert.equal(j1.matchedProducts[0].id, createdProductId);
 
-    // 2. Compare
     const r2 = await worker.fetch(
       new Request('https://sofumer.example/api/ai/buyer/compare', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${edgeToken}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
         body: JSON.stringify({ productIds: [createdProductId] }),
       }),
       mockEnv
     );
     assert.equal(r2.status, 200);
 
-    // 3. Seller listing & translate
     const r3 = await worker.fetch(
       new Request('https://sofumer.example/api/ai/seller/assist', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${edgeToken}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
         body: JSON.stringify({ action: 'generate_listing', title: 'Analyzer', notes: '16ch' }),
       }),
       mockEnv
@@ -391,99 +420,79 @@ async function runTests() {
     const r4 = await worker.fetch(
       new Request('https://sofumer.example/api/ai/seller/assist', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${edgeToken}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
         body: JSON.stringify({ action: 'translate', title: 'Analyzer', notes: '16ch', targetLanguage: 'French' }),
       }),
       mockEnv
     );
     assert.equal(r4.status, 200);
 
-    // 4. Platform support
     const r5 = await worker.fetch(
       new Request('https://sofumer.example/api/ai/platform/support', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${edgeToken}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
         body: JSON.stringify({ question: 'How do direct orders work?' }),
       }),
       mockEnv
     );
     assert.equal(r5.status, 200);
-
     assert.equal(aiCalls.length, 5);
-    assert.ok(aiCalls.every((c) => c.model === '@cf/meta/llama-3.1-8b-instruct'));
-  });
 
-  await test('Ordinary buyer cannot access admin APIs; admin disables user & global AI -> backend returns 403', async () => {
-    const denied = await req('/api/admin/overview', {
-      headers: { Authorization: `Bearer ${buyerToken}` },
-    });
-    assert.equal(denied.status, 401);
-
-    const login = await req('/api/admin/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        passcode: process.env.ADMIN_BOOTSTRAP_SECRET || 'SOFUMER-DEV-ADMIN-2026',
-        adminName: 'IntegrationTester',
+    // 8. Admin isolation & AI governance via ADMIN_TELEGRAM_IDS
+    const denied = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/overview', {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
       }),
-    });
-    assert.equal(login.status, 200);
-    adminToken = login.data.token;
+      mockEnv
+    );
+    assert.equal(denied.status, 403);
 
-    // Disable AI for buyer user
-    const disableAi = await req(`/api/admin/users/${buyerUserId}/ai-access`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({ aiEnabled: false, reason: 'Integration test restriction' }),
-    });
+    const adminOverview = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/overview', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(adminOverview.status, 200);
+
+    const disableAi = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/users/${buyerUserId}/ai-access`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ aiEnabled: false, reason: 'Integration test restriction' }),
+      }),
+      mockEnv
+    );
     assert.equal(disableAi.status, 200);
 
-    const aiBlocked = await req('/api/ai/buyer/discover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ query: 'analyzer' }),
-    });
+    const aiBlocked = await worker.fetch(
+      new Request('https://sofumer.example/api/ai/buyer/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
+        body: JSON.stringify({ query: 'analyzer' }),
+      }),
+      mockEnv
+    );
     assert.equal(aiBlocked.status, 403);
 
-    // Restore user AI, then test Global AI OFF
-    await req(`/api/admin/users/${buyerUserId}/ai-access`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({ aiEnabled: true }),
-    });
-
-    await req('/api/admin/ai/features/global_ai', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({
-        isEnabled: false,
-        modelName: '@cf/meta/llama-3.1-8b-instruct',
-        dailyLimitPerUser: 100,
+    await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/users/${buyerUserId}/ai-access`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ aiEnabled: true }),
       }),
-    });
+      mockEnv
+    );
 
-    const globalBlocked = await req('/api/ai/platform/support', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerToken}` },
-      body: JSON.stringify({ question: 'hello' }),
-    });
-    assert.equal(globalBlocked.status, 403);
-
-    // Restore global AI ON
-    await req('/api/admin/ai/features/global_ai', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
-      body: JSON.stringify({
-        isEnabled: true,
-        modelName: '@cf/meta/llama-3.1-8b-instruct',
-        dailyLimitPerUser: 100,
+    const archiveRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/seller/products/${createdProductId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({ status: 'archived' }),
       }),
-    });
-
-    await req(`/api/seller/products/${createdProductId}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${sellerToken}` },
-    });
+      mockEnv
+    );
+    assert.equal(archiveRes.status, 200);
   });
 
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);

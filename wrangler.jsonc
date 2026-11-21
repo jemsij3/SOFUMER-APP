@@ -10,10 +10,7 @@
     "not_found_handling": "single-page-application"
   },
   "vars": {
-    "TELEGRAM_BOT_NAME": "SOFUMER",
-    "TELEGRAM_BOT_USERNAME": "SofumerBot",
-    "CLOUDFLARE_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct",
-    "ALLOW_DEV_SANDBOX": "false"
+    "CLOUDFLARE_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct"
   },
   "d1_databases": [
     {

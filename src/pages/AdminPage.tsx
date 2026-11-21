@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ArrowLeft, Lock, ShieldCheck } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { apiFetch, getAdminToken, setAdminToken } from '../lib/api';
+import { apiFetch } from '../lib/api';
 
 type AdminTab =
   | 'overview'
@@ -49,12 +49,11 @@ const ADMIN_TABS: Array<{ key: AdminTab; label: string }> = [
 ];
 
 export function AdminPage() {
-  const { switchTab, refreshBootstrap, notify } = useApp();
+  const { user, switchTab, refreshBootstrap, notify } = useApp();
 
   const [adminSession, setAdminSession] = useState<{ adminIdentifier: string; role: string } | null>(null);
   const [checkingAuth, setCheckingAuth] = useState(true);
-  const [passcode, setPasscode] = useState('');
-  const [adminName, setAdminName] = useState('Platform Owner');
+  const [authError, setAuthError] = useState<string | null>(null);
   const [tab, setTab] = useState<AdminTab>('overview');
 
   // Module datasets
@@ -100,28 +99,18 @@ export function AdminPage() {
   const [broadcastBody, setBroadcastBody] = useState('');
 
   useEffect(() => {
-    if (!getAdminToken()) {
-      // Also check cookie session
-      apiFetch<{ authenticated: boolean; admin: { adminIdentifier: string; role: string } }>(
-        '/api/admin/auth/me',
-        { isAdmin: true }
-      )
-        .then((res) => setAdminSession(res.admin))
-        .catch(() => setAdminSession(null))
-        .finally(() => setCheckingAuth(false));
-      return;
-    }
+    setCheckingAuth(true);
+    setAuthError(null);
     apiFetch<{ authenticated: boolean; admin: { adminIdentifier: string; role: string } }>(
-      '/api/admin/auth/me',
-      { isAdmin: true }
+      '/api/admin/auth/me'
     )
       .then((res) => setAdminSession(res.admin))
-      .catch(() => {
-        setAdminToken(null);
+      .catch((err) => {
         setAdminSession(null);
+        setAuthError(err instanceof Error ? err.message : 'Administrator privileges required.');
       })
       .finally(() => setCheckingAuth(false));
-  }, []);
+  }, [user?.id, user?.telegram_id]);
 
   const loadTabData = useCallback(async (activeTab: AdminTab) => {
     try {
@@ -195,37 +184,8 @@ export function AdminPage() {
     }
   }, [adminSession, tab, loadTabData]);
 
-  async function handleAdminLogin(e: React.FormEvent) {
-    e.preventDefault();
-    try {
-      const res = await apiFetch<{ token: string; adminIdentifier: string; role: string }>(
-        '/api/admin/auth/login',
-        {
-          method: 'POST',
-          body: JSON.stringify({ passcode, adminName }),
-        }
-      );
-      setAdminToken(res.token);
-      setAdminSession({ adminIdentifier: res.adminIdentifier, role: res.role });
-      setPasscode('');
-      notify('Admin portal authenticated', 'success');
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Invalid administrator credentials', 'error');
-    }
-  }
-
-  async function handleAdminLogout() {
-    try {
-      await apiFetch('/api/admin/auth/logout', { method: 'POST', isAdmin: true });
-    } catch {
-      // Ignore
-    }
-    setAdminToken(null);
-    setAdminSession(null);
-  }
-
   if (checkingAuth) {
-    return <div className="p-8 text-sm text-slate-400">Verifying administrative session...</div>;
+    return <div className="p-8 text-sm text-slate-400">Verifying Telegram administrator permissions...</div>;
   }
 
   if (!adminSession) {
@@ -236,45 +196,35 @@ export function AdminPage() {
           <span>Return to Marketplace</span>
         </button>
 
-        <form onSubmit={handleAdminLogin} className="p-6 sm:p-7 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-4">
+        <div className="p-6 sm:p-7 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-4">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-purple-950/60 border border-purple-700/50 flex items-center justify-center">
               <Lock className="w-5 h-5 text-purple-300" />
             </div>
             <div>
-              <h1 className="text-lg font-bold text-white">SOFUMER Admin Portal</h1>
-              <p className="text-xs text-slate-400">Isolated server-authorized governance console</p>
+              <h1 className="text-lg font-bold text-white">Administrator Access Restricted</h1>
+              <p className="text-xs text-slate-400">Authorized Telegram Admin IDs only</p>
             </div>
           </div>
 
-          <div>
-            <label className="block text-xs text-slate-400 mb-1">Administrator Identifier</label>
-            <input
-              type="text"
-              required
-              value={adminName}
-              onChange={(e) => setAdminName(e.target.value)}
-              className="w-full h-11 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-sm text-white"
-            />
-          </div>
-          <div>
-            <label className="block text-xs text-slate-400 mb-1">Server Bootstrap Secret / Passcode</label>
-            <input
-              type="password"
-              required
-              value={passcode}
-              onChange={(e) => setPasscode(e.target.value)}
-              placeholder="Enter ADMIN_BOOTSTRAP_SECRET"
-              className="w-full h-11 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-sm text-white"
-            />
-          </div>
-          <button type="submit" className="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold">
-            Authenticate Admin Session
-          </button>
-          <p className="text-[11px] text-slate-500 leading-relaxed">
-            Ordinary Telegram buyer sessions cannot access admin APIs. Set <code className="text-slate-300">ADMIN_BOOTSTRAP_SECRET</code> in production environment secrets.
+          <p className="text-xs text-slate-300 leading-relaxed">
+            {authError || 'Your Telegram account is not authorized in ADMIN_TELEGRAM_IDS.'}
           </p>
-        </form>
+
+          {user?.telegram_id && (
+            <div className="p-3 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-400 font-mono-nums">
+              Current Telegram ID: <span className="text-slate-200">{user.telegram_id}</span>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => switchTab('home')}
+            className="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold"
+          >
+            Return to Marketplace
+          </button>
+        </div>
       </div>
     );
   }
@@ -288,16 +238,13 @@ export function AdminPage() {
           <div>
             <h1 className="text-lg font-bold text-white">SOFUMER Governance Console</h1>
             <p className="text-xs text-slate-400">
-              Signed in as {adminSession.adminIdentifier} · Role: {adminSession.role}
+              Signed in via Telegram as {adminSession.adminIdentifier} · Role: {adminSession.role}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => switchTab('home')} className="h-9 px-3.5 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-slate-200">
             Marketplace View
-          </button>
-          <button type="button" onClick={handleAdminLogout} className="h-9 px-3.5 rounded-lg bg-red-950/60 border border-red-800/50 text-xs text-red-200">
-            Admin Logout
           </button>
         </div>
       </div>

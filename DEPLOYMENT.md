@@ -18,9 +18,9 @@
 SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from another project).
 
 1. Open `@BotFather` on Telegram and run `/newbot`.
-2. Name: `SOFUMER`, Username: e.g. `SofumerBot`.
+2. Choose your bot display name and handle (public bot info is automatically retrieved via Telegram `getMe` from `TELEGRAM_BOT_TOKEN`).
 3. Copy the Bot Token (`TELEGRAM_BOT_TOKEN`).
-4. Configure the Mini App button in `@BotFather` (`/newapp` or `/setmenubutton`) pointing to your production HTTPS URL (`MINI_APP_URL`).
+4. Configure the Mini App button in `@BotFather` (`/newapp` or `/setmenubutton`) pointing to your production HTTPS URL (`https://sofumer-app.derartuaman8.workers.dev`).
 5. Generate a random 32+ character webhook secret (`TELEGRAM_WEBHOOK_SECRET`).
 6. Register the webhook:
    ```bash
@@ -38,19 +38,16 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 | Variable / Secret | Scope | Required | Purpose |
 | :--- | :--- | :--- | :--- |
-| `TELEGRAM_BOT_TOKEN` | Server Secret | Yes (Prod) | Verifies Telegram `initData` HMAC-SHA256 & sends bot messages |
-| `TELEGRAM_WEBHOOK_SECRET` | Server Secret | Yes (Prod) | Validates `X-Telegram-Bot-Api-Secret-Token` header on webhook |
-| `TELEGRAM_BOT_NAME` | Env Var | Yes | Bot display name (`SOFUMER`) |
-| `TELEGRAM_BOT_USERNAME` | Env Var | Yes | Bot handle without `@` (e.g. `SofumerBot`) |
-| `MINI_APP_URL` | Env Var | Yes | Public HTTPS URL of the SOFUMER Mini App |
-| `SESSION_SECRET` | Server Secret | Yes (Prod) | Signs user and admin session token hashes |
-| `ADMIN_BOOTSTRAP_SECRET` | Server Secret | Yes | Server-side passcode to authenticate the initial Owner Admin |
+| `TELEGRAM_BOT_TOKEN` | Cloudflare Secret | Yes | Verifies Telegram `initData` HMAC-SHA256, resolves bot info via `getMe`, and sends bot messages |
+| `TELEGRAM_WEBHOOK_SECRET` | Cloudflare Secret | Yes | Validates `X-Telegram-Bot-Api-Secret-Token` header on webhook |
+| `JWT_SECRET` | Cloudflare Secret | Yes | Signs & verifies HS256 JWT authentication tokens for Telegram users |
+| `ADMIN_TELEGRAM_IDS` | Cloudflare Secret | Yes | Comma-separated numeric Telegram user IDs authorized for the Admin Governance Console |
+| `MINI_APP_URL` | Env Var (Optional) | No | Optional override for Mini App URL used in Telegram bot buttons |
 | `CLOUDFLARE_AI_MODEL` | `wrangler.jsonc` Var | Yes | Cloudflare Workers AI model (default: `@cf/meta/llama-3.1-8b-instruct`) |
 | `CLOUDFLARE_ACCOUNT_ID` | Local Dev Only | Optional | Used only when running Node.js `server.ts` outside Cloudflare Workers |
 | `CLOUDFLARE_AI_API_TOKEN` | Local Dev Only | Optional | Workers AI REST token when testing AI from Node.js outside Wrangler |
-| `ALLOW_DEV_SANDBOX` | Env Var | Prod: `false` | Enables cryptographic preview sandbox outside Telegram in dev only |
 
-> **Note:** In Cloudflare Workers production, AI runs natively via the `ai` binding (`env.AI`) declared in `wrangler.jsonc`. No external AI API key is needed in production.
+> **Note:** SOFUMER enforces strict Telegram Mini App-only authentication. Standard public browser access without valid Telegram `initData` is rejected on both the UI and all marketplace/commerce/AI/admin API endpoints.
 
 ---
 
@@ -63,12 +60,12 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
    ```bash
    npx wrangler d1 migrations apply sofumer-db --remote
    ```
-5. **Configure Cloudflare Secrets**:
+3. **Configure Cloudflare Secrets**:
    ```bash
    npx wrangler secret put TELEGRAM_BOT_TOKEN
    npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
-   npx wrangler secret put SESSION_SECRET
-   npx wrangler secret put ADMIN_BOOTSTRAP_SECRET
+   npx wrangler secret put JWT_SECRET
+   npx wrangler secret put ADMIN_TELEGRAM_IDS
    ```
 6. **Build and Deploy**:
    ```bash

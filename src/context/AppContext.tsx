@@ -25,8 +25,10 @@ interface AppContextValue {
   sellerProfile: SellerProfile | null;
   shop: Shop | null;
   authLoading: boolean;
-  sandboxAvailable: boolean;
+  authError: string | null;
+  botName: string;
   botUsername: string;
+  telegramConfigured: boolean;
   categories: Category[];
   subcategories: Subcategory[];
   countries: Country[];
@@ -45,8 +47,9 @@ interface AppContextValue {
   navigate: (next: SubView) => void;
   goBack: () => void;
   switchTab: (tab: NavTab) => void;
-  refreshSession: () => Promise<void>;
+  refreshSession: () => Promise<boolean>;
   refreshBootstrap: () => Promise<void>;
+  retryTelegramAuth: () => Promise<void>;
   toggleFavorite: (productId: string) => Promise<void>;
   showAuthModal: boolean;
   setShowAuthModal: (open: boolean) => void;
@@ -70,8 +73,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sellerProfile, setSellerProfile] = useState<SellerProfile | null>(null);
   const [shop, setShop] = useState<Shop | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [sandboxAvailable, setSandboxAvailable] = useState(false);
-  const [botUsername, setBotUsername] = useState('SofumerBot');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [botName, setBotName] = useState('');
+  const [botUsername, setBotUsername] = useState('');
+  const [telegramConfigured, setTelegramConfigured] = useState(false);
 
   const [categories, setCategories] = useState<Category[]>([]);
   const [subcategories, setSubcategories] = useState<Subcategory[]>([]);
@@ -155,7 +160,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const refreshSession = useCallback(async () => {
+  const refreshSession = useCallback(async (): Promise<boolean> => {
     try {
       const me = await apiFetch<{
         authenticated: boolean;
@@ -176,6 +181,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setFavoriteIds(new Set(me.favoriteProductIds || []));
         if (me.user.preferred_currency) setDisplayCurrency(me.user.preferred_currency);
         if (me.user.preferred_language) setLanguage(me.user.preferred_language);
+        await refreshBootstrap();
+        return true;
       } else {
         setUser(null);
         setSellerProfile(null);
@@ -183,48 +190,52 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setUnreadMessages(0);
         setUnreadNotifications(0);
         setFavoriteIds(new Set());
+        return false;
       }
     } catch {
       setUser(null);
+      return false;
     }
-  }, []);
+  }, [refreshBootstrap]);
+
+  const authenticateTelegram = useCallback(async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const cfg = await apiFetch<{
+        botName: string | null;
+        botUsername: string | null;
+        telegramConfigured: boolean;
+      }>('/api/auth/config');
+      setBotName(cfg.botName || '');
+      setBotUsername(cfg.botUsername || '');
+      setTelegramConfigured(Boolean(cfg.telegramConfigured));
+    } catch {
+      // Ignore config lookup errors
+    }
+
+    const initData = getTelegramInitData();
+    if (initData) {
+      try {
+        const authRes = await apiFetch<{ token: string }>('/api/auth/telegram', {
+          method: 'POST',
+          body: JSON.stringify({ initData }),
+        });
+        if (authRes.token) setUserToken(authRes.token);
+      } catch (err) {
+        setUserToken(null);
+        setAuthError(err instanceof Error ? err.message : 'Telegram Mini App verification failed.');
+      }
+    }
+
+    await refreshSession();
+    setAuthLoading(false);
+  }, [refreshSession]);
 
   useEffect(() => {
     initTelegramMiniApp();
-
-    async function boot() {
-      setAuthLoading(true);
-      await refreshBootstrap();
-      try {
-        const cfg = await apiFetch<{
-          botUsername: string;
-          sandboxAvailable: boolean;
-        }>('/api/auth/config');
-        setBotUsername(cfg.botUsername || 'SofumerBot');
-        setSandboxAvailable(Boolean(cfg.sandboxAvailable));
-      } catch {
-        // Ignore
-      }
-
-      const initData = getTelegramInitData();
-      if (initData) {
-        try {
-          const authRes = await apiFetch<{ token: string }>('/api/auth/telegram', {
-            method: 'POST',
-            body: JSON.stringify({ initData }),
-          });
-          if (authRes.token) setUserToken(authRes.token);
-        } catch {
-          // Will prompt user if Telegram auth fails
-        }
-      }
-
-      await refreshSession();
-      setAuthLoading(false);
-    }
-
-    boot();
-  }, [refreshBootstrap, refreshSession]);
+    authenticateTelegram();
+  }, [authenticateTelegram]);
 
   const requireUserOrPrompt = useCallback(() => {
     if (user) return true;
@@ -274,8 +285,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         sellerProfile,
         shop,
         authLoading,
-        sandboxAvailable,
+        authError,
+        botName,
         botUsername,
+        telegramConfigured,
         categories,
         subcategories,
         countries,
@@ -296,6 +309,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         switchTab,
         refreshSession,
         refreshBootstrap,
+        retryTelegramAuth: authenticateTelegram,
         toggleFavorite,
         showAuthModal,
         setShowAuthModal,

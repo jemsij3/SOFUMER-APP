@@ -5,7 +5,6 @@ import {
   newId,
   parseJsonBody,
   requireEdgeUser,
-  resolveEdgeUserSession,
   sanitizeText,
 } from './helpers.ts';
 
@@ -38,6 +37,10 @@ export async function handleMarketplaceRoutes(
   if (!url.pathname.startsWith('/api/marketplace/')) return null;
   if (!env.DB) return json({ error: 'Database binding (DB) is not configured.' }, 503);
 
+  const auth = await requireEdgeUser(request, env);
+  if ('error' in auth) return auth.error;
+  const authUser = auth.user;
+
   const sub = url.pathname.slice('/api/marketplace'.length);
 
   if (sub === '/bootstrap') {
@@ -65,7 +68,6 @@ export async function handleMarketplaceRoutes(
 
   if (sub === '/home') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const authUser = await resolveEdgeUserSession(request, env);
 
     const [featuredProducts, trendingProducts, newArrivals, featuredShops, activePromotions, totalRow] =
       await Promise.all([
@@ -216,11 +218,10 @@ export async function handleMarketplaceRoutes(
   if (sub.startsWith('/products/')) {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const id = decodeURIComponent(sub.slice('/products/'.length));
-    const authUser = await resolveEdgeUserSession(request, env);
     const product = await env.DB.prepare(
       `${PRODUCT_SELECT} WHERE p.id = ? AND (p.status = 'published' OR p.seller_user_id = ?)`
     )
-      .bind(id, authUser?.id || '')
+      .bind(id, authUser.id)
       .first<Record<string, unknown>>();
 
     if (!product) return json({ error: 'Listing not found or unavailable.' }, 404);
@@ -229,15 +230,13 @@ export async function handleMarketplaceRoutes(
       await env.DB.prepare('UPDATE products SET view_count = view_count + 1 WHERE id = ?')
         .bind(product.id)
         .run();
-      if (authUser) {
-        await env.DB.prepare(
-          `INSERT INTO recently_viewed (id, user_id, product_id, viewed_at)
-           VALUES (?, ?, ?, datetime('now'))
-           ON CONFLICT(user_id, product_id) DO UPDATE SET viewed_at = datetime('now')`
-        )
-          .bind(newId('rv'), authUser.id, product.id)
-          .run();
-      }
+      await env.DB.prepare(
+        `INSERT INTO recently_viewed (id, user_id, product_id, viewed_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(user_id, product_id) DO UPDATE SET viewed_at = datetime('now')`
+      )
+        .bind(newId('rv'), authUser.id, product.id)
+        .run();
     }
 
     const [images, variants, reviews, shop] = await Promise.all([

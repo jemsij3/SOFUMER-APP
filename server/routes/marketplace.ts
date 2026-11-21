@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { db, newId } from '../db.ts';
-import { optionalAuth, requireAuth, sanitizeText } from '../security.ts';
+import { requireAuth, sanitizeText } from '../security.ts';
 
 export const marketplaceRouter = Router();
+marketplaceRouter.use(requireAuth);
 
 const PRODUCT_SELECT = `
   SELECT p.*,
@@ -59,7 +60,7 @@ marketplaceRouter.get('/bootstrap', (_req, res) => {
   });
 });
 
-marketplaceRouter.get('/home', optionalAuth, (req, res) => {
+marketplaceRouter.get('/home', (req, res) => {
   const featuredProducts = db
     .prepare(
       `${PRODUCT_SELECT}
@@ -232,13 +233,13 @@ marketplaceRouter.get('/explore', (req, res) => {
   res.json({ mode, items: products });
 });
 
-marketplaceRouter.get('/products/:id', optionalAuth, (req, res) => {
+marketplaceRouter.get('/products/:id', (req, res) => {
   const product = db
     .prepare(
       `${PRODUCT_SELECT}
        WHERE p.id = ? AND (p.status = 'published' OR p.seller_user_id = ?)`
     )
-    .get(req.params.id, req.authUser?.id || '') as Record<string, unknown> | undefined;
+    .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
 
   if (!product) {
     return res.status(404).json({ error: 'Listing not found or unavailable.' });
@@ -246,13 +247,11 @@ marketplaceRouter.get('/products/:id', optionalAuth, (req, res) => {
 
   if (product.status === 'published') {
     db.prepare('UPDATE products SET view_count = view_count + 1 WHERE id = ?').run(product.id);
-    if (req.authUser) {
-      db.prepare(
-        `INSERT INTO recently_viewed (id, user_id, product_id, viewed_at)
-         VALUES (?, ?, ?, datetime('now'))
-         ON CONFLICT(user_id, product_id) DO UPDATE SET viewed_at = datetime('now')`
-      ).run(newId('rv'), req.authUser.id, product.id);
-    }
+    db.prepare(
+      `INSERT INTO recently_viewed (id, user_id, product_id, viewed_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(user_id, product_id) DO UPDATE SET viewed_at = datetime('now')`
+    ).run(newId('rv'), req.authUser!.id, product.id);
   }
 
   const images = db
