@@ -1,4 +1,4 @@
-name = "sofumer-marketplace"
+name = "sofumer-app"
 main = "cloudflare/worker.ts"
 compatibility_date = "2025-11-01"
 compatibility_flags = ["nodejs_compat"]
@@ -26,9 +26,3 @@ bucket_name = "sofumer-media"
 
 [ai]
 binding = "AI"
-
-[env.development]
-name = "sofumer-marketplace-dev"
-[env.development.vars]
-CLOUDFLARE_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
-ALLOW_DEV_SANDBOX = "true"

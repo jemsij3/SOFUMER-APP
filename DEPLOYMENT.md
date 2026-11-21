@@ -83,5 +83,8 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
    npm run build
    npx wrangler deploy
    ```
+   If using **Cloudflare Workers Builds** (GitHub auto-deploy for Worker `sofumer-app`):
+   - **Build command**: `npm run build`
+   - **Deploy command**: `npx wrangler deploy`
 7. **GitHub Actions CI/CD**:
    Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` to your GitHub Repository Secrets. Pushing to `main` automatically runs `npm run lint`, `npm run build`, applies D1 migrations, and deploys to Cloudflare.
