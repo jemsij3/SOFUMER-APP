@@ -5,12 +5,16 @@ import crypto from 'crypto';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOAD_DIR = path.resolve(process.cwd(), 'storage', 'r2');
+const DIGITAL_DIR = path.resolve(process.cwd(), 'storage', 'digital');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+if (!fs.existsSync(DIGITAL_DIR)) {
+  fs.mkdirSync(DIGITAL_DIR, { recursive: true });
 }
 
 const DB_PATH = path.join(DATA_DIR, 'sofumer.db');
@@ -65,4 +69,18 @@ export function slugify(input: string): string {
 
 export function getUploadDir(): string {
   return UPLOAD_DIR;
+}
+
+export function getDigitalDir(): string {
+  return DIGITAL_DIR;
+}
+
+export function resolveConfinedDigitalPath(storageKey: string): string | null {
+  const cleaned = String(storageKey || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!cleaned || cleaned.includes('\0')) return null;
+  const resolved = path.resolve(DIGITAL_DIR, cleaned);
+  if (resolved !== DIGITAL_DIR && !resolved.startsWith(DIGITAL_DIR + path.sep)) {
+    return null;
+  }
+  return resolved;
 }

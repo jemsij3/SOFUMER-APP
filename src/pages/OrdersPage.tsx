@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ArrowLeft, CheckCircle2, ShieldAlert, Star } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, Download, KeyRound, ShieldAlert, Star } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { apiFetch } from '../lib/api';
-import type { Order, OrderStatus } from '../types';
+import { apiDownload, apiFetch } from '../lib/api';
+import type { Order, OrderDigitalAsset, OrderStatus } from '../types';
 
 interface OrderDetailPayload {
   order: Order;
@@ -35,6 +35,9 @@ export function OrdersPage({ initialOrderId }: { initialOrderId?: string }) {
   const [detail, setDetail] = useState<OrderDetailPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [statusNote, setStatusNote] = useState('');
+  const [digitalAssets, setDigitalAssets] = useState<OrderDigitalAsset[]>([]);
+  const [digitalLockedMsg, setDigitalLockedMsg] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   // Review state
   const [rating, setRating] = useState(5);
@@ -57,10 +60,27 @@ export function OrdersPage({ initialOrderId }: { initialOrderId?: string }) {
     try {
       const res = await apiFetch<OrderDetailPayload>(`/api/orders/${id}`);
       setDetail(res);
+      setDigitalAssets([]);
+      setDigitalLockedMsg(null);
+      const hasDigitalItem = res.items.some((item) => item.listing_type === 'digital');
+      if (hasDigitalItem) {
+        const isSeller = user?.id === res.order.seller_user_id;
+        const unlocked = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'].includes(res.order.status);
+        if (isSeller || unlocked) {
+          try {
+            const dig = await apiFetch<{ assets: OrderDigitalAsset[] }>(`/api/orders/${id}/digital`);
+            setDigitalAssets(dig.assets || []);
+          } catch (digErr) {
+            setDigitalLockedMsg(digErr instanceof Error ? digErr.message : 'Digital package unavailable');
+          }
+        } else {
+          setDigitalLockedMsg('Protected digital files and license keys unlock once the order is Confirmed.');
+        }
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Unable to load order', 'error');
     }
-  }, [notify]);
+  }, [notify, user?.id]);
 
   useEffect(() => {
     if (!user) {
@@ -120,6 +140,22 @@ export function OrdersPage({ initialOrderId }: { initialOrderId?: string }) {
       await loadDetail(detail.order.id);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Review submission failed', 'error');
+    }
+  }
+
+  async function handleDigitalDownload(orderId: string, asset: OrderDigitalAsset) {
+    setDownloadingId(asset.productId);
+    try {
+      await apiDownload(
+        `/api/orders/${orderId}/digital/${asset.productId}/download`,
+        asset.fileName || 'digital-delivery.txt'
+      );
+      notify('Digital delivery downloaded', 'success');
+      await loadDetail(orderId);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Download failed', 'error');
+    } finally {
+      setDownloadingId(null);
     }
   }
 
@@ -227,6 +263,62 @@ export function OrdersPage({ initialOrderId }: { initialOrderId?: string }) {
                   <span className="text-slate-200">{detail.order.delivery_arrangement || 'Agreed directly'}</span>
                 </div>
               </div>
+
+              {(digitalAssets.length > 0 || digitalLockedMsg) && (
+                <div className="p-4 rounded-xl bg-[#070B14] border border-emerald-800/50 space-y-3">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-emerald-300">
+                    <KeyRound className="w-4 h-4" />
+                    <span>Protected Digital Delivery</span>
+                  </div>
+                  {digitalLockedMsg ? (
+                    <p className="text-xs text-slate-400">{digitalLockedMsg}</p>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {digitalAssets.map((asset) => (
+                        <div key={asset.productId} className="p-3 rounded-lg bg-[#0E1525] border border-slate-800 space-y-2 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-white">{asset.productTitle}</span>
+                            <span className="text-slate-400 font-mono-nums">
+                              Downloads: {asset.downloadsUsed}/{asset.downloadLimit}
+                            </span>
+                          </div>
+                          {!asset.hasAsset ? (
+                            <p className="text-slate-400">
+                              The seller has not attached a digital package to this listing yet. Message the seller in Messages.
+                            </p>
+                          ) : (
+                            <>
+                              {asset.licenseKey && (
+                                <div className="p-2 rounded bg-[#070B14] border border-slate-800 font-mono-nums text-emerald-300 break-all">
+                                  License Key: {asset.licenseKey}
+                                </div>
+                              )}
+                              {asset.deliveryInstructions && (
+                                <p className="text-slate-300 whitespace-pre-line">{asset.deliveryInstructions}</p>
+                              )}
+                              <button
+                                type="button"
+                                disabled={downloadingId === asset.productId}
+                                onClick={() => handleDigitalDownload(detail.order.id, asset)}
+                                className="h-9 px-3.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-60"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>
+                                  {downloadingId === asset.productId
+                                    ? 'Downloading...'
+                                    : asset.hasFile && asset.fileName
+                                    ? `Download ${asset.fileName}`
+                                    : 'Download Delivery Receipt'}
+                                </span>
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Action Controls based on User Role & Current Status */}
               <div className="p-4 rounded-xl bg-[#070B14] border border-slate-800 space-y-3">

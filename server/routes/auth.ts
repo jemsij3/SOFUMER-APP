@@ -7,6 +7,7 @@ import {
   rateLimit,
   requireAuth,
   resolveUserSession,
+  sanitizeSafeUrl,
   sanitizeText,
   signJwt,
   verifyTelegramInitData,
@@ -37,6 +38,8 @@ function createSessionForTelegramUser(
     .join(' ')
     .trim() || tgUser.username || `User ${tgId}`;
 
+  const safePhotoUrl = sanitizeSafeUrl(tgUser.photo_url || '', 300);
+
   let userId: string;
   if (!existing) {
     userId = newId('usr');
@@ -50,7 +53,7 @@ function createSessionForTelegramUser(
       sanitizeText(tgUser.first_name || 'Member', 64),
       sanitizeText(tgUser.last_name || '', 64),
       sanitizeText(displayName, 80),
-      sanitizeText(tgUser.photo_url || '', 300),
+      safePhotoUrl,
       sanitizeText(tgUser.language_code || 'en', 10)
     );
     db.prepare(
@@ -68,12 +71,14 @@ function createSessionForTelegramUser(
     }
     db.prepare(
       `UPDATE users
-       SET telegram_username = ?, first_name = ?, last_name = ?, last_login_at = datetime('now'), updated_at = datetime('now')
+       SET telegram_username = ?, first_name = ?, last_name = ?, avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END, last_login_at = datetime('now'), updated_at = datetime('now')
        WHERE id = ?`
     ).run(
       sanitizeText(tgUser.username || '', 64),
       sanitizeText(tgUser.first_name || String(existing.first_name), 64),
       sanitizeText(tgUser.last_name || '', 64),
+      safePhotoUrl,
+      safePhotoUrl,
       userId
     );
   }

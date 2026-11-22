@@ -1,5 +1,8 @@
 import {
   type Env,
+  VALID_CF_MODELS,
+  checkEdgeRateLimit,
+  getActiveSubscriptionEdge,
   json,
   methodNotAllowed,
   newId,
@@ -8,7 +11,9 @@ import {
 } from './helpers.ts';
 
 async function checkEdgeAiPermission(env: Env, userId: string, featureKey: string) {
-  const defaultModel = env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct';
+  const defaultModel = VALID_CF_MODELS.has(env.CLOUDFLARE_AI_MODEL || '')
+    ? String(env.CLOUDFLARE_AI_MODEL)
+    : '@cf/meta/llama-3.1-8b-instruct';
 
   const globalSetting = await env.DB!.prepare(
     "SELECT is_enabled, model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'"
@@ -56,18 +61,12 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     };
   }
 
-  const subRow = await env.DB!.prepare(
-    `SELECT sp.ai_daily_limit FROM subscriptions s
-     JOIN subscription_plans sp ON sp.id = s.plan_id
-     WHERE s.user_id = ? AND s.status = 'active'
-     ORDER BY s.created_at DESC LIMIT 1`
-  )
-    .bind(userId)
-    .first<{ ai_daily_limit: number }>();
+  const activeSub = await getActiveSubscriptionEdge(env.DB!, { userId });
+  const subDailyLimit = activeSub ? Number(activeSub.ai_daily_limit) : null;
 
   const dailyLimit =
     userPerm?.custom_daily_limit ??
-    subRow?.ai_daily_limit ??
+    subDailyLimit ??
     featureSetting?.daily_limit_per_user ??
     25;
 
@@ -89,9 +88,12 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     };
   }
 
+  const candidateModel = featureSetting?.model_name || globalSetting.model_name || defaultModel;
+  const modelName = VALID_CF_MODELS.has(candidateModel) ? candidateModel : defaultModel;
+
   return {
     allowed: true,
-    modelName: env.CLOUDFLARE_AI_MODEL || featureSetting?.model_name || globalSetting.model_name || defaultModel,
+    modelName,
     dailyLimit,
     usedToday,
   };
@@ -165,6 +167,11 @@ export async function handleAiRoutes(
   const auth = await requireEdgeUser(request, env);
   if ('error' in auth) return auth.error;
   const userId = auth.user.id;
+
+  if (request.method === 'POST') {
+    const limited = await checkEdgeRateLimit(request, env, 'ai', 60, 60, userId);
+    if (limited) return limited;
+  }
 
   if (url.pathname === '/api/ai/status') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
@@ -342,6 +349,12 @@ export async function handleAiRoutes(
       }
 
       if (body.action === 'analytics') {
+        const sellerProfile = await env.DB!.prepare('SELECT id FROM seller_profiles WHERE user_id = ?')
+          .bind(userId)
+          .first<{ id: string }>();
+        if (!sellerProfile) {
+          return json({ error: 'Seller profile required to view AI shop analytics.' }, 403);
+        }
         const stats = await env.DB!.prepare(
           `SELECT s.name,
                   (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status = 'published') as published_products,

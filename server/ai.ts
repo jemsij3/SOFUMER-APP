@@ -1,14 +1,9 @@
 import { db, newId } from './db.ts';
+import { VALID_CF_MODELS, getActiveSubscriptionLocal } from './security.ts';
 
-export const DEFAULT_CLOUDFLARE_AI_MODEL =
-  process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct';
-
-const VALID_CF_MODELS = new Set([
-  '@cf/meta/llama-3.1-8b-instruct',
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/qwen/qwen2.5-7b-instruct',
-  '@cf/mistral/mistral-7b-instruct-v0.2',
-]);
+export const DEFAULT_CLOUDFLARE_AI_MODEL = VALID_CF_MODELS.has(process.env.CLOUDFLARE_AI_MODEL || '')
+  ? String(process.env.CLOUDFLARE_AI_MODEL)
+  : '@cf/meta/llama-3.1-8b-instruct';
 
 export interface WorkersAiBinding {
   run(
@@ -153,19 +148,12 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     };
   }
 
-  const subRow = db
-    .prepare(
-      `SELECT sp.ai_daily_limit
-       FROM subscriptions s
-       JOIN subscription_plans sp ON sp.id = s.plan_id
-       WHERE s.user_id = ? AND s.status = 'active'
-       ORDER BY s.created_at DESC LIMIT 1`
-    )
-    .get(userId) as { ai_daily_limit: number } | undefined;
+  const activeSub = getActiveSubscriptionLocal({ userId });
+  const subDailyLimit = activeSub ? Number(activeSub.ai_daily_limit) : null;
 
   const dailyLimit =
     userPerm?.custom_daily_limit ??
-    subRow?.ai_daily_limit ??
+    subDailyLimit ??
     featureSetting?.daily_limit_per_user ??
     25;
 
@@ -186,8 +174,7 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     };
   }
 
-  const configuredEnvModel = process.env.CLOUDFLARE_AI_MODEL;
-  const rawModel = configuredEnvModel || featureSetting?.model_name || globalSetting.model_name || fallbackModel;
+  const rawModel = featureSetting?.model_name || globalSetting.model_name || fallbackModel;
   const modelName = VALID_CF_MODELS.has(rawModel) ? rawModel : DEFAULT_CLOUDFLARE_AI_MODEL;
 
   return {

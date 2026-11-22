@@ -489,4 +489,516 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const row = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'auto_approve_products'").first();
     expect(row?.value).toBe('true');
   });
+
+  it('11. /r2/digital/* is blocked with 403 and unsafe image/logo URLs are rejected', async () => {
+    const blockedDigital = await SELF.fetch('https://sofumer-app.derartuaman8.workers.dev/r2/digital/secret-pkg.zip');
+    expect(blockedDigital.status).toBe(403);
+
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const sellerInit = await signTelegramInitData(
+      { id: 710001, first_name: 'UrlSeller', username: 'url_seller' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: sellerInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    const badRegCtx = createExecutionContext();
+    const badRegRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Bad Url Seller',
+          shopName: 'Bad Url Shop',
+          countryCode: 'US',
+          logoUrl: 'javascript:alert(1)',
+        }),
+      }),
+      testEnv,
+      badRegCtx
+    );
+    await waitOnExecutionContext(badRegCtx);
+    expect(badRegRes.status).toBe(400);
+  });
+
+  it('12. Telegram Stars (XTR) enforces 402 on paid plans, activates on webhook successful_payment idempotently, and expires past-due plans', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const sellerInit = await signTelegramInitData(
+      { id: 720001, first_name: 'StarsSeller', username: 'stars_seller' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: sellerInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    const regCtx = createExecutionContext();
+    const regRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Stars Merchant',
+          shopName: 'Stars Shop',
+          countryCode: 'US',
+        }),
+      }),
+      testEnv,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+    expect(regRes.status).toBe(201);
+
+    // Direct upgrade to PRO blocked with 402
+    const unpaidCtx = createExecutionContext();
+    const unpaidRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/subscriptions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ planCode: 'PRO', billingCycle: 'monthly' }),
+      }),
+      testEnv,
+      unpaidCtx
+    );
+    await waitOnExecutionContext(unpaidCtx);
+    expect(unpaidRes.status).toBe(402);
+    const unpaidJson = await unpaidRes.json();
+    expect(unpaidJson.requiresStarsPayment).toBe(true);
+
+    // Mock Telegram Bot API fetch for createInvoiceLink & answerPreCheckoutQuery
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const target = typeof input === 'string' ? input : input.url;
+      if (target.includes('api.telegram.org/bot') && target.includes('/createInvoiceLink')) {
+        return new Response(
+          JSON.stringify({ ok: true, result: 'https://t.me/$mock_stars_invoice_pro' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.includes('api.telegram.org/bot') && target.includes('/answerPreCheckoutQuery')) {
+        return new Response(
+          JSON.stringify({ ok: true, result: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      const invCtx = createExecutionContext();
+      const invRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/subscriptions/invoice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ planCode: 'PRO', billingCycle: 'monthly' }),
+        }),
+        testEnv,
+        invCtx
+      );
+      await waitOnExecutionContext(invCtx);
+      expect(invRes.status).toBe(201);
+      const invJson = await invRes.json();
+      expect(invJson.currency).toBe('XTR');
+      expect(invJson.starsAmount).toBeGreaterThan(0);
+      expect(invJson.invoiceUrl).toBe('https://t.me/$mock_stars_invoice_pro');
+
+      const paymentRow = await env.DB.prepare('SELECT payload_token, stars_amount FROM telegram_stars_payments WHERE id = ?')
+        .bind(invJson.paymentId)
+        .first();
+      expect(paymentRow?.payload_token).toBeTruthy();
+
+      // Webhook pre_checkout_query
+      const preCtx = createExecutionContext();
+      const preRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/telegram/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': testEnv.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({
+            update_id: 8001,
+            pre_checkout_query: {
+              id: 'pcq_8001',
+              from: { id: 720001 },
+              currency: 'XTR',
+              total_amount: paymentRow.stars_amount,
+              invoice_payload: paymentRow.payload_token,
+            },
+          }),
+        }),
+        testEnv,
+        preCtx
+      );
+      await waitOnExecutionContext(preCtx);
+      expect(preRes.status).toBe(200);
+      const preJson = await preRes.json();
+      expect(preJson.status).toBe('pre_checkout_answered');
+      expect(preJson.valid).toBe(true);
+
+      // Webhook successful_payment activates PRO subscription
+      const payPayload = {
+        update_id: 8002,
+        message: {
+          message_id: 501,
+          from: { id: 720001 },
+          successful_payment: {
+            currency: 'XTR',
+            total_amount: paymentRow.stars_amount,
+            invoice_payload: paymentRow.payload_token,
+            telegram_payment_charge_id: 'tg_charge_pro_8002',
+            provider_payment_charge_id: 'prov_charge_pro_8002',
+          },
+        },
+      };
+
+      const payCtx1 = createExecutionContext();
+      const payRes1 = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/telegram/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': testEnv.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify(payPayload),
+        }),
+        testEnv,
+        payCtx1
+      );
+      await waitOnExecutionContext(payCtx1);
+      expect(payRes1.status).toBe(200);
+      const payJson1 = await payRes1.json();
+      expect(payJson1.status).toBe('payment_processed');
+      expect(payJson1.paymentStatus).toBe('paid');
+
+      // Dashboard shows PRO plan with future ends_at
+      const dashCtx = createExecutionContext();
+      const dashRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/dashboard', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        testEnv,
+        dashCtx
+      );
+      await waitOnExecutionContext(dashCtx);
+      expect(dashRes.status).toBe(200);
+      const dashJson = await dashRes.json();
+      expect(dashJson.subscription?.plan_code).toBe('PRO');
+      expect(dashJson.subscription?.ends_at).toBeTruthy();
+
+      // Replay duplicate charge ID safely ignored
+      const payCtx2 = createExecutionContext();
+      const payRes2 = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/telegram/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': testEnv.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({ ...payPayload, update_id: 8003 }),
+        }),
+        testEnv,
+        payCtx2
+      );
+      await waitOnExecutionContext(payCtx2);
+      expect(payRes2.status).toBe(200);
+      const payJson2 = await payRes2.json();
+      expect(payJson2.status).toBe('payment_processed');
+      expect(payJson2.paymentStatus).toBe('duplicate_charge_ignored');
+
+      // Expired paid subscription falls back to null/no active PRO tier
+      await env.DB.prepare("UPDATE subscriptions SET ends_at = datetime('now', '-1 day') WHERE id = ?")
+        .bind(invJson.subscriptionId)
+        .run();
+      const expiredDashCtx = createExecutionContext();
+      const expiredDashRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/dashboard', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        testEnv,
+        expiredDashCtx
+      );
+      await waitOnExecutionContext(expiredDashCtx);
+      const expiredDashJson = await expiredDashRes.json();
+      expect(expiredDashJson.subscription?.plan_code || 'FREE').not.toBe('PRO');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('13. Protected digital product delivery enforces order confirmation, ownership, license templating, and download quota', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const loginAs = async (id, username) => {
+      const initData = await signTelegramInitData({ id, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      const authData = await res.json();
+      const meCtx = createExecutionContext();
+      const meRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/me', {
+          headers: { Authorization: `Bearer ${authData.token}` },
+        }),
+        testEnv,
+        meCtx
+      );
+      await waitOnExecutionContext(meCtx);
+      const meData = await meRes.json();
+      return { token: authData.token, user: meData.user };
+    };
+
+    const seller = await loginAs(730001, 'dig_seller');
+    const buyer = await loginAs(730002, 'dig_buyer');
+    const intruder = await loginAs(730003, 'dig_intruder');
+
+    const regCtx = createExecutionContext();
+    await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ sellerType: 'individual', legalName: 'Dig Seller', shopName: 'Dig Shop', countryCode: 'US' }),
+      }),
+      testEnv,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+
+    const prodCtx = createExecutionContext();
+    const prodRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          listingType: 'digital',
+          title: 'CLI Pro Bundle',
+          description: 'Protected digital toolkit with per-order license key.',
+          categoryId: 'cat_electronics',
+          price: 19,
+          currency: 'USD',
+          status: 'published',
+        }),
+      }),
+      testEnv,
+      prodCtx
+    );
+    await waitOnExecutionContext(prodCtx);
+    const { product } = await prodRes.json();
+
+    const assetCtx = createExecutionContext();
+    const assetRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${product.id}/digital-asset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          fileName: 'cli-bundle.txt',
+          deliveryInstructions: 'Run npm install && activate using your key.',
+          licenseKeyTemplate: 'SFM-{ORDER}-KEY',
+          downloadLimit: 2,
+        }),
+      }),
+      testEnv,
+      assetCtx
+    );
+    await waitOnExecutionContext(assetCtx);
+    expect(assetRes.status).toBe(201);
+
+    const ordCtx = createExecutionContext();
+    const ordRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          productId: product.id,
+          buyerUserId: buyer.user.id,
+          quantity: 1,
+          agreedTotal: 19,
+          currency: 'USD',
+        }),
+      }),
+      testEnv,
+      ordCtx
+    );
+    await waitOnExecutionContext(ordCtx);
+    expect(ordRes.status).toBe(201);
+    const orderData = await ordRes.json();
+
+    // Buyer blocked before confirmation -> 403
+    const lockedCtx = createExecutionContext();
+    const lockedRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/orders/${orderData.orderId}/digital`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      }),
+      testEnv,
+      lockedCtx
+    );
+    await waitOnExecutionContext(lockedCtx);
+    expect(lockedRes.status).toBe(403);
+
+    // Buyer confirms order -> unlocks delivery
+    const confCtx = createExecutionContext();
+    await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/orders/${orderData.orderId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+        body: JSON.stringify({ status: 'Confirmed' }),
+      }),
+      testEnv,
+      confCtx
+    );
+    await waitOnExecutionContext(confCtx);
+
+    // Intruder still blocked -> 403
+    const intrCtx = createExecutionContext();
+    const intrRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/orders/${orderData.orderId}/digital`, {
+        headers: { Authorization: `Bearer ${intruder.token}` },
+      }),
+      testEnv,
+      intrCtx
+    );
+    await waitOnExecutionContext(intrCtx);
+    expect(intrRes.status).toBe(403);
+
+    // Buyer gets unlocked asset metadata with order-templated license key
+    const unlCtx = createExecutionContext();
+    const unlRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/orders/${orderData.orderId}/digital`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      }),
+      testEnv,
+      unlCtx
+    );
+    await waitOnExecutionContext(unlCtx);
+    expect(unlRes.status).toBe(200);
+    const unlJson = await unlRes.json();
+    expect(unlJson.assets[0].licenseKey).toBe(`SFM-${orderData.orderNumber}-KEY`);
+
+    // Download quota (limit = 2): 1st and 2nd succeed, 3rd returns 403
+    for (const expectedStatus of [200, 200, 403]) {
+      const dlCtx = createExecutionContext();
+      const dlRes = await worker.fetch(
+        new Request(
+          `https://sofumer-app.derartuaman8.workers.dev/api/orders/${orderData.orderId}/digital/${product.id}/download`,
+          { headers: { Authorization: `Bearer ${buyer.token}` } }
+        ),
+        testEnv,
+        dlCtx
+      );
+      await waitOnExecutionContext(dlCtx);
+      expect(dlRes.status).toBe(expectedStatus);
+    }
+  });
+
+  it('14. Cookie-based state mutations enforce same-origin CSRF protection', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+    const userInit = await signTelegramInitData(
+      { id: 740001, first_name: 'CsrfUser', username: 'csrf_user' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: userInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    // Missing Origin/Referer with Cookie auth only -> 403
+    const csrfCtx = createExecutionContext();
+    const csrfRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/account/profile', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: `sofumer_session=${token}`,
+        },
+        body: JSON.stringify({ displayName: 'Evil Rename' }),
+      }),
+      testEnv,
+      csrfCtx
+    );
+    await waitOnExecutionContext(csrfCtx);
+    expect(csrfRes.status).toBe(403);
+
+    // Matching Origin passes -> 200
+    const okCtx = createExecutionContext();
+    const okRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/account/profile', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://sofumer-app.derartuaman8.workers.dev',
+          Cookie: `sofumer_session=${token}`,
+        },
+        body: JSON.stringify({ displayName: 'Safe Rename' }),
+      }),
+      testEnv,
+      okCtx
+    );
+    await waitOnExecutionContext(okCtx);
+    expect(okRes.status).toBe(200);
+  });
 });

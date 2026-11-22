@@ -1,6 +1,6 @@
 /**
- * Shared Edge types, cryptography, JWT auth, Telegram verification, and D1 authorization helpers
- * for the SOFUMER Cloudflare Worker runtime.
+ * Shared Edge types, cryptography, JWT auth, Telegram verification, Stars payments,
+ * rate limiting, URL safety, and D1 authorization helpers for the SOFUMER Cloudflare Worker.
  */
 
 export interface D1PreparedStatement {
@@ -15,6 +15,22 @@ export interface D1Database {
   batch<T = unknown>(
     statements: D1PreparedStatement[]
   ): Promise<Array<{ success: boolean; results?: T[]; meta?: { changes?: number } }>>;
+}
+
+export interface R2ObjectBodyLike {
+  body: ReadableStream<Uint8Array>;
+  size?: number;
+  httpMetadata?: { contentType?: string };
+}
+
+export interface R2BucketLike {
+  get(key: string): Promise<R2ObjectBodyLike | null>;
+  put(
+    key: string,
+    value: ArrayBuffer | Uint8Array | string | ReadableStream<Uint8Array>,
+    options?: { httpMetadata?: { contentType?: string } }
+  ): Promise<unknown>;
+  delete?(key: string): Promise<void>;
 }
 
 export interface WorkersAiBinding {
@@ -42,6 +58,7 @@ export interface Env {
   DB?: D1Database;
   AI?: WorkersAiBinding;
   ASSETS?: Fetcher;
+  MEDIA_BUCKET?: R2BucketLike;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   JWT_SECRET?: string;
@@ -49,6 +66,15 @@ export interface Env {
   MINI_APP_URL?: string;
   CLOUDFLARE_AI_MODEL?: string;
 }
+
+export const VALID_CF_MODELS = new Set([
+  '@cf/meta/llama-3.1-8b-instruct',
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/qwen/qwen2.5-7b-instruct',
+  '@cf/mistral/mistral-7b-instruct-v0.2',
+]);
+
+export const PAID_ORDER_STATUSES = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'] as const;
 
 export interface EdgeAuthUser {
   id: string;
@@ -148,6 +174,33 @@ export function sanitizeText(value: unknown, maxLen = 2000): string {
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
     .trim()
     .slice(0, maxLen);
+}
+
+export function isSafeUrlOrEmpty(value: unknown, maxLen = 400): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value !== 'string') return false;
+  const cleaned = sanitizeText(value, maxLen);
+  if (!cleaned) return true;
+  if (cleaned.startsWith('/') && !cleaned.startsWith('//')) {
+    return !/[\s<>"'`]/.test(cleaned);
+  }
+  try {
+    const parsed = new URL(cleaned);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeSafeUrl(value: unknown, maxLen = 400): string {
+  if (typeof value !== 'string') return '';
+  const cleaned = sanitizeText(value, maxLen);
+  if (!cleaned) return '';
+  return isSafeUrlOrEmpty(cleaned, maxLen) ? cleaned : '';
+}
+
+export function escapeSqlLike(input: string): string {
+  return input.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
 
 export async function hmacSha256(
@@ -303,6 +356,94 @@ export function isTelegramIdAdmin(telegramId: string, adminTelegramIdsRaw?: stri
     }
   }
   return false;
+}
+
+export function verifyCookieCsrfEdge(request: Request, env: Env, url: URL): Response | null {
+  if (!['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method)) return null;
+  if (!url.pathname.startsWith('/api/')) return null;
+  if (url.pathname === '/api/telegram/webhook' || url.pathname === '/api/auth/telegram') return null;
+
+  const authHeader = request.headers.get('Authorization') || '';
+  if (authHeader.startsWith('Bearer ') && authHeader.slice(7).trim()) {
+    return null;
+  }
+
+  const rawCookie = request.headers.get('Cookie') || '';
+  if (!rawCookie.includes('sofumer_session=')) {
+    return null;
+  }
+
+  const allowedOrigins = new Set<string>([url.origin]);
+  if (env.MINI_APP_URL) {
+    try {
+      allowedOrigins.add(new URL(env.MINI_APP_URL).origin);
+    } catch {
+      // Ignore malformed MINI_APP_URL
+    }
+  }
+
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    if (!allowedOrigins.has(origin)) {
+      return json({ error: 'Cross-site request origin rejected.' }, 403);
+    }
+    return null;
+  }
+
+  const referer = request.headers.get('Referer');
+  if (referer) {
+    try {
+      if (allowedOrigins.has(new URL(referer).origin)) {
+        return null;
+      }
+    } catch {
+      // Fall through to reject
+    }
+  }
+
+  return json({ error: 'Missing Origin header for cookie-authenticated state mutation.' }, 403);
+}
+
+export async function checkEdgeRateLimit(
+  request: Request,
+  env: Env,
+  scope: string,
+  maxRequests: number,
+  windowSeconds: number,
+  actorKey?: string
+): Promise<Response | null> {
+  if (!env.DB) return null;
+  const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'anon';
+  const rateKey = `${scope}:${actorKey || ip}`.slice(0, 120);
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  try {
+    const existing = await env.DB.prepare('SELECT count, reset_at FROM edge_rate_limits WHERE rate_key = ?')
+      .bind(rateKey)
+      .first<{ count: number; reset_at: number }>();
+
+    if (!existing || existing.reset_at <= nowSec) {
+      await env.DB.prepare(
+        `INSERT INTO edge_rate_limits (rate_key, count, reset_at)
+         VALUES (?, 1, ?)
+         ON CONFLICT(rate_key) DO UPDATE SET count = 1, reset_at = excluded.reset_at`
+      )
+        .bind(rateKey, nowSec + windowSeconds)
+        .run();
+      return null;
+    }
+
+    if (existing.count >= maxRequests) {
+      return json({ error: 'Too many requests. Please wait a moment and try again.' }, 429);
+    }
+
+    await env.DB.prepare('UPDATE edge_rate_limits SET count = count + 1 WHERE rate_key = ?')
+      .bind(rateKey)
+      .run();
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getTelegramBotInfoEdge(env: Env): Promise<TelegramBotPublicInfo> {
@@ -472,7 +613,7 @@ export async function resolveEdgeUserSession(
     first_name: String(row.first_name || ''),
     last_name: String(row.last_name || ''),
     display_name: String(row.display_name || ''),
-    avatar_url: String(row.avatar_url || ''),
+    avatar_url: sanitizeSafeUrl(row.avatar_url || '', 300),
     bio: String(row.bio || ''),
     phone: String(row.phone || ''),
     country_code: String(row.country_code || 'US'),
@@ -679,4 +820,320 @@ export async function parseJsonBody<T = Record<string, unknown>>(
   } catch {
     return { ok: false, error: json({ error: 'Invalid JSON request body.' }, 400) };
   }
+}
+
+export async function getActiveSubscriptionEdge(
+  db: D1Database,
+  opts: { sellerId?: string; userId?: string }
+): Promise<Record<string, unknown> | null> {
+  const whereField = opts.sellerId ? 'seller_id' : 'user_id';
+  const whereVal = opts.sellerId || opts.userId || '';
+  if (!whereVal) return null;
+
+  await db
+    .prepare(
+      `UPDATE subscriptions
+       SET status = 'expired'
+       WHERE ${whereField} = ? AND status = 'active' AND ends_at IS NOT NULL AND datetime(ends_at) <= datetime('now')`
+    )
+    .bind(whereVal)
+    .run();
+
+  return await db
+    .prepare(
+      `SELECT s.*, sp.code as plan_code, sp.name as plan_name, sp.max_products, sp.ai_daily_limit,
+              sp.featured_slots, sp.promotional_discount_pct, sp.analytics_level
+       FROM subscriptions s
+       JOIN subscription_plans sp ON sp.id = s.plan_id
+       WHERE s.${whereField} = ? AND s.status = 'active'
+         AND (s.ends_at IS NULL OR datetime(s.ends_at) > datetime('now'))
+       ORDER BY s.created_at DESC LIMIT 1`
+    )
+    .bind(whereVal)
+    .first<Record<string, unknown>>();
+}
+
+export async function getStarsPerUsdEdge(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare("SELECT value FROM platform_settings WHERE key = 'stars_per_usd'")
+    .first<{ value: string }>();
+  const parsed = Number(row?.value || 50);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+}
+
+export function computeStarsFromUsd(usdAmount: number, starsPerUsd = 50): number {
+  if (!Number.isFinite(usdAmount) || usdAmount <= 0) return 0;
+  return Math.max(1, Math.round(usdAmount * starsPerUsd));
+}
+
+export async function createTelegramInvoiceLinkEdge(
+  env: Env,
+  params: {
+    title: string;
+    description: string;
+    payload: string;
+    starsAmount: number;
+  }
+): Promise<{ ok: true; invoiceUrl: string } | { ok: false; error: string }> {
+  const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (!botToken) {
+    return { ok: false, error: 'TELEGRAM_BOT_TOKEN is not configured.' };
+  }
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/createInvoiceLink`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: params.title.slice(0, 32),
+        description: params.description.slice(0, 255),
+        payload: params.payload.slice(0, 128),
+        provider_token: '',
+        currency: 'XTR',
+        prices: [{ label: params.title.slice(0, 32), amount: Math.max(1, Math.round(params.starsAmount)) }],
+      }),
+    });
+    const data = (await resp.json().catch(() => ({}))) as {
+      ok?: boolean;
+      result?: string;
+      description?: string;
+    };
+    if (!resp.ok || !data?.ok || typeof data.result !== 'string') {
+      return { ok: false, error: data.description || 'Failed to generate Telegram Stars invoice link.' };
+    }
+    return { ok: true, invoiceUrl: data.result };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Telegram Bot API error.' };
+  }
+}
+
+export async function answerPreCheckoutQueryEdge(
+  env: Env,
+  preCheckoutQueryId: string,
+  ok: boolean,
+  errorMessage?: string
+): Promise<boolean> {
+  const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (!botToken || !preCheckoutQueryId) return false;
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/answerPreCheckoutQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pre_checkout_query_id: preCheckoutQueryId,
+        ok,
+        ...(ok ? {} : { error_message: (errorMessage || 'Invoice invalid or expired.').slice(0, 200) }),
+      }),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+export interface TelegramPreCheckoutQuery {
+  id: string;
+  from?: { id?: number };
+  currency?: string;
+  total_amount?: number;
+  invoice_payload?: string;
+}
+
+export async function fulfillStarsPreCheckoutEdge(
+  env: Env,
+  query: TelegramPreCheckoutQuery
+): Promise<{ valid: boolean; reason?: string; answered: boolean }> {
+  if (!env.DB) {
+    const answered = await answerPreCheckoutQueryEdge(env, query.id, false, 'Service unavailable.');
+    return { valid: false, reason: 'db_missing', answered };
+  }
+
+  let valid = true;
+  let reason = '';
+
+  if (query.currency !== 'XTR') {
+    valid = false;
+    reason = 'Only Telegram Stars (XTR) payments are accepted.';
+  }
+
+  const payload = String(query.invoice_payload || '');
+  const payment = payload
+    ? await env.DB.prepare('SELECT * FROM telegram_stars_payments WHERE payload_token = ?')
+        .bind(payload)
+        .first<Record<string, unknown>>()
+    : null;
+
+  if (valid && !payment) {
+    valid = false;
+    reason = 'Payment invoice not found.';
+  }
+  if (valid && payment && payment.status !== 'pending') {
+    valid = false;
+    reason = `Invoice is no longer pending (status: ${String(payment.status)}).`;
+  }
+  if (valid && payment && new Date(String(payment.expires_at)).getTime() <= Date.now()) {
+    await env.DB.prepare(
+      "UPDATE telegram_stars_payments SET status = 'expired', updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
+    )
+      .bind(payment.id)
+      .run();
+    valid = false;
+    reason = 'This invoice has expired. Please request a fresh checkout link.';
+  }
+  if (valid && payment && Number(query.total_amount) !== Number(payment.stars_amount)) {
+    valid = false;
+    reason = 'Invoice Star amount mismatch.';
+  }
+  if (
+    valid &&
+    payment &&
+    query.from?.id !== undefined &&
+    String(query.from.id) !== String(payment.payer_telegram_id)
+  ) {
+    valid = false;
+    reason = 'This invoice belongs to a different Telegram account.';
+  }
+
+  const answered = await answerPreCheckoutQueryEdge(env, query.id, valid, valid ? undefined : reason);
+  return { valid, reason: valid ? undefined : reason, answered };
+}
+
+export interface TelegramSuccessfulPayment {
+  currency?: string;
+  total_amount?: number;
+  invoice_payload?: string;
+  telegram_payment_charge_id?: string;
+  provider_payment_charge_id?: string;
+}
+
+export async function fulfillStarsSuccessfulPaymentEdge(
+  env: Env,
+  sp: TelegramSuccessfulPayment,
+  payerTelegramId?: string,
+  originUrl = ''
+): Promise<{ status: string; paymentId?: string }> {
+  if (!env.DB) return { status: 'db_missing' };
+  const chargeId = String(sp.telegram_payment_charge_id || '').trim();
+  const providerChargeId = String(sp.provider_payment_charge_id || '').trim();
+  const payload = String(sp.invoice_payload || '').trim();
+
+  if (sp.currency !== 'XTR' || !chargeId || !payload) {
+    return { status: 'invalid_payment_payload' };
+  }
+
+  const dupCharge = await env.DB.prepare(
+    'SELECT id FROM telegram_stars_payments WHERE telegram_payment_charge_id = ? LIMIT 1'
+  )
+    .bind(chargeId)
+    .first<{ id: string }>();
+  if (dupCharge) {
+    return { status: 'duplicate_charge_ignored', paymentId: dupCharge.id };
+  }
+
+  const payment = await env.DB.prepare('SELECT * FROM telegram_stars_payments WHERE payload_token = ?')
+    .bind(payload)
+    .first<Record<string, unknown>>();
+  if (!payment) return { status: 'invoice_not_found' };
+  if (payment.status === 'paid') return { status: 'already_paid', paymentId: String(payment.id) };
+  if (Number(sp.total_amount) !== Number(payment.stars_amount)) {
+    return { status: 'amount_mismatch', paymentId: String(payment.id) };
+  }
+  if (payerTelegramId && String(payment.payer_telegram_id) !== payerTelegramId) {
+    return { status: 'payer_mismatch', paymentId: String(payment.id) };
+  }
+
+  const updateRes = await env.DB.prepare(
+    `UPDATE telegram_stars_payments
+     SET status = 'paid',
+         telegram_payment_charge_id = ?,
+         provider_payment_charge_id = ?,
+         paid_at = datetime('now'),
+         updated_at = datetime('now')
+     WHERE id = ? AND status = 'pending'`
+  )
+    .bind(chargeId, providerChargeId, payment.id)
+    .run();
+
+  if ((updateRes.meta?.changes ?? 0) === 0) {
+    return { status: 'already_processed', paymentId: String(payment.id) };
+  }
+
+  const userId = String(payment.user_id);
+  if (payment.target_type === 'subscription') {
+    const subRow = await env.DB.prepare('SELECT * FROM subscriptions WHERE id = ?')
+      .bind(payment.target_id)
+      .first<Record<string, unknown>>();
+    if (subRow) {
+      const days = subRow.billing_cycle === 'annual' ? 365 : 30;
+      const endsAt = new Date(Date.now() + days * 86400_000).toISOString();
+      await env.DB.prepare(
+        "UPDATE subscriptions SET status = 'cancelled' WHERE seller_id = ? AND status = 'active' AND id != ?"
+      )
+        .bind(subRow.seller_id, subRow.id)
+        .run();
+      await env.DB.prepare(
+        `UPDATE subscriptions
+         SET status = 'active',
+             starts_at = datetime('now'),
+             ends_at = ?,
+             payment_reference = ?
+         WHERE id = ?`
+      )
+        .bind(endsAt, chargeId, subRow.id)
+        .run();
+    }
+    await notifyUserAndTelegramEdge(
+      env,
+      userId,
+      'subscription',
+      `SOFUMER Plan Activated: ${String(payment.plan_code || 'PRO')}`,
+      `Telegram Stars payment received (${Number(payment.stars_amount)} XTR). Your ${String(payment.plan_code)} (${String(payment.billing_cycle)}) plan is now active.`,
+      originUrl
+    );
+  } else if (payment.target_type === 'promotion') {
+    const promo = await env.DB.prepare('SELECT * FROM promotions WHERE id = ?')
+      .bind(payment.target_id)
+      .first<Record<string, unknown>>();
+    if (promo) {
+      const days = Math.max(1, Number(promo.duration_days || 7));
+      const endsAt = new Date(Date.now() + days * 86400_000).toISOString();
+      await env.DB.prepare(
+        `UPDATE promotions
+         SET status = 'active',
+             starts_at = datetime('now'),
+             ends_at = ?
+         WHERE id = ?`
+      )
+        .bind(endsAt, promo.id)
+        .run();
+      await env.DB.prepare(
+        `UPDATE promotion_transactions
+         SET status = 'recorded',
+             reference = ?
+         WHERE promotion_id = ?`
+      )
+        .bind(chargeId, promo.id)
+        .run();
+      if (promo.product_id) {
+        if (promo.promo_type === 'sponsored_placement') {
+          await env.DB.prepare('UPDATE products SET is_sponsored = 1 WHERE id = ?')
+            .bind(promo.product_id)
+            .run();
+        } else {
+          await env.DB.prepare('UPDATE products SET is_featured = 1 WHERE id = ?')
+            .bind(promo.product_id)
+            .run();
+        }
+      }
+      await notifyUserAndTelegramEdge(
+        env,
+        userId,
+        'promotion',
+        `Promotion Live: ${String(promo.title)}`,
+        `Telegram Stars payment confirmed (${Number(payment.stars_amount)} XTR). Your promotion is active for ${days} days.`,
+        originUrl
+      );
+    }
+  }
+
+  return { status: 'paid', paymentId: String(payment.id) };
 }

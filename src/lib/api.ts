@@ -44,3 +44,35 @@ export async function apiFetch<T>(
   }
   return data as T;
 }
+
+export async function apiDownload(url: string, fallbackFilename = 'download.bin'): Promise<void> {
+  const token = getUserToken();
+  const resp = await fetch(url, {
+    method: 'GET',
+    credentials: 'include',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+
+  if (!resp.ok) {
+    const errJson = (await resp.json().catch(() => ({}))) as { error?: string };
+    throw new Error(errJson.error || `Download failed (${resp.status})`);
+  }
+
+  const blob = await resp.blob();
+  const disposition = resp.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+  const fileName = match?.[1] ? decodeURIComponent(match[1]) : fallbackFilename;
+
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = fileName;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+  }
+}

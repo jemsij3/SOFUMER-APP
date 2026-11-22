@@ -69,6 +69,15 @@ accountAiRouter.patch('/account/profile', requireAuth, (req, res) => {
   const preferredCurrency = sanitizeText(req.body?.preferredCurrency ?? user.preferred_currency, 6).toUpperCase();
   const preferredLanguage = sanitizeText(req.body?.preferredLanguage ?? user.preferred_language, 10);
 
+  const validCountry = db.prepare('SELECT code FROM countries WHERE code = ?').get(countryCode);
+  const validCurrency = db.prepare('SELECT code FROM currencies WHERE code = ?').get(preferredCurrency);
+  if (!validCountry) {
+    return res.status(400).json({ error: `Unsupported country code "${countryCode}".` });
+  }
+  if (!validCurrency) {
+    return res.status(400).json({ error: `Unsupported currency code "${preferredCurrency}".` });
+  }
+
   db.prepare(
     `UPDATE users
      SET display_name = ?, bio = ?, phone = ?, country_code = ?, preferred_currency = ?, preferred_language = ?, updated_at = datetime('now')
@@ -163,6 +172,12 @@ accountAiRouter.post('/ai/seller/assist', requireAuth, rateLimit(20, 60_000, 'ai
   const action = req.body?.action;
   if (!['generate_listing', 'translate', 'analytics'].includes(action)) {
     return res.status(400).json({ error: 'Invalid seller AI action.' });
+  }
+  if (action === 'analytics') {
+    const sellerProfile = db.prepare('SELECT id FROM seller_profiles WHERE user_id = ?').get(req.authUser!.id);
+    if (!sellerProfile) {
+      return res.status(403).json({ error: 'Seller profile required to view AI shop analytics.' });
+    }
   }
   try {
     const result = await runSellerListingAi(req.authUser!.id, {

@@ -8,10 +8,25 @@ interface Props {
   fallbackLabel?: string;
 }
 
+function isSafeImageSrc(raw?: string | null): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') return parsed.toString();
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function ImageWithFallback({ src, alt, className = '', fallbackLabel }: Props) {
   const [failed, setFailed] = useState(false);
+  const safeSrc = isSafeImageSrc(src);
 
-  if (!src || failed) {
+  if (!safeSrc || failed) {
     return (
       <div
         className={`flex flex-col items-center justify-center bg-gradient-to-br from-[#0E1525] via-[#131C31] to-[#1A1635] text-slate-400 select-none ${className}`}
@@ -29,7 +44,7 @@ export function ImageWithFallback({ src, alt, className = '', fallbackLabel }: P
 
   return (
     <img
-      src={src}
+      src={safeSrc}
       alt={alt}
       referrerPolicy="no-referrer"
       onError={() => setFailed(true)}

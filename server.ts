@@ -11,6 +11,7 @@ import { messagingOrdersRouter } from './server/routes/messaging_orders.ts';
 import { accountAiRouter } from './server/routes/account_ai.ts';
 import { adminRouter } from './server/routes/admin.ts';
 import { processTelegramWebhookUpdate, verifyWebhookSecret } from './server/telegram.ts';
+import { verifyCookieCsrf } from './server/security.ts';
 
 async function startServer() {
   runMigrations();
@@ -19,11 +20,18 @@ async function startServer() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '2mb' }));
 
-  // Basic security headers
+  // Basic security headers (compatible with Telegram Mini App & iframe embedding)
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     next();
+  });
+
+  app.use(verifyCookieCsrf);
+
+  // Never serve private digital product files publicly under /r2
+  app.use('/r2/digital', (_req, res) => {
+    res.status(403).json({ error: 'Protected digital assets require authenticated order delivery.' });
   });
 
   // Serve R2-compatible uploaded media with safe headers

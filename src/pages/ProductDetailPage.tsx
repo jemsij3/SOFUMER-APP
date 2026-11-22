@@ -261,12 +261,22 @@ export function ProductDetailPage({ productId }: { productId: string }) {
               </div>
             )}
             {product.listing_type === 'digital' && (
-              <div className="flex justify-between gap-4">
-                <span className="text-slate-400">Format & License</span>
-                <span className="text-slate-100 text-right">
-                  {product.file_format || 'Standard digital'} · {product.license_info || 'Standard license'}
-                </span>
-              </div>
+              <>
+                <div className="flex justify-between gap-4">
+                  <span className="text-slate-400">Format & License</span>
+                  <span className="text-slate-100 text-right">
+                    {product.file_format || 'Standard digital'} · {product.license_info || 'Standard license'}
+                  </span>
+                </div>
+                {Boolean(product.has_digital_package) && (
+                  <div className="flex justify-between gap-4">
+                    <span className="text-slate-400">Protected Delivery</span>
+                    <span className="text-emerald-300 font-medium text-right">
+                      Verified Order Delivery Unlocked After Confirmation
+                    </span>
+                  </div>
+                )}
+              </>
             )}
             {product.listing_type === 'service' && (
               <div className="flex justify-between gap-4">

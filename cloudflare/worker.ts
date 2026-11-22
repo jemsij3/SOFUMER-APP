@@ -5,6 +5,11 @@
 import {
   type Env,
   type ExecutionContextLike,
+  type TelegramPreCheckoutQuery,
+  type TelegramSuccessfulPayment,
+  checkEdgeRateLimit,
+  fulfillStarsPreCheckoutEdge,
+  fulfillStarsSuccessfulPaymentEdge,
   getTelegramBotInfoEdge,
   hashSessionIdentifier,
   html,
@@ -15,10 +20,12 @@ import {
   parseJsonBody,
   requireEdgeUser,
   resolveEdgeUserSession,
+  sanitizeSafeUrl,
   sanitizeText,
   sendTelegramBotMessageEdge,
   signJwtEdge,
   timingSafeEqualStr,
+  verifyCookieCsrfEdge,
   verifyTelegramInitDataEdge,
 } from './helpers.ts';
 import { handleMarketplaceRoutes } from './routes-marketplace.ts';
@@ -70,14 +77,65 @@ async function handleTelegramWebhook(
 
   const parsed = await parseJsonBody<{
     update_id?: number;
-    message?: { chat?: { id?: number }; text?: string };
+    pre_checkout_query?: TelegramPreCheckoutQuery;
+    message?: {
+      chat?: { id?: number };
+      from?: { id?: number };
+      text?: string;
+      successful_payment?: TelegramSuccessfulPayment;
+    };
   }>(request);
   if (!parsed.ok) return parsed.error;
 
   const update = parsed.data;
   const updateId = Number(update.update_id);
+
+  // Telegram requires pre_checkout_query to be answered synchronously within 10 seconds
+  if (update.pre_checkout_query?.id) {
+    const result = await fulfillStarsPreCheckoutEdge(env, update.pre_checkout_query);
+    if (env.DB && updateId) {
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO telegram_updates (update_id, chat_id, command) VALUES (?, ?, ?)'
+      )
+        .bind(
+          updateId,
+          String(update.pre_checkout_query.from?.id || ''),
+          result.valid ? 'pre_checkout_ok' : 'pre_checkout_rejected'
+        )
+        .run();
+    }
+    return json({ status: 'pre_checkout_answered', valid: result.valid, updateId: updateId || null }, 200);
+  }
+
   if (!updateId) {
     return json({ status: 'ignored' }, 200);
+  }
+
+  if (update.message?.successful_payment) {
+    if (env.DB) {
+      const existing = await env.DB.prepare(
+        'SELECT update_id FROM telegram_updates WHERE update_id = ?'
+      )
+        .bind(updateId)
+        .first();
+      if (existing) {
+        return json({ status: 'duplicate_skipped', updateId }, 200);
+      }
+      const chatId = update.message.chat?.id ? String(update.message.chat.id) : '';
+      const payerId = update.message.from?.id ? String(update.message.from.id) : chatId;
+      await env.DB.prepare(
+        'INSERT INTO telegram_updates (update_id, chat_id, command) VALUES (?, ?, ?)'
+      )
+        .bind(updateId, chatId, 'successful_payment')
+        .run();
+      const fulfillment = await fulfillStarsSuccessfulPaymentEdge(
+        env,
+        update.message.successful_payment,
+        payerId,
+        url.origin
+      );
+      return json({ status: 'payment_processed', paymentStatus: fulfillment.status, updateId }, 200);
+    }
   }
 
   const processUpdate = async () => {
@@ -169,6 +227,9 @@ async function handleAuthRoutes(
 
   if (url.pathname === '/api/auth/telegram') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const rateRes = await checkEdgeRateLimit(request, env, 'auth', 60, 60);
+    if (rateRes) return rateRes;
+
     if (!env.TELEGRAM_BOT_TOKEN) {
       return json(
         { error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.' },
@@ -206,6 +267,8 @@ async function handleAuthRoutes(
         tgUser.username ||
         `User ${tgId}`;
 
+      const safePhotoUrl = sanitizeSafeUrl(tgUser.photo_url || '', 300);
+
       let userId: string;
       if (!existing) {
         userId = newId('usr');
@@ -220,7 +283,7 @@ async function handleAuthRoutes(
             sanitizeText(tgUser.first_name || 'Member', 64),
             sanitizeText(tgUser.last_name || '', 64),
             sanitizeText(displayName, 80),
-            sanitizeText(tgUser.photo_url || '', 300),
+            safePhotoUrl,
             sanitizeText(tgUser.language_code || 'en', 10)
           )
           .run();
@@ -241,13 +304,15 @@ async function handleAuthRoutes(
         }
         await env.DB.prepare(
           `UPDATE users
-           SET telegram_username = ?, first_name = ?, last_name = ?, last_login_at = datetime('now'), updated_at = datetime('now')
+           SET telegram_username = ?, first_name = ?, last_name = ?, avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END, last_login_at = datetime('now'), updated_at = datetime('now')
            WHERE id = ?`
         )
           .bind(
             sanitizeText(tgUser.username || '', 64),
             sanitizeText(tgUser.first_name || String(existing.first_name), 64),
             sanitizeText(tgUser.last_name || '', 64),
+            safePhotoUrl,
+            safePhotoUrl,
             userId
           )
           .run();
@@ -365,6 +430,10 @@ async function handleMediaRoutes(
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return methodNotAllowed(['GET', 'HEAD']);
     }
+    // Never allow public exposure of private digital asset keys under /r2/digital/*
+    if (url.pathname.startsWith('/r2/digital/')) {
+      return json({ error: 'Protected digital assets require authenticated order delivery.' }, 403);
+    }
     return json({ error: 'Media storage (R2) is currently disabled and will be added later.' }, 404);
   }
 
@@ -441,6 +510,9 @@ export default {
       if (url.pathname === '/api/telegram/webhook') {
         return await handleTelegramWebhook(request, env, url, ctx);
       }
+
+      const csrfErr = verifyCookieCsrfEdge(request, env, url);
+      if (csrfErr) return csrfErr;
 
       const mediaResp = await handleMediaRoutes(request, env, url);
       if (mediaResp) return mediaResp;

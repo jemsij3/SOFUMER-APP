@@ -4,14 +4,17 @@ import {
   Bot,
   Eye,
   ImagePlus,
+  KeyRound,
   Package,
   Plus,
+  Sparkles,
   Store,
   Trash2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
-import type { Product, Shop } from '../types';
+import { openTelegramInvoice } from '../lib/telegram';
+import type { Product, ProductDigitalAsset, Shop, StarsPayment } from '../types';
 import { ImageWithFallback } from '../components/ImageWithFallback';
 
 type SellerModule =
@@ -35,6 +38,7 @@ interface SellerDashboardData {
     featured_slots: number;
     promotional_discount_pct: number;
     billing_cycle: string;
+    ends_at?: string | null;
   } | null;
   stats: {
     total_products: number;
@@ -62,6 +66,7 @@ interface SellerDashboardData {
     review_notes: string;
     created_at: string;
   }>;
+  starsPayments?: StarsPayment[];
 }
 
 export function SellerCenterPage({ initialSection }: { initialSection?: string }) {
@@ -141,6 +146,21 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
 
   // AI Analytics explanation
   const [analyticsInsight, setAnalyticsInsight] = useState('');
+
+  // Billing & Stars checkout state
+  const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
+  const [checkoutBusy, setCheckoutBusy] = useState(false);
+
+  // Digital delivery asset editor state
+  const [digitalEditProduct, setDigitalEditProduct] = useState<Product | null>(null);
+  const [digitalAssetLoading, setDigitalAssetLoading] = useState(false);
+  const [digitalAssetSaving, setDigitalAssetSaving] = useState(false);
+  const [digitalR2Configured, setDigitalR2Configured] = useState(false);
+  const [digitalFileName, setDigitalFileName] = useState('');
+  const [digitalInstructions, setDigitalInstructions] = useState('');
+  const [digitalLicenseTpl, setDigitalLicenseTpl] = useState('');
+  const [digitalDownloadLimit, setDigitalDownloadLimit] = useState('5');
+  const [digitalUploadFile, setDigitalUploadFile] = useState<File | null>(null);
 
   const loadSellerData = useCallback(async () => {
     if (!user || !sellerProfile) {
@@ -491,10 +511,72 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     }
   }
 
+  async function openDigitalAssetEditor(p: Product) {
+    setDigitalEditProduct(p);
+    setDigitalUploadFile(null);
+    setDigitalAssetLoading(true);
+    try {
+      const res = await apiFetch<{ asset: ProductDigitalAsset | null; r2Configured: boolean }>(
+        `/api/seller/products/${p.id}/digital-asset`
+      );
+      setDigitalR2Configured(Boolean(res.r2Configured));
+      setDigitalFileName(res.asset?.file_name || '');
+      setDigitalInstructions(res.asset?.delivery_instructions || p.digital_delivery_method || '');
+      setDigitalLicenseTpl(res.asset?.license_key_template || '');
+      setDigitalDownloadLimit(String(res.asset?.download_limit ?? 5));
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to load digital asset settings', 'error');
+    } finally {
+      setDigitalAssetLoading(false);
+    }
+  }
+
+  async function saveDigitalAsset(e: React.FormEvent) {
+    e.preventDefault();
+    if (!digitalEditProduct) return;
+    setDigitalAssetSaving(true);
+    try {
+      if (digitalUploadFile) {
+        const fd = new FormData();
+        fd.append('file', digitalUploadFile);
+        fd.append('fileName', digitalFileName || digitalUploadFile.name);
+        fd.append('deliveryInstructions', digitalInstructions);
+        fd.append('licenseKeyTemplate', digitalLicenseTpl);
+        fd.append('downloadLimit', digitalDownloadLimit);
+        await apiFetch(`/api/seller/products/${digitalEditProduct.id}/digital-asset`, {
+          method: 'POST',
+          body: fd,
+        });
+      } else {
+        await apiFetch(`/api/seller/products/${digitalEditProduct.id}/digital-asset`, {
+          method: 'POST',
+          body: JSON.stringify({
+            fileName: digitalFileName,
+            deliveryInstructions: digitalInstructions,
+            licenseKeyTemplate: digitalLicenseTpl,
+            downloadLimit: Number(digitalDownloadLimit || 5),
+          }),
+        });
+      }
+      notify('Protected digital delivery package saved', 'success');
+      setDigitalEditProduct(null);
+      await loadSellerData();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to save digital package', 'error');
+    } finally {
+      setDigitalAssetSaving(false);
+    }
+  }
+
   async function createPromotion(e: React.FormEvent) {
     e.preventDefault();
+    setCheckoutBusy(true);
     try {
-      const res = await apiFetch<{ priceAmount: number }>('/api/seller/promotions', {
+      const res = await apiFetch<{
+        paymentId: string;
+        invoiceUrl: string;
+        starsAmount: number;
+      }>('/api/seller/promotions/invoice', {
         method: 'POST',
         body: JSON.stringify({
           promoType,
@@ -503,24 +585,73 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
           durationDays: Number(promoDays || 7),
         }),
       });
-      setPromoTitle('');
-      notify(`Promotion submitted ($${res.priceAmount} USD) for admin activation`, 'success');
+      const status = await openTelegramInvoice(res.invoiceUrl);
+      if (status === 'paid') {
+        setPromoTitle('');
+        notify(`Promotion activated via ${res.starsAmount} Telegram Stars!`, 'success');
+      } else if (status === 'cancelled') {
+        await apiFetch(`/api/seller/payments/${res.paymentId}/cancel`, { method: 'POST' }).catch(() => {});
+        notify('Telegram Stars checkout was cancelled.', 'info');
+      } else if (status === 'unavailable') {
+        notify(`Stars invoice created (${res.starsAmount} XTR). Open SOFUMER inside Telegram to complete payment.`, 'info');
+      } else {
+        notify(`Promotion invoice status: ${status}`, 'info');
+      }
       await loadSellerData();
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Promotion failed', 'error');
+      notify(err instanceof Error ? err.message : 'Promotion checkout failed', 'error');
+    } finally {
+      setCheckoutBusy(false);
     }
   }
 
-  async function switchPlan(planCode: string, billingCycle: 'monthly' | 'annual') {
+  async function switchPlan(planCode: string, cycle: 'monthly' | 'annual') {
+    setCheckoutBusy(true);
     try {
-      await apiFetch('/api/seller/subscriptions', {
+      if (planCode === 'FREE') {
+        await apiFetch('/api/seller/subscriptions', {
+          method: 'POST',
+          body: JSON.stringify({ planCode, billingCycle: cycle }),
+        });
+        notify('Switched to FREE plan', 'success');
+        await loadSellerData();
+        return;
+      }
+
+      const res = await apiFetch<{
+        paymentId: string;
+        invoiceUrl: string;
+        starsAmount: number;
+      }>('/api/seller/subscriptions/invoice', {
         method: 'POST',
-        body: JSON.stringify({ planCode, billingCycle }),
+        body: JSON.stringify({ planCode, billingCycle: cycle }),
       });
-      notify(`Subscribed to ${planCode} (${billingCycle})`, 'success');
+      const status = await openTelegramInvoice(res.invoiceUrl);
+      if (status === 'paid') {
+        notify(`Subscribed to ${planCode} (${cycle}) with ${res.starsAmount} Stars!`, 'success');
+      } else if (status === 'cancelled') {
+        await apiFetch(`/api/seller/payments/${res.paymentId}/cancel`, { method: 'POST' }).catch(() => {});
+        notify('Telegram Stars checkout was cancelled.', 'info');
+      } else if (status === 'unavailable') {
+        notify(`Stars invoice created (${res.starsAmount} XTR). Open inside Telegram to complete checkout.`, 'info');
+      } else {
+        notify(`Checkout status: ${status}`, 'info');
+      }
       await loadSellerData();
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Plan change failed', 'error');
+      notify(err instanceof Error ? err.message : 'Plan checkout failed', 'error');
+    } finally {
+      setCheckoutBusy(false);
+    }
+  }
+
+  async function cancelPendingPayment(paymentId: string) {
+    try {
+      await apiFetch(`/api/seller/payments/${paymentId}/cancel`, { method: 'POST' });
+      notify('Pending Stars invoice cancelled', 'info');
+      await loadSellerData();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to cancel invoice', 'error');
     }
   }
 
@@ -670,7 +801,17 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                         )}
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {p.listing_type === 'digital' && (
+                        <button
+                          type="button"
+                          onClick={() => openDigitalAssetEditor(p)}
+                          className="h-9 px-3 rounded-lg bg-emerald-950/60 border border-emerald-700/60 text-xs text-emerald-200 flex items-center gap-1"
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>{p.has_digital_package ? 'Digital Package' : 'Attach Package'}</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => navigate({ type: 'product', productId: p.id })}
@@ -696,6 +837,102 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                     </div>
                   </div>
                 ))
+              )}
+
+              {digitalEditProduct && (
+                <form onSubmit={saveDigitalAsset} className="p-5 rounded-2xl bg-[#0E1525] border border-emerald-800/60 space-y-3.5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-white">
+                        Protected Digital Delivery — {digitalEditProduct.title}
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Automatically unlocked for buyers after order confirmation. Never exposed on public asset URLs.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDigitalEditProduct(null)}
+                      className="h-8 px-3 rounded-lg bg-slate-800 text-xs text-slate-300"
+                    >
+                      Close
+                    </button>
+                  </div>
+                  {digitalAssetLoading ? (
+                    <div className="text-xs text-slate-400">Loading digital package configuration...</div>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1">Receipt / Package Filename</label>
+                          <input
+                            type="text"
+                            value={digitalFileName}
+                            onChange={(e) => setDigitalFileName(e.target.value)}
+                            placeholder="software-license.txt"
+                            className="w-full h-10 px-3 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1">Max Downloads Per Order</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="100"
+                            value={digitalDownloadLimit}
+                            onChange={(e) => setDigitalDownloadLimit(e.target.value)}
+                            className="w-full h-10 px-3 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-white font-mono-nums"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          License Key / Access Template (optional, use {'{ORDER}'} to inject order number)
+                        </label>
+                        <input
+                          type="text"
+                          value={digitalLicenseTpl}
+                          onChange={(e) => setDigitalLicenseTpl(e.target.value)}
+                          placeholder="SFM-PRO-{ORDER}"
+                          className="w-full h-10 px-3 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-white font-mono-nums"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Protected Delivery Instructions / Download Notes
+                        </label>
+                        <textarea
+                          rows={3}
+                          value={digitalInstructions}
+                          onChange={(e) => setDigitalInstructions(e.target.value)}
+                          placeholder="Step-by-step setup notes, activation instructions, or private fulfillment details..."
+                          className="w-full p-3 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-white"
+                        />
+                      </div>
+                      {digitalR2Configured ? (
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1">Optional Binary File Upload (max 50MB)</label>
+                          <input
+                            type="file"
+                            onChange={(e) => setDigitalUploadFile(e.target.files?.[0] || null)}
+                            className="text-xs text-slate-300"
+                          />
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-slate-400">
+                          Note: Object storage for binary archives is optional and currently omitted; delivery instructions and license keys are delivered as protected order receipts.
+                        </p>
+                      )}
+                      <button
+                        type="submit"
+                        disabled={digitalAssetSaving}
+                        className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-60"
+                      >
+                        {digitalAssetSaving ? 'Saving Package...' : 'Save Digital Package'}
+                      </button>
+                    </>
+                  )}
+                </form>
               )}
             </div>
           )}
@@ -1025,8 +1262,13 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                   <input type="text" required value={promoTitle} onChange={(e) => setPromoTitle(e.target.value)} placeholder="Campaign Headline" className="h-11 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-sm text-white" />
                   <input type="number" min="1" max="30" value={promoDays} onChange={(e) => setPromoDays(e.target.value)} placeholder="Duration Days" className="h-11 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-sm text-white font-mono-nums" />
                 </div>
-                <button type="submit" className="h-11 px-5 rounded-xl bg-blue-600 text-white text-sm font-semibold">
-                  Submit Promotion Campaign
+                <button
+                  type="submit"
+                  disabled={checkoutBusy}
+                  className="h-11 px-5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>{checkoutBusy ? 'Creating Stars Invoice...' : 'Promote with Telegram Stars'}</span>
                 </button>
               </form>
 
@@ -1048,43 +1290,117 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
           )}
 
           {module === 'plans' && dash && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {plans.map((pl) => {
-                const isCurrent = dash.subscription?.plan_code === pl.code;
-                let feats: string[] = [];
-                try {
-                  feats = JSON.parse(pl.features_json || '[]');
-                } catch {
-                  feats = [];
-                }
-                return (
-                  <div key={pl.id} className={`p-5 rounded-2xl border flex flex-col justify-between gap-4 ${isCurrent ? 'bg-blue-600/10 border-blue-500' : 'bg-[#0E1525] border-slate-800'}`}>
-                    <div className="space-y-3">
-                      <div>
-                        <div className="text-xs text-blue-400 font-semibold">{pl.code}</div>
-                        <h3 className="text-lg font-bold text-white">{pl.name}</h3>
-                        <p className="text-xs text-slate-400 mt-0.5">{pl.tagline}</p>
-                      </div>
-                      <div className="text-2xl font-bold text-white font-mono-nums">
-                        ${pl.monthly_price} <span className="text-xs font-normal text-slate-400">/ mo</span>
-                      </div>
-                      <ul className="space-y-1.5 text-xs text-slate-300">
-                        {feats.map((f, i) => (
-                          <li key={i}>· {f}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={isCurrent}
-                      onClick={() => switchPlan(pl.code, 'monthly')}
-                      className={`h-10 rounded-xl text-xs font-semibold ${isCurrent ? 'bg-slate-800 text-slate-400' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}
-                    >
-                      {isCurrent ? 'Current Active Plan' : `Select ${pl.code}`}
-                    </button>
+            <div className="space-y-5">
+              <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                <div className="text-xs">
+                  <div className="font-semibold text-white">
+                    Active Plan: {dash.subscription?.plan_name || 'Free Starter'} ({dash.subscription?.billing_cycle || 'monthly'})
                   </div>
-                );
-              })}
+                  {dash.subscription?.ends_at && (
+                    <div className="text-slate-400 mt-0.5 font-mono-nums">
+                      Renews / Expires: {new Date(dash.subscription.ends_at).toLocaleDateString()}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 p-1 rounded-xl bg-[#070B14] border border-slate-800">
+                  {(['monthly', 'annual'] as const).map((cycle) => (
+                    <button
+                      key={cycle}
+                      type="button"
+                      onClick={() => setBillingCycle(cycle)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize ${
+                        billingCycle === cycle ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {cycle}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {plans.map((pl) => {
+                  const isCurrent = dash.subscription?.plan_code === pl.code;
+                  const usdPrice = billingCycle === 'annual' ? pl.annual_price : pl.monthly_price;
+                  const starsCost = billingCycle === 'annual' ? (pl.stars_annual ?? 0) : (pl.stars_monthly ?? 0);
+                  let feats: string[] = [];
+                  try {
+                    feats = JSON.parse(pl.features_json || '[]');
+                  } catch {
+                    feats = [];
+                  }
+                  return (
+                    <div key={pl.id} className={`p-5 rounded-2xl border flex flex-col justify-between gap-4 ${isCurrent ? 'bg-blue-600/10 border-blue-500' : 'bg-[#0E1525] border-slate-800'}`}>
+                      <div className="space-y-3">
+                        <div>
+                          <div className="text-xs text-blue-400 font-semibold">{pl.code}</div>
+                          <h3 className="text-lg font-bold text-white">{pl.name}</h3>
+                          <p className="text-xs text-slate-400 mt-0.5">{pl.tagline}</p>
+                        </div>
+                        <div className="space-y-0.5">
+                          <div className="text-2xl font-bold text-white font-mono-nums">
+                            {starsCost > 0 ? `${starsCost} XTR` : 'Free'}
+                            <span className="text-xs font-normal text-slate-400">
+                              {' '}
+                              / {billingCycle === 'annual' ? 'yr' : 'mo'}
+                            </span>
+                          </div>
+                          {usdPrice > 0 && (
+                            <div className="text-[11px] text-slate-400 font-mono-nums">
+                              Approx. ${usdPrice} USD via Telegram Stars
+                            </div>
+                          )}
+                        </div>
+                        <ul className="space-y-1.5 text-xs text-slate-300">
+                          {feats.map((f, i) => (
+                            <li key={i}>· {f}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isCurrent || checkoutBusy}
+                        onClick={() => switchPlan(pl.code, billingCycle)}
+                        className={`h-10 rounded-xl text-xs font-semibold ${isCurrent ? 'bg-slate-800 text-slate-400' : 'bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-60'}`}
+                      >
+                        {isCurrent
+                          ? 'Current Active Plan'
+                          : starsCost > 0
+                          ? `Pay ${starsCost} Stars (${pl.code})`
+                          : `Select ${pl.code}`}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {dash.starsPayments && dash.starsPayments.length > 0 && (
+                <div className="p-5 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-2.5 text-xs">
+                  <div className="text-sm font-semibold text-white">Telegram Stars Billing History</div>
+                  {dash.starsPayments.map((pay) => (
+                    <div key={pay.id} className="flex flex-wrap items-center justify-between gap-2 py-2 border-b border-slate-800/70">
+                      <div>
+                        <span className="font-semibold text-white">
+                          {pay.target_type} · {pay.plan_code} ({pay.billing_cycle})
+                        </span>
+                        <span className="text-slate-400 ml-2 font-mono-nums">{pay.stars_amount} XTR</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="uppercase font-mono-nums text-blue-300">{pay.status}</span>
+                        {pay.status === 'pending' && (
+                          <button
+                            type="button"
+                            onClick={() => cancelPendingPayment(pay.id)}
+                            className="h-7 px-2.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white"
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -1114,7 +1430,12 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                     <span>Upload Logo</span>
                     <input type="file" accept="image/*" className="hidden" onChange={async (e) => {
                       const f = e.target.files?.[0];
-                      if (f) setEditLogo(await uploadImage(f));
+                      if (!f) return;
+                      try {
+                        setEditLogo(await uploadImage(f));
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Logo upload failed', 'error');
+                      }
                     }} />
                   </label>
                   <label className="h-10 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-200 flex items-center gap-2 cursor-pointer">
@@ -1122,7 +1443,12 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                     <span>Upload Banner</span>
                     <input type="file" accept="image/*" className="hidden" onChange={async (e) => {
                       const f = e.target.files?.[0];
-                      if (f) setEditBanner(await uploadImage(f));
+                      if (!f) return;
+                      try {
+                        setEditBanner(await uploadImage(f));
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Banner upload failed', 'error');
+                      }
                     }} />
                   </label>
                 </div>

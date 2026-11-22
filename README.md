@@ -28,7 +28,7 @@ sofumer-app/
 │   ├── routes-commerce.ts      # Conversations, direct orders, reviews, account & support
 │   ├── routes-ai.ts            # Cloudflare Workers AI (`env.AI`) endpoints & quota enforcement
 │   └── routes-admin.ts         # Isolated admin governance console API
-├── migrations/                 # Version-controlled D1 SQL migrations (0001–0003)
+├── migrations/                 # Version-controlled D1 SQL migrations (0001–0004)
 ├── test/
 │   └── worker.test.js          # Vitest + @cloudflare/vitest-pool-workers Worker test suite
 ├── tests/
@@ -80,11 +80,13 @@ npm run build
 npm test
 ```
 
-## 4. Cloudflare D1 Auto-Provisioning & Secrets
+## 4. Cloudflare D1, Telegram Stars (`XTR`), Digital Delivery & Secrets
 
-`wrangler.jsonc` intentionally omits `database_id` while specifying `"database_name": "sofumer-db"` so Cloudflare Workers Builds / Wrangler automatically creates and binds `sofumer-db` during deployment (and reuses it by name on future deploys). R2 object storage is intentionally omitted for now and can be added later.
+`wrangler.jsonc` binds `sofumer-db` (`database_id`: `37387526-bf6a-4a2d-bf61-70dece9eb2f5`). R2 object storage (`MEDIA_BUCKET`) is intentionally omitted for now and can be added later.
 
-The Worker also includes an idempotent auto-bootstrapper (`cloudflare/d1-bootstrap.ts`) that creates all 40 tables, indexes, and system lookup seeds on first `/api/*` request if a fresh empty D1 database is bound.
+The Worker includes an idempotent auto-bootstrapper (`cloudflare/d1-bootstrap.ts`) matching migrations `0001`–`0004` that initializes tables, indexes, Telegram Stars billing tables, protected digital delivery tables, and system seeds on first `/api/*` request if an empty D1 database is bound.
+
+Paid seller tiers (`PRO`, `BUSINESS`) and featured promotions use native Telegram Stars (`XTR`) checkout (`createInvoiceLink` + webhook verification), and digital listings support protected post-confirmation package/license delivery.
 
 Configure production secrets in Cloudflare (never stored in `wrangler.jsonc` or Git):
 
@@ -111,7 +113,7 @@ After deploying `sofumer-app`, register your Telegram bot webhook **once** using
 curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
   -d '{
-    "url": "https://sofumer-app.derartuaman8.workers.dev/api/telegram/webhook",
+    "url": "<YOUR_WORKER_URL>/api/telegram/webhook",
     "secret_token": "<TELEGRAM_WEBHOOK_SECRET>"
   }'
 ```

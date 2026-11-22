@@ -50,6 +50,8 @@ export interface SubscriptionPlan {
   custom_branding: number;
   priority_support: number;
   features_json: string;
+  stars_monthly?: number;
+  stars_annual?: number;
 }
 
 export interface User {
@@ -155,7 +157,53 @@ export interface Product {
   stock_quantity?: number;
   unlimited_digital?: number;
   availability_status?: string;
+  has_digital_package?: number | boolean;
   created_at: string;
+}
+
+export interface StarsPayment {
+  id: string;
+  target_type: 'subscription' | 'promotion';
+  target_id: string;
+  plan_code: string;
+  billing_cycle: string;
+  stars_amount: number;
+  currency: string;
+  invoice_url: string;
+  telegram_payment_charge_id: string;
+  status: 'pending' | 'paid' | 'cancelled' | 'expired' | 'failed' | 'refunded';
+  paid_at: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface ProductDigitalAsset {
+  id: string;
+  product_id: string;
+  file_name: string;
+  content_type: string;
+  file_size: number;
+  storage_provider: 'r2' | 'local' | 'inline_note';
+  delivery_instructions: string;
+  license_key_template: string;
+  download_limit: number;
+  download_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrderDigitalAsset {
+  productId: string;
+  productTitle: string;
+  hasAsset: boolean;
+  fileName: string | null;
+  contentType: string | null;
+  fileSize: number;
+  hasFile: boolean;
+  deliveryInstructions: string;
+  licenseKey: string;
+  downloadLimit: number;
+  downloadsUsed: number;
 }
 
 export interface Conversation {

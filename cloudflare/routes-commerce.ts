@@ -1,5 +1,8 @@
 import {
   type Env,
+  PAID_ORDER_STATUSES,
+  checkEdgeRateLimit,
+  isSafeUrlOrEmpty,
   json,
   methodNotAllowed,
   newId,
@@ -8,6 +11,15 @@ import {
   requireEdgeUser,
   sanitizeText,
 } from './helpers.ts';
+
+function resolveLicenseKey(template: string, orderNumber: string): string {
+  const cleaned = String(template || '').trim();
+  if (!cleaned) return '';
+  if (/\{\{ORDER_NUMBER\}\}|\{ORDER\}/i.test(cleaned)) {
+    return cleaned.replace(/\{\{ORDER_NUMBER\}\}|\{ORDER\}/gi, orderNumber);
+  }
+  return `${cleaned}-${orderNumber}`;
+}
 
 export async function handleCommerceAndAccountRoutes(
   request: Request,
@@ -57,6 +69,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method === 'POST') {
       const auth = await requireEdgeUser(request, env);
       if ('error' in auth) return auth.error;
+      const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+      if (limited) return limited;
       const body = await parseJsonBody(request);
       if (!body.ok) return body.error;
 
@@ -71,7 +85,7 @@ export async function handleCommerceAndAccountRoutes(
 
       if (productId) {
         const product = await env.DB.prepare(
-          "SELECT id, shop_id, seller_user_id, title FROM products WHERE id = ? AND status = 'published'"
+          "SELECT p.id, p.shop_id, p.seller_user_id, p.title FROM products p JOIN shops s ON s.id = p.shop_id WHERE p.id = ? AND p.status = 'published' AND s.status = 'active'"
         )
           .bind(productId)
           .first<{ id: string; shop_id: string; seller_user_id: string; title: string }>();
@@ -232,6 +246,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method === 'POST') {
       const auth = await requireEdgeUser(request, env);
       if ('error' in auth) return auth.error;
+      const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+      if (limited) return limited;
       const body = await parseJsonBody(request);
       if (!body.ok) return body.error;
 
@@ -259,7 +275,11 @@ export async function handleCommerceAndAccountRoutes(
       }
 
       const msgBody = sanitizeText(body.data.body || '', 2500);
-      const attachmentUrl = sanitizeText(body.data.attachmentUrl || '', 300);
+      const rawAttachmentUrl = sanitizeText(body.data.attachmentUrl || '', 300);
+      if (rawAttachmentUrl && !isSafeUrlOrEmpty(rawAttachmentUrl, 300)) {
+        return json({ error: 'Attachment URL must use http(s) or a relative path.' }, 400);
+      }
+      const attachmentUrl = rawAttachmentUrl;
       const attachmentType = sanitizeText(body.data.attachmentType || '', 40);
       if (!msgBody && !attachmentUrl) {
         return json({ error: 'Message text or image attachment is required.' }, 400);
@@ -328,6 +348,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
+    const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+    if (limited) return limited;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const targetUserId = sanitizeText(body.data.userId || '', 64);
@@ -388,6 +410,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method === 'POST') {
       const auth = await requireEdgeUser(request, env);
       if ('error' in auth) return auth.error;
+      const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+      if (limited) return limited;
       const body = await parseJsonBody(request);
       if (!body.ok) return body.error;
 
@@ -405,7 +429,7 @@ export async function handleCommerceAndAccountRoutes(
       const deliveryArrangement = sanitizeText(body.data.deliveryArrangement || '', 300);
       const notes = sanitizeText(body.data.notes || '', 600);
 
-      if (!productId || !buyerUserId || Number.isNaN(agreedTotal) || agreedTotal < 0) {
+      if (!productId || !buyerUserId || !Number.isFinite(agreedTotal) || agreedTotal < 0) {
         return json({ error: 'Product, buyer, and agreed total are required.' }, 400);
       }
 
@@ -494,6 +518,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
+    const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+    if (limited) return limited;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
@@ -569,6 +595,8 @@ export async function handleCommerceAndAccountRoutes(
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
+    const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
+    if (limited) return limited;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
@@ -620,6 +648,172 @@ export async function handleCommerceAndAccountRoutes(
       .run();
 
     return json({ reviewId, rating }, 201);
+  }
+
+  // Protected Digital Product Delivery for confirmed/completed orders
+  if (path.startsWith('/api/orders/') && path.endsWith('/digital')) {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const orderId = decodeURIComponent(path.slice('/api/orders/'.length, -'/digital'.length));
+
+    const order = await env.DB.prepare('SELECT * FROM orders WHERE id = ?')
+      .bind(orderId)
+      .first<Record<string, unknown>>();
+    if (!order) return json({ error: 'Order not found.' }, 404);
+
+    const isBuyer = order.buyer_user_id === auth.user.id;
+    const isSeller = order.seller_user_id === auth.user.id;
+    if (!isBuyer && !isSeller) return json({ error: 'Not authorized to access this order.' }, 403);
+
+    const unlocked = (PAID_ORDER_STATUSES as readonly string[]).includes(String(order.status));
+    if (isBuyer && !unlocked) {
+      return json({ error: 'Digital delivery unlocks once the order is confirmed.' }, 403);
+    }
+
+    const itemsRes = await env.DB.prepare(
+      `SELECT oi.product_id, oi.product_title, oi.listing_type,
+              pda.id as asset_id, pda.file_name, pda.content_type, pda.file_size,
+              pda.storage_provider, pda.delivery_instructions, pda.license_key_template,
+              pda.download_limit,
+              (SELECT COUNT(*) FROM digital_download_logs ddl WHERE ddl.order_id = oi.order_id AND ddl.product_id = oi.product_id) as downloads_used
+       FROM order_items oi
+       LEFT JOIN product_digital_assets pda ON pda.product_id = oi.product_id
+       WHERE oi.order_id = ?`
+    )
+      .bind(order.id)
+      .all<Record<string, unknown>>();
+
+    const assets = itemsRes.results
+      .filter((row) => row.asset_id || row.listing_type === 'digital')
+      .map((row) => ({
+        productId: String(row.product_id),
+        productTitle: String(row.product_title),
+        hasAsset: Boolean(row.asset_id),
+        fileName: row.file_name ? String(row.file_name) : null,
+        contentType: row.content_type ? String(row.content_type) : null,
+        fileSize: Number(row.file_size || 0),
+        hasFile: row.storage_provider === 'r2' || row.storage_provider === 'local',
+        deliveryInstructions: String(row.delivery_instructions || ''),
+        licenseKey: resolveLicenseKey(String(row.license_key_template || ''), String(order.order_number)),
+        downloadLimit: Number(row.download_limit || 5),
+        downloadsUsed: Number(row.downloads_used || 0),
+      }));
+
+    return json({
+      orderId: order.id,
+      orderNumber: order.order_number,
+      status: order.status,
+      unlocked: true,
+      assets,
+    });
+  }
+
+  const digitalDlMatch = path.match(/^\/api\/orders\/([^/]+)\/digital\/([^/]+)\/download$/);
+  if (digitalDlMatch) {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const orderId = decodeURIComponent(digitalDlMatch[1]);
+    const productId = decodeURIComponent(digitalDlMatch[2]);
+
+    const order = await env.DB.prepare('SELECT * FROM orders WHERE id = ?')
+      .bind(orderId)
+      .first<Record<string, unknown>>();
+    if (!order) return json({ error: 'Order not found.' }, 404);
+
+    const isBuyer = order.buyer_user_id === auth.user.id;
+    const isSeller = order.seller_user_id === auth.user.id;
+    if (!isBuyer && !isSeller) return json({ error: 'Not authorized to download from this order.' }, 403);
+
+    if (isBuyer && !(PAID_ORDER_STATUSES as readonly string[]).includes(String(order.status))) {
+      return json({ error: 'Digital downloads unlock once the order is confirmed.' }, 403);
+    }
+
+    const item = await env.DB.prepare(
+      'SELECT id, product_title FROM order_items WHERE order_id = ? AND product_id = ? LIMIT 1'
+    )
+      .bind(order.id, productId)
+      .first<{ id: string; product_title: string }>();
+    if (!item) return json({ error: 'Digital product is not part of this order.' }, 404);
+
+    const asset = await env.DB.prepare('SELECT * FROM product_digital_assets WHERE product_id = ?')
+      .bind(productId)
+      .first<Record<string, unknown>>();
+    if (!asset) return json({ error: 'Digital delivery package has not been uploaded by the seller yet.' }, 404);
+
+    const usedRow = await env.DB.prepare(
+      'SELECT COUNT(*) as cnt FROM digital_download_logs WHERE order_id = ? AND product_id = ?'
+    )
+      .bind(order.id, productId)
+      .first<{ cnt: number }>();
+    const used = usedRow?.cnt || 0;
+    const limit = Math.max(1, Number(asset.download_limit || 5));
+    if (isBuyer && used >= limit) {
+      return json({ error: `Download quota exceeded (${used}/${limit}). Contact the seller for renewal.` }, 403);
+    }
+
+    const safeFileName = sanitizeText(String(asset.file_name || `${item.product_title}.txt`), 120).replace(
+      /["\r\n\\]/g,
+      '_'
+    );
+
+    if (asset.storage_provider === 'r2' && asset.storage_key) {
+      if (!env.MEDIA_BUCKET) {
+        return json({ error: 'Object storage is not attached for this digital file.' }, 503);
+      }
+      const obj = await env.MEDIA_BUCKET.get(String(asset.storage_key));
+      if (!obj) return json({ error: 'Digital asset file not found in storage.' }, 404);
+
+      await env.DB.prepare(
+        'INSERT INTO digital_download_logs (id, order_id, product_id, user_id) VALUES (?, ?, ?, ?)'
+      )
+        .bind(newId('ddl'), order.id, productId, auth.user.id)
+        .run();
+      await env.DB.prepare("UPDATE product_digital_assets SET download_count = download_count + 1, updated_at = datetime('now') WHERE id = ?")
+        .bind(asset.id)
+        .run();
+
+      return new Response(obj.body, {
+        status: 200,
+        headers: {
+          'Content-Type': String(asset.content_type || 'application/octet-stream'),
+          'Content-Disposition': `attachment; filename="${safeFileName}"`,
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'private, no-store',
+        },
+      });
+    }
+
+    await env.DB.prepare(
+      'INSERT INTO digital_download_logs (id, order_id, product_id, user_id) VALUES (?, ?, ?, ?)'
+    )
+      .bind(newId('ddl'), order.id, productId, auth.user.id)
+      .run();
+    await env.DB.prepare("UPDATE product_digital_assets SET download_count = download_count + 1, updated_at = datetime('now') WHERE id = ?")
+      .bind(asset.id)
+      .run();
+
+    const licenseKey = resolveLicenseKey(String(asset.license_key_template || ''), String(order.order_number));
+    const receiptText = [
+      `SOFUMER Digital Delivery Receipt`,
+      `Order: ${String(order.order_number)}`,
+      `Product: ${item.product_title}`,
+      licenseKey ? `License Key: ${licenseKey}` : null,
+      asset.delivery_instructions ? `\nDelivery Instructions:\n${String(asset.delivery_instructions)}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    return new Response(receiptText, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain;charset=UTF-8',
+        'Content-Disposition': `attachment; filename="${safeFileName.replace(/\.txt$/i, '')}-delivery.txt"`,
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'private, no-store',
+      },
+    });
   }
 
   if (path.startsWith('/api/orders/')) {

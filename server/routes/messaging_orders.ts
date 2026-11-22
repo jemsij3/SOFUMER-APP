@@ -1,6 +1,14 @@
+import fs from 'fs';
 import { Router } from 'express';
-import { db, newId } from '../db.ts';
-import { rateLimit, requireAuth, sanitizeText } from '../security.ts';
+import { db, newId, resolveConfinedDigitalPath } from '../db.ts';
+import {
+  PAID_ORDER_STATUSES,
+  isSafeUrlOrEmpty,
+  rateLimit,
+  requireAuth,
+  sanitizeSafeUrl,
+  sanitizeText,
+} from '../security.ts';
 import { notifyUserAndTelegram } from '../telegram.ts';
 
 export const messagingOrdersRouter = Router();
@@ -44,7 +52,11 @@ messagingOrdersRouter.post('/conversations', requireAuth, rateLimit(20, 60_000, 
 
   if (productId) {
     const product = db
-      .prepare("SELECT id, shop_id, seller_user_id, title FROM products WHERE id = ? AND status = 'published'")
+      .prepare(
+        `SELECT p.id, p.shop_id, p.seller_user_id, p.title
+         FROM products p JOIN shops s ON s.id = p.shop_id
+         WHERE p.id = ? AND p.status = 'published' AND s.status = 'active'`
+      )
       .get(productId) as { id: string; shop_id: string; seller_user_id: string; title: string } | undefined;
     if (!product) {
       return res.status(404).json({ error: 'Listing not found.' });
@@ -227,7 +239,10 @@ messagingOrdersRouter.post('/conversations/:id/messages', requireAuth, rateLimit
   }
 
   const body = sanitizeText(req.body?.body || '', 2500);
-  const attachmentUrl = sanitizeText(req.body?.attachmentUrl || '', 300);
+  if (!isSafeUrlOrEmpty(req.body?.attachmentUrl, 300)) {
+    return res.status(400).json({ error: 'Attachment URL must use http(s) or a valid relative path.' });
+  }
+  const attachmentUrl = sanitizeSafeUrl(req.body?.attachmentUrl || '', 300);
   const attachmentType = sanitizeText(req.body?.attachmentType || '', 40);
 
   if (!body && !attachmentUrl) {
@@ -397,7 +412,7 @@ messagingOrdersRouter.post('/orders', requireAuth, async (req, res) => {
   const deliveryArrangement = sanitizeText(req.body?.deliveryArrangement || '', 300);
   const notes = sanitizeText(req.body?.notes || '', 600);
 
-  if (!productId || !buyerUserId || Number.isNaN(agreedTotal) || agreedTotal < 0) {
+  if (!productId || !buyerUserId || !Number.isFinite(agreedTotal) || agreedTotal < 0) {
     return res.status(400).json({ error: 'Product, buyer, and agreed total are required.' });
   }
 
@@ -623,4 +638,157 @@ messagingOrdersRouter.post('/orders/:id/review', requireAuth, (req, res) => {
   })();
 
   res.status(201).json({ reviewId, rating });
+});
+
+function resolveLicenseKeyLocal(template: string, orderNumber: string): string {
+  const clean = template.trim();
+  if (!clean) return '';
+  if (/\{\{ORDER_NUMBER\}\}|\{ORDER\}/i.test(clean)) {
+    return clean.replace(/\{\{ORDER_NUMBER\}\}|\{ORDER\}/gi, orderNumber);
+  }
+  return `${clean}-${orderNumber}`;
+}
+
+messagingOrdersRouter.get('/orders/:id/digital', requireAuth, (req, res) => {
+  const userId = req.authUser!.id;
+  const order = db
+    .prepare('SELECT * FROM orders WHERE id = ? AND (buyer_user_id = ? OR seller_user_id = ?)')
+    .get(req.params.id, userId, userId) as Record<string, unknown> | undefined;
+  if (!order) {
+    return res.status(404).json({ error: 'Order not found or unauthorized.' });
+  }
+
+  const isSeller = order.seller_user_id === userId;
+  const unlocked = isSeller || (PAID_ORDER_STATUSES as readonly string[]).includes(String(order.status));
+  if (!unlocked) {
+    return res.status(403).json({
+      error: 'Digital delivery unlocks once the order is confirmed.',
+      status: order.status,
+      unlocked: false,
+    });
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT oi.product_id, oi.product_title, oi.listing_type,
+              da.id as asset_id, da.file_name, da.content_type, da.file_size,
+              da.storage_provider, da.delivery_instructions, da.license_key_template, da.download_limit,
+              (SELECT COUNT(*) FROM digital_download_logs l WHERE l.order_id = oi.order_id AND l.product_id = oi.product_id) as downloads_used
+       FROM order_items oi
+       LEFT JOIN product_digital_assets da ON da.product_id = oi.product_id
+       WHERE oi.order_id = ?`
+    )
+    .all(order.id) as Array<Record<string, unknown>>;
+
+  const assets = rows
+    .filter((row) => row.asset_id || row.listing_type === 'digital')
+    .map((row) => ({
+      productId: String(row.product_id),
+      productTitle: String(row.product_title),
+      hasAsset: Boolean(row.asset_id),
+      fileName: row.file_name ? String(row.file_name) : null,
+      contentType: row.content_type ? String(row.content_type) : null,
+      fileSize: Number(row.file_size || 0),
+      hasFile: row.storage_provider === 'r2' || row.storage_provider === 'local',
+      deliveryInstructions: String(row.delivery_instructions || ''),
+      licenseKey: resolveLicenseKeyLocal(String(row.license_key_template || ''), String(order.order_number)),
+      downloadLimit: Number(row.download_limit || 5),
+      downloadsUsed: Number(row.downloads_used || 0),
+    }));
+
+  res.json({
+    orderId: order.id,
+    orderNumber: order.order_number,
+    status: order.status,
+    unlocked: true,
+    assets,
+  });
+});
+
+messagingOrdersRouter.get('/orders/:id/digital/:productId/download', requireAuth, (req, res) => {
+  const userId = req.authUser!.id;
+  const order = db
+    .prepare('SELECT * FROM orders WHERE id = ? AND (buyer_user_id = ? OR seller_user_id = ?)')
+    .get(req.params.id, userId, userId) as Record<string, unknown> | undefined;
+  if (!order) {
+    return res.status(404).json({ error: 'Order not found or unauthorized.' });
+  }
+
+  const isSeller = order.seller_user_id === userId;
+  const unlocked = isSeller || (PAID_ORDER_STATUSES as readonly string[]).includes(String(order.status));
+  if (!unlocked) {
+    return res.status(403).json({ error: 'Digital downloads unlock once the order is confirmed.' });
+  }
+
+  const item = db
+    .prepare('SELECT id, product_title FROM order_items WHERE order_id = ? AND product_id = ? LIMIT 1')
+    .get(order.id, req.params.productId) as { id: string; product_title: string } | undefined;
+  if (!item) {
+    return res.status(404).json({ error: 'Digital product is not part of this order.' });
+  }
+
+  const asset = db
+    .prepare('SELECT * FROM product_digital_assets WHERE product_id = ?')
+    .get(req.params.productId) as Record<string, unknown> | undefined;
+  if (!asset) {
+    return res.status(404).json({ error: 'Digital delivery package has not been uploaded by the seller yet.' });
+  }
+
+  const usedRow = db
+    .prepare('SELECT COUNT(*) as cnt FROM digital_download_logs WHERE order_id = ? AND product_id = ?')
+    .get(order.id, req.params.productId) as { cnt: number };
+  const limit = Math.max(1, Number(asset.download_limit || 5));
+  if (!isSeller && usedRow.cnt >= limit) {
+    return res.status(403).json({ error: `Download quota exceeded (${usedRow.cnt}/${limit}). Contact the seller.` });
+  }
+
+  const safeFilename = String(asset.file_name || `${item.product_title}.txt`).replace(/[\r\n"\\/]/g, '_');
+
+  if (asset.storage_provider === 'r2' || asset.storage_provider === 'local') {
+    const filePath = resolveConfinedDigitalPath(String(asset.storage_key || ''));
+    if (!filePath || !fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Stored digital file is unavailable on disk.' });
+    }
+    db.prepare(
+      `INSERT INTO digital_download_logs (id, order_id, product_id, user_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(newId('ddl'), order.id, req.params.productId, userId);
+    db.prepare("UPDATE product_digital_assets SET download_count = download_count + 1, updated_at = datetime('now') WHERE id = ?").run(
+      asset.id
+    );
+
+    res.setHeader('Content-Type', String(asset.content_type || 'application/octet-stream'));
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-store');
+    return res.sendFile(filePath);
+  }
+
+  db.prepare(
+    `INSERT INTO digital_download_logs (id, order_id, product_id, user_id)
+     VALUES (?, ?, ?, ?)`
+  ).run(newId('ddl'), order.id, req.params.productId, userId);
+  db.prepare("UPDATE product_digital_assets SET download_count = download_count + 1, updated_at = datetime('now') WHERE id = ?").run(
+    asset.id
+  );
+
+  const licenseKey = resolveLicenseKeyLocal(String(asset.license_key_template || ''), String(order.order_number));
+  const receipt = [
+    `SOFUMER Digital Delivery Receipt`,
+    `Order: ${String(order.order_number)}`,
+    `Product: ${item.product_title}`,
+    licenseKey ? `License Key: ${licenseKey}` : null,
+    asset.delivery_instructions ? `\nDelivery Instructions:\n${String(asset.delivery_instructions)}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${safeFilename.replace(/\.txt$/i, '')}-delivery.txt"`
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  return res.status(200).send(receipt);
 });

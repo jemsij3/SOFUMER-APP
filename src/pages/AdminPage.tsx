@@ -73,6 +73,7 @@ export function AdminPage() {
     subscriptions: Array<Record<string, unknown>>;
     promotions: Array<Record<string, unknown>>;
     promotionTransactions: Array<Record<string, unknown>>;
+    starsPayments?: Array<Record<string, unknown>>;
   } | null>(null);
   const [aiData, setAiData] = useState<{
     features: Array<Record<string, unknown>>;
@@ -281,6 +282,8 @@ export function AdminPage() {
                 { label: 'Disputed Orders', val: overview.disputed_orders },
                 { label: 'Open Reports', val: overview.open_reports },
                 { label: 'Open Tickets', val: overview.open_tickets },
+                { label: 'Stars Revenue (XTR)', val: overview.stars_revenue_xtr ?? 0 },
+                { label: 'Pending Stars', val: overview.pending_stars_payments ?? 0 },
                 { label: 'Subscription Rev ($)', val: overview.subscription_revenue_usd },
                 { label: 'Promotion Rev ($)', val: overview.promotion_revenue_usd },
                 { label: 'AI Calls Today', val: overview.ai_calls_today },
@@ -314,12 +317,16 @@ export function AdminPage() {
                         <button
                           type="button"
                           onClick={async () => {
-                            await apiFetch(`/api/admin/users/${u.id}/ai-access`, {
-                              method: 'PATCH',
-                              isAdmin: true,
-                              body: JSON.stringify({ aiEnabled: !u.ai_enabled }),
-                            });
-                            loadTabData('users');
+                            try {
+                              await apiFetch(`/api/admin/users/${u.id}/ai-access`, {
+                                method: 'PATCH',
+                                isAdmin: true,
+                                body: JSON.stringify({ aiEnabled: !u.ai_enabled }),
+                              });
+                              await loadTabData('users');
+                            } catch (err) {
+                              notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                            }
                           }}
                           className={`h-8 px-3 rounded-lg border ${
                             u.ai_enabled ? 'border-purple-700 text-purple-200' : 'border-red-700 text-red-200'
@@ -330,13 +337,17 @@ export function AdminPage() {
                         <button
                           type="button"
                           onClick={async () => {
-                            const nextStatus = u.status === 'active' ? 'suspended' : 'active';
-                            await apiFetch(`/api/admin/users/${u.id}/status`, {
-                              method: 'PATCH',
-                              isAdmin: true,
-                              body: JSON.stringify({ status: nextStatus }),
-                            });
-                            loadTabData('users');
+                            try {
+                              const nextStatus = u.status === 'active' ? 'suspended' : 'active';
+                              await apiFetch(`/api/admin/users/${u.id}/status`, {
+                                method: 'PATCH',
+                                isAdmin: true,
+                                body: JSON.stringify({ status: nextStatus }),
+                              });
+                              await loadTabData('users');
+                            } catch (err) {
+                              notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                            }
                           }}
                           className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
                         >
@@ -368,12 +379,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/sellers/${s.id}/status`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ verificationStatus: 'verified' }),
-                          });
-                          loadTabData('sellers');
+                          try {
+                            await apiFetch(`/api/admin/sellers/${s.id}/status`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ verificationStatus: 'verified' }),
+                            });
+                            await loadTabData('sellers');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-blue-600 text-white"
                       >
@@ -382,12 +397,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/sellers/${s.id}/status`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ isFeatured: !s.is_featured }),
-                          });
-                          loadTabData('sellers');
+                          try {
+                            await apiFetch(`/api/admin/sellers/${s.id}/status`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ isFeatured: !s.is_featured }),
+                            });
+                            await loadTabData('sellers');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
                       >
@@ -396,12 +415,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/sellers/${s.id}/status`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ status: s.status === 'active' ? 'suspended' : 'active' }),
-                          });
-                          loadTabData('sellers');
+                          try {
+                            await apiFetch(`/api/admin/sellers/${s.id}/status`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ status: s.status === 'active' ? 'suspended' : 'active' }),
+                            });
+                            await loadTabData('sellers');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/50 text-red-200"
                       >
@@ -432,12 +455,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/products/${p.id}/moderate`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ status: 'published' }),
-                          });
-                          loadTabData('products');
+                          try {
+                            await apiFetch(`/api/admin/products/${p.id}/moderate`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ status: 'published' }),
+                            });
+                            await loadTabData('products');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-emerald-600 text-white"
                       >
@@ -446,12 +473,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/products/${p.id}/moderate`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ isFeatured: !p.is_featured }),
-                          });
-                          loadTabData('products');
+                          try {
+                            await apiFetch(`/api/admin/products/${p.id}/moderate`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ isFeatured: !p.is_featured }),
+                            });
+                            await loadTabData('products');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
                       >
@@ -460,12 +491,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/products/${p.id}/moderate`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ status: 'rejected', notes: 'Policy violation' }),
-                          });
-                          loadTabData('products');
+                          try {
+                            await apiFetch(`/api/admin/products/${p.id}/moderate`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ status: 'rejected', notes: 'Policy violation' }),
+                            });
+                            await loadTabData('products');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-red-600 text-white"
                       >
@@ -484,10 +519,14 @@ export function AdminPage() {
                 <form
                   onSubmit={async (e) => {
                     e.preventDefault();
-                    await apiFetch('/api/admin/categories', { method: 'POST', isAdmin: true, body: JSON.stringify({ name: newCatName }) });
-                    setNewCatName('');
-                    await loadTabData('categories');
-                    await refreshBootstrap();
+                    try {
+                      await apiFetch('/api/admin/categories', { method: 'POST', isAdmin: true, body: JSON.stringify({ name: newCatName }) });
+                      setNewCatName('');
+                      await loadTabData('categories');
+                      await refreshBootstrap();
+                    } catch (err) {
+                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                    }
                   }}
                   className="space-y-2"
                 >
@@ -501,10 +540,14 @@ export function AdminPage() {
                 <form
                   onSubmit={async (e) => {
                     e.preventDefault();
-                    await apiFetch('/api/admin/subcategories', { method: 'POST', isAdmin: true, body: JSON.stringify({ categoryId: newSubParent, name: newSubCatName }) });
-                    setNewSubCatName('');
-                    await loadTabData('categories');
-                    await refreshBootstrap();
+                    try {
+                      await apiFetch('/api/admin/subcategories', { method: 'POST', isAdmin: true, body: JSON.stringify({ categoryId: newSubParent, name: newSubCatName }) });
+                      setNewSubCatName('');
+                      await loadTabData('categories');
+                      await refreshBootstrap();
+                    } catch (err) {
+                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                    }
                   }}
                   className="space-y-2"
                 >
@@ -566,12 +609,16 @@ export function AdminPage() {
                     <button
                       type="button"
                       onClick={async () => {
-                        await apiFetch(`/api/admin/reports/${r.id}`, {
-                          method: 'PATCH',
-                          isAdmin: true,
-                          body: JSON.stringify({ status: 'resolved', resolutionNotes: 'Reviewed by moderation' }),
-                        });
-                        loadTabData('reports');
+                        try {
+                          await apiFetch(`/api/admin/reports/${r.id}`, {
+                            method: 'PATCH',
+                            isAdmin: true,
+                            body: JSON.stringify({ status: 'resolved', resolutionNotes: 'Reviewed by moderation' }),
+                          });
+                          await loadTabData('reports');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                        }
                       }}
                       className="h-8 px-3 rounded-lg bg-blue-600 text-white"
                     >
@@ -585,8 +632,12 @@ export function AdminPage() {
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await apiFetch<{ messages: Array<Record<string, unknown>> }>(`/api/admin/conversations/${c.id}/messages`, { isAdmin: true });
-                        setInspectedMsgs(res.messages);
+                        try {
+                          const res = await apiFetch<{ messages: Array<Record<string, unknown>> }>(`/api/admin/conversations/${c.id}/messages`, { isAdmin: true });
+                          setInspectedMsgs(res.messages);
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Unable to inspect thread', 'error');
+                        }
                       }}
                       className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
                     >
@@ -620,12 +671,16 @@ export function AdminPage() {
                   <button
                     type="button"
                     onClick={async () => {
-                      await apiFetch(`/api/admin/reviews/${r.id}`, {
-                        method: 'PATCH',
-                        isAdmin: true,
-                        body: JSON.stringify({ status: r.status === 'published' ? 'hidden' : 'published' }),
-                      });
-                      loadTabData('reviews');
+                      try {
+                        await apiFetch(`/api/admin/reviews/${r.id}`, {
+                          method: 'PATCH',
+                          isAdmin: true,
+                          body: JSON.stringify({ status: r.status === 'published' ? 'hidden' : 'published' }),
+                        });
+                        await loadTabData('reviews');
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                      }
                     }}
                     className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
                   >
@@ -645,22 +700,26 @@ export function AdminPage() {
                     <div key={String(pl.id)} className="p-4 rounded-xl bg-[#070B14] border border-slate-800 space-y-2 text-xs">
                       <div className="font-bold text-white">{String(pl.code)} — {String(pl.name)}</div>
                       <div className="text-slate-400 font-mono-nums">
-                        ${String(pl.monthly_price)}/mo · Max Listings: {String(pl.max_products)} · AI/day: {String(pl.ai_daily_limit)}
+                        ${String(pl.monthly_price)}/mo ({String(pl.stars_monthly ?? 0)} XTR) · Max Listings: {String(pl.max_products)} · AI/day: {String(pl.ai_daily_limit)}
                       </div>
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/plans/${pl.id}`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({
-                              monthlyPrice: Number(pl.monthly_price) + 5,
-                              annualPrice: Number(pl.annual_price),
-                              maxProducts: Number(pl.max_products),
-                              aiDailyLimit: Number(pl.ai_daily_limit),
-                            }),
-                          });
-                          loadTabData('subscriptions');
+                          try {
+                            await apiFetch(`/api/admin/plans/${pl.id}`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({
+                                monthlyPrice: Number(pl.monthly_price) + 5,
+                                annualPrice: Number(pl.annual_price),
+                                maxProducts: Number(pl.max_products),
+                                aiDailyLimit: Number(pl.ai_daily_limit),
+                              }),
+                            });
+                            await loadTabData('subscriptions');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Plan update failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-slate-800 text-slate-200"
                       >
@@ -683,12 +742,16 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/promotions/${pr.id}`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ status: 'active' }),
-                          });
-                          loadTabData('promotions');
+                          try {
+                            await apiFetch(`/api/admin/promotions/${pr.id}`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ status: 'active' }),
+                            });
+                            await loadTabData('promotions');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
+                          }
                         }}
                         className="h-8 px-3 rounded-lg bg-emerald-600 text-white"
                       >
@@ -698,6 +761,23 @@ export function AdminPage() {
                   </div>
                 ))}
               </div>
+
+              {monetization.starsPayments && monetization.starsPayments.length > 0 && (
+                <div className="p-5 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-2 text-xs">
+                  <div className="text-sm font-semibold text-white">Telegram Stars (XTR) Payment Ledger</div>
+                  {monetization.starsPayments.map((sp) => (
+                    <div key={String(sp.id)} className="flex flex-wrap items-center justify-between gap-2 py-2 border-b border-slate-800/70">
+                      <div>
+                        <span className="font-semibold text-white">
+                          {String(sp.payer_name || sp.payer_telegram_id)} · {String(sp.target_type)} ({String(sp.plan_code)})
+                        </span>
+                        <span className="text-slate-400 ml-2 font-mono-nums">{String(sp.stars_amount)} XTR</span>
+                      </div>
+                      <span className="uppercase font-mono-nums text-blue-300">{String(sp.status)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -722,16 +802,20 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await apiFetch(`/api/admin/ai/features/${f.feature_key}`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({
-                              isEnabled: !f.is_enabled,
-                              modelName: f.model_name,
-                              dailyLimitPerUser: f.daily_limit_per_user,
-                            }),
-                          });
-                          loadTabData('ai');
+                          try {
+                            await apiFetch(`/api/admin/ai/features/${f.feature_key}`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({
+                                isEnabled: !f.is_enabled,
+                                modelName: f.model_name,
+                                dailyLimitPerUser: f.daily_limit_per_user,
+                              }),
+                            });
+                            await loadTabData('ai');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
                         }}
                         className={`h-8 px-3.5 rounded-lg font-semibold ${
                           f.is_enabled ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white'
@@ -774,12 +858,16 @@ export function AdminPage() {
                     <button
                       type="button"
                       onClick={async () => {
-                        await apiFetch(`/api/admin/support/${t.id}`, {
-                          method: 'PATCH',
-                          isAdmin: true,
-                          body: JSON.stringify({ status: 'resolved', adminResponse: 'Reviewed and resolved by SOFUMER Operations.' }),
-                        });
-                        loadTabData('support');
+                        try {
+                          await apiFetch(`/api/admin/support/${t.id}`, {
+                            method: 'PATCH',
+                            isAdmin: true,
+                            body: JSON.stringify({ status: 'resolved', adminResponse: 'Reviewed and resolved by SOFUMER Operations.' }),
+                          });
+                          await loadTabData('support');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                        }
                       }}
                       className="h-8 px-3 rounded-lg bg-blue-600 text-white"
                     >
@@ -803,13 +891,17 @@ export function AdminPage() {
                   <button
                     type="button"
                     onClick={async () => {
-                      await apiFetch(`/api/admin/countries/${co.code}`, {
-                        method: 'PATCH',
-                        isAdmin: true,
-                        body: JSON.stringify({ isEnabled: !co.is_enabled, shippingNotes: co.shipping_notes }),
-                      });
-                      loadTabData('countries');
-                      refreshBootstrap();
+                      try {
+                        await apiFetch(`/api/admin/countries/${co.code}`, {
+                          method: 'PATCH',
+                          isAdmin: true,
+                          body: JSON.stringify({ isEnabled: !co.is_enabled, shippingNotes: co.shipping_notes }),
+                        });
+                        await loadTabData('countries');
+                        await refreshBootstrap();
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                      }
                     }}
                     className={`h-8 px-3 rounded-lg ${co.is_enabled ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'}`}
                   >
@@ -824,15 +916,19 @@ export function AdminPage() {
             <form
               onSubmit={async (e) => {
                 e.preventDefault();
-                await apiFetch('/api/admin/notifications/broadcast', {
-                  method: 'POST',
-                  isAdmin: true,
-                  body: JSON.stringify({ title: broadcastTitle, body: broadcastBody }),
-                });
-                setBroadcastTitle('');
-                setBroadcastBody('');
-                notify('Global marketplace announcement broadcasted', 'success');
-                refreshBootstrap();
+                try {
+                  await apiFetch('/api/admin/notifications/broadcast', {
+                    method: 'POST',
+                    isAdmin: true,
+                    body: JSON.stringify({ title: broadcastTitle, body: broadcastBody }),
+                  });
+                  setBroadcastTitle('');
+                  setBroadcastBody('');
+                  notify('Global marketplace announcement broadcasted', 'success');
+                  await refreshBootstrap();
+                } catch (err) {
+                  notify(err instanceof Error ? err.message : 'Broadcast failed', 'error');
+                }
               }}
               className="p-5 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-3"
             >
@@ -857,14 +953,18 @@ export function AdminPage() {
                       <button
                         type="button"
                         onClick={async () => {
-                          const nextVal = st.value === 'true' ? 'false' : 'true';
-                          await apiFetch(`/api/admin/settings/${st.key}`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ value: nextVal }),
-                          });
-                          loadTabData('settings');
-                          refreshBootstrap();
+                          try {
+                            const nextVal = st.value === 'true' ? 'false' : 'true';
+                            await apiFetch(`/api/admin/settings/${st.key}`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ value: nextVal }),
+                            });
+                            await loadTabData('settings');
+                            await refreshBootstrap();
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Setting update failed', 'error');
+                          }
                         }}
                         className={`h-8 px-3 rounded-lg font-semibold ${st.value === 'true' ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'}`}
                       >

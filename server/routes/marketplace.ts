@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { db, newId } from '../db.ts';
-import { requireAuth, sanitizeText } from '../security.ts';
+import { escapeSqlLike, requireAuth, sanitizeText } from '../security.ts';
 
 export const marketplaceRouter = Router();
 marketplaceRouter.use(requireAuth);
@@ -16,7 +16,8 @@ const PRODUCT_SELECT = `
          (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1) as primary_image,
          COALESCE(inv.stock_quantity, 1) as stock_quantity,
          COALESCE(inv.unlimited_digital, 0) as unlimited_digital,
-         COALESCE(inv.availability_status, 'in_stock') as availability_status
+         COALESCE(inv.availability_status, 'in_stock') as availability_status,
+         EXISTS(SELECT 1 FROM product_digital_assets da WHERE da.product_id = p.id) as has_digital_package
   FROM products p
   JOIN categories c ON c.id = p.category_id
   LEFT JOIN subcategories sc ON sc.id = p.subcategory_id
@@ -40,7 +41,13 @@ marketplaceRouter.get('/bootstrap', (_req, res) => {
     .prepare('SELECT * FROM currencies WHERE is_active = 1 ORDER BY code ASC')
     .all();
   const plans = db
-    .prepare('SELECT * FROM subscription_plans WHERE is_active = 1 ORDER BY monthly_price ASC')
+    .prepare(
+      `SELECT sp.*, COALESCE(sps.stars_monthly, 0) as stars_monthly, COALESCE(sps.stars_annual, 0) as stars_annual
+       FROM subscription_plans sp
+       LEFT JOIN subscription_plan_stars sps ON sps.plan_id = sp.id
+       WHERE sp.is_active = 1
+       ORDER BY sp.monthly_price ASC`
+    )
     .all();
   const announcementRow = db
     .prepare("SELECT value FROM platform_settings WHERE key = 'marketplace_announcement'")
@@ -126,7 +133,11 @@ marketplaceRouter.get('/home', (req, res) => {
   }
 
   const totalPublished = (
-    db.prepare("SELECT COUNT(*) as cnt FROM products WHERE status = 'published'").get() as { cnt: number }
+    db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM products p JOIN shops s ON s.id = p.shop_id WHERE p.status = 'published' AND s.status = 'active'"
+      )
+      .get() as { cnt: number }
   ).cnt;
 
   res.json({
@@ -156,8 +167,9 @@ marketplaceRouter.get('/explore', (req, res) => {
     const conditions: string[] = ["s.status = 'active'"];
     const params: unknown[] = [];
     if (q) {
-      conditions.push('(s.name LIKE ? OR s.description LIKE ?)');
-      params.push(`%${q}%`, `%${q}%`);
+      const escapedQ = escapeSqlLike(q);
+      conditions.push("(s.name LIKE ? ESCAPE '\\' OR s.description LIKE ? ESCAPE '\\')");
+      params.push(`%${escapedQ}%`, `%${escapedQ}%`);
     }
     if (country) {
       conditions.push('s.country_code = ?');
@@ -188,8 +200,11 @@ marketplaceRouter.get('/explore', (req, res) => {
   }
 
   if (q) {
-    conditions.push('(p.title LIKE ? OR p.description LIKE ? OR p.keywords LIKE ? OR s.name LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    const escapedQ = escapeSqlLike(q);
+    conditions.push(
+      "(p.title LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\' OR p.keywords LIKE ? ESCAPE '\\' OR s.name LIKE ? ESCAPE '\\')"
+    );
+    params.push(`%${escapedQ}%`, `%${escapedQ}%`, `%${escapedQ}%`, `%${escapedQ}%`);
   }
   if (categoryId) {
     conditions.push('p.category_id = ?');
@@ -207,11 +222,17 @@ marketplaceRouter.get('/explore', (req, res) => {
     conditions.push('p.condition = ?');
     params.push(condition);
   }
-  if (minPrice !== null && !Number.isNaN(minPrice)) {
+  if (minPrice !== null) {
+    if (!Number.isFinite(minPrice) || minPrice < 0) {
+      return res.status(400).json({ error: 'minPrice must be a valid non-negative number.' });
+    }
     conditions.push('p.price >= ?');
     params.push(minPrice);
   }
-  if (maxPrice !== null && !Number.isNaN(maxPrice)) {
+  if (maxPrice !== null) {
+    if (!Number.isFinite(maxPrice) || maxPrice < 0) {
+      return res.status(400).json({ error: 'maxPrice must be a valid non-negative number.' });
+    }
     conditions.push('p.price <= ?');
     params.push(maxPrice);
   }
@@ -237,7 +258,7 @@ marketplaceRouter.get('/products/:id', (req, res) => {
   const product = db
     .prepare(
       `${PRODUCT_SELECT}
-       WHERE p.id = ? AND (p.status = 'published' OR p.seller_user_id = ?)`
+       WHERE p.id = ? AND ((p.status = 'published' AND s.status = 'active') OR p.seller_user_id = ?)`
     )
     .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
 
@@ -325,7 +346,11 @@ marketplaceRouter.post('/favorites/:productId', requireAuth, (req, res) => {
   const userId = req.authUser!.id;
   const productId = req.params.productId;
   const prod = db
-    .prepare("SELECT id FROM products WHERE id = ? AND status = 'published'")
+    .prepare(
+      `SELECT p.id FROM products p
+       JOIN shops s ON s.id = p.shop_id
+       WHERE p.id = ? AND p.status = 'published' AND s.status = 'active'`
+    )
     .get(productId);
   if (!prod) {
     return res.status(404).json({ error: 'Listing not found.' });
@@ -355,7 +380,7 @@ marketplaceRouter.get('/favorites', requireAuth, (req, res) => {
     .prepare(
       `${PRODUCT_SELECT}
        JOIN product_favorites f ON f.product_id = p.id
-       WHERE f.user_id = ? AND p.status = 'published'
+       WHERE f.user_id = ? AND p.status = 'published' AND s.status = 'active'
        ORDER BY f.created_at DESC`
     )
     .all(req.authUser!.id);
@@ -367,7 +392,7 @@ marketplaceRouter.get('/recently-viewed', requireAuth, (req, res) => {
     .prepare(
       `${PRODUCT_SELECT}
        JOIN recently_viewed rv ON rv.product_id = p.id
-       WHERE rv.user_id = ? AND p.status = 'published'
+       WHERE rv.user_id = ? AND p.status = 'published' AND s.status = 'active'
        ORDER BY rv.viewed_at DESC
        LIMIT 24`
     )

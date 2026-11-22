@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db, newId, slugify } from '../db.ts';
 import {
+  VALID_CF_MODELS,
   recordAdminAudit,
   requireAdmin,
   sanitizeText,
@@ -44,6 +45,8 @@ adminRouter.get('/overview', requireAdmin, (_req, res) => {
          (SELECT COUNT(*) FROM support_tickets WHERE status IN ('open', 'in_progress')) as open_tickets,
          (SELECT COALESCE(SUM(amount_recorded), 0) FROM subscriptions WHERE status = 'active') as subscription_revenue_usd,
          (SELECT COALESCE(SUM(amount), 0) FROM promotion_transactions WHERE status = 'recorded') as promotion_revenue_usd,
+         (SELECT COALESCE(SUM(stars_amount), 0) FROM telegram_stars_payments WHERE status = 'paid') as stars_revenue_xtr,
+         (SELECT COUNT(*) FROM telegram_stars_payments WHERE status = 'pending') as pending_stars_payments,
          (SELECT COUNT(*) FROM ai_usage WHERE date(created_at) = date('now')) as ai_calls_today,
          (SELECT COUNT(*) FROM ai_usage WHERE status = 'error' AND date(created_at) = date('now')) as ai_errors_today`
     )
@@ -75,16 +78,18 @@ adminRouter.patch('/users/:id/status', requireAdmin, (req, res) => {
   if (!['active', 'restricted', 'suspended'].includes(status)) {
     return res.status(400).json({ error: 'Invalid user status.' });
   }
-  db.prepare("UPDATE users SET status = ?, restriction_reason = ?, updated_at = datetime('now') WHERE id = ?").run(
-    status,
-    reason,
-    req.params.id
-  );
+  const upd = db
+    .prepare("UPDATE users SET status = ?, restriction_reason = ?, updated_at = datetime('now') WHERE id = ?")
+    .run(status, reason, req.params.id);
+  if (upd.changes === 0) return res.status(404).json({ error: 'User not found.' });
   recordAdminAudit(req.adminSession!.adminIdentifier, 'user.status_updated', 'user', req.params.id, { status, reason }, req.ip || '');
   res.json({ updated: true });
 });
 
 adminRouter.patch('/users/:id/ai-access', requireAdmin, (req, res) => {
+  const userExists = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id);
+  if (!userExists) return res.status(404).json({ error: 'User not found.' });
+
   const aiEnabled = req.body?.aiEnabled ? 1 : 0;
   const customDailyLimit =
     req.body?.customDailyLimit !== undefined && req.body?.customDailyLimit !== ''
@@ -215,11 +220,9 @@ adminRouter.patch('/products/:id/moderate', requireAdmin, async (req, res) => {
   if (typeof isFeatured === 'boolean') {
     db.prepare('UPDATE products SET is_featured = ? WHERE id = ?').run(isFeatured ? 1 : 0, product.id);
   }
-
-  db.prepare(
-    `INSERT INTO moderation_actions (id, target_type, target_id, action, reason, performed_by)
-     VALUES (?, 'product', ?, ?, ?, ?)`
-  ).run(newId('mod'), product.id, status || 'feature_toggle', notes, req.adminSession!.adminIdentifier);
+  if (typeof req.body?.isSponsored === 'boolean') {
+    db.prepare('UPDATE products SET is_sponsored = ? WHERE id = ?').run(req.body.isSponsored ? 1 : 0, product.id);
+  }
 
   recordAdminAudit(
     req.adminSession!.adminIdentifier,
@@ -245,11 +248,11 @@ adminRouter.get('/categories', requireAdmin, (_req, res) => {
 adminRouter.post('/categories', requireAdmin, (req, res) => {
   const name = sanitizeText(req.body?.name || '', 80);
   const description = sanitizeText(req.body?.description || '', 240);
-  const sortOrder = Number(req.body?.sortOrder || 99);
+  const sortOrder = Number.isFinite(Number(req.body?.sortOrder)) ? Number(req.body.sortOrder) : 99;
   if (!name) return res.status(400).json({ error: 'Category name required.' });
 
   const id = newId('cat');
-  const slug = slugify(name);
+  const slug = `${slugify(name)}-${id.slice(-4)}`;
   db.prepare('INSERT INTO categories (id, slug, name, description, sort_order) VALUES (?, ?, ?, ?, ?)').run(
     id,
     slug,
@@ -266,8 +269,11 @@ adminRouter.post('/subcategories', requireAdmin, (req, res) => {
   const name = sanitizeText(req.body?.name || '', 80);
   if (!categoryId || !name) return res.status(400).json({ error: 'Category ID and name required.' });
 
+  const parentCat = db.prepare('SELECT id FROM categories WHERE id = ?').get(categoryId);
+  if (!parentCat) return res.status(404).json({ error: 'Parent category not found.' });
+
   const id = newId('sub');
-  const slug = slugify(name);
+  const slug = `${slugify(name)}-${id.slice(-4)}`;
   db.prepare('INSERT INTO subcategories (id, category_id, slug, name) VALUES (?, ?, ?, ?)').run(
     id,
     categoryId,
@@ -332,9 +338,12 @@ adminRouter.patch('/reports/:id', requireAdmin, (req, res) => {
   if (!['open', 'investigating', 'resolved', 'dismissed'].includes(status)) {
     return res.status(400).json({ error: 'Invalid report status.' });
   }
-  db.prepare(
-    `UPDATE reports SET status = ?, resolution_notes = ?, resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`
-  ).run(status, resolutionNotes, req.adminSession!.adminIdentifier, req.params.id);
+  const repUpd = db
+    .prepare(
+      `UPDATE reports SET status = ?, resolution_notes = ?, resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`
+    )
+    .run(status, resolutionNotes, req.adminSession!.adminIdentifier, req.params.id);
+  if (repUpd.changes === 0) return res.status(404).json({ error: 'Report not found.' });
   recordAdminAudit(req.adminSession!.adminIdentifier, 'report.updated', 'report', req.params.id, { status, resolutionNotes }, req.ip || '');
   res.json({ updated: true });
 });
@@ -358,7 +367,33 @@ adminRouter.patch('/reviews/:id', requireAdmin, (req, res) => {
   if (!['published', 'hidden', 'removed'].includes(status)) {
     return res.status(400).json({ error: 'Invalid review status.' });
   }
-  db.prepare('UPDATE reviews SET status = ? WHERE id = ?').run(status, req.params.id);
+  const review = db
+    .prepare('SELECT id, product_id, shop_id FROM reviews WHERE id = ?')
+    .get(req.params.id) as { id: string; product_id: string; shop_id: string } | undefined;
+  if (!review) return res.status(404).json({ error: 'Review not found.' });
+
+  db.transaction(() => {
+    db.prepare('UPDATE reviews SET status = ? WHERE id = ?').run(status, review.id);
+
+    const prodAgg = db
+      .prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE product_id = ? AND status = 'published'")
+      .get(review.product_id) as { avg_r: number; cnt: number };
+    db.prepare('UPDATE products SET rating_avg = ?, review_count = ? WHERE id = ?').run(
+      Number((prodAgg.avg_r || 0).toFixed(2)),
+      prodAgg.cnt,
+      review.product_id
+    );
+
+    const shopAgg = db
+      .prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE shop_id = ? AND status = 'published'")
+      .get(review.shop_id) as { avg_r: number; cnt: number };
+    db.prepare('UPDATE shops SET rating_avg = ?, review_count = ? WHERE id = ?').run(
+      Number((shopAgg.avg_r || 0).toFixed(2)),
+      shopAgg.cnt,
+      review.shop_id
+    );
+  })();
+
   recordAdminAudit(req.adminSession!.adminIdentifier, 'review.moderated', 'review', req.params.id, { status }, req.ip || '');
   res.json({ updated: true });
 });
@@ -368,7 +403,14 @@ adminRouter.patch('/reviews/:id', requireAdmin, (req, res) => {
 // ============================================================================
 
 adminRouter.get('/monetization', requireAdmin, (_req, res) => {
-  const plans = db.prepare('SELECT * FROM subscription_plans ORDER BY monthly_price ASC').all();
+  const plans = db
+    .prepare(
+      `SELECT sp.*, COALESCE(sps.stars_monthly, 0) as stars_monthly, COALESCE(sps.stars_annual, 0) as stars_annual
+       FROM subscription_plans sp
+       LEFT JOIN subscription_plan_stars sps ON sps.plan_id = sp.id
+       ORDER BY sp.monthly_price ASC`
+    )
+    .all();
   const subscriptions = db
     .prepare(
       `SELECT s.*, sp.code as plan_code, sp.name as plan_name, u.display_name as seller_name
@@ -391,23 +433,63 @@ adminRouter.get('/monetization', requireAdmin, (_req, res) => {
   const promotionTransactions = db
     .prepare('SELECT * FROM promotion_transactions ORDER BY created_at DESC LIMIT 100')
     .all();
+  const starsPayments = db
+    .prepare(
+      `SELECT x.*, u.display_name as payer_name, u.telegram_username as payer_username
+       FROM telegram_stars_payments x
+       LEFT JOIN users u ON u.id = x.user_id
+       ORDER BY x.created_at DESC LIMIT 100`
+    )
+    .all();
 
-  res.json({ plans, subscriptions, promotions, promotionTransactions });
+  res.json({ plans, subscriptions, promotions, promotionTransactions, starsPayments });
 });
 
 adminRouter.patch('/plans/:id', requireAdmin, (req, res) => {
   const monthlyPrice = Number(req.body?.monthlyPrice ?? 0);
   const annualPrice = Number(req.body?.annualPrice ?? 0);
-  const maxProducts = Math.max(1, Number(req.body?.maxProducts ?? 10));
-  const aiDailyLimit = Math.max(0, Number(req.body?.aiDailyLimit ?? 15));
-  const featuredSlots = Math.max(0, Number(req.body?.featuredSlots ?? 0));
-  const promotionalDiscountPct = Math.min(90, Math.max(0, Number(req.body?.promotionalDiscountPct ?? 0)));
+  const maxProductsRaw = Number(req.body?.maxProducts ?? 10);
+  const aiDailyLimitRaw = Number(req.body?.aiDailyLimit ?? 15);
+  const featuredSlotsRaw = Number(req.body?.featuredSlots ?? 0);
+  const promotionalDiscountPctRaw = Number(req.body?.promotionalDiscountPct ?? 0);
 
-  db.prepare(
-    `UPDATE subscription_plans
-     SET monthly_price = ?, annual_price = ?, max_products = ?, ai_daily_limit = ?, featured_slots = ?, promotional_discount_pct = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(monthlyPrice, annualPrice, maxProducts, aiDailyLimit, featuredSlots, promotionalDiscountPct, req.params.id);
+  if (
+    !Number.isFinite(monthlyPrice) || monthlyPrice < 0 ||
+    !Number.isFinite(annualPrice) || annualPrice < 0 ||
+    !Number.isFinite(maxProductsRaw) || maxProductsRaw < 1 ||
+    !Number.isFinite(aiDailyLimitRaw) || aiDailyLimitRaw < 0 ||
+    !Number.isFinite(featuredSlotsRaw) || featuredSlotsRaw < 0 ||
+    !Number.isFinite(promotionalDiscountPctRaw)
+  ) {
+    return res.status(400).json({ error: 'All plan pricing and limit fields must be valid non-negative numbers.' });
+  }
+
+  const maxProducts = Math.max(1, Math.floor(maxProductsRaw));
+  const aiDailyLimit = Math.max(0, Math.floor(aiDailyLimitRaw));
+  const featuredSlots = Math.max(0, Math.floor(featuredSlotsRaw));
+  const promotionalDiscountPct = Math.min(90, Math.max(0, promotionalDiscountPctRaw));
+
+  const upd = db
+    .prepare(
+      `UPDATE subscription_plans
+       SET monthly_price = ?, annual_price = ?, max_products = ?, ai_daily_limit = ?, featured_slots = ?, promotional_discount_pct = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(monthlyPrice, annualPrice, maxProducts, aiDailyLimit, featuredSlots, promotionalDiscountPct, req.params.id);
+  if (upd.changes === 0) return res.status(404).json({ error: 'Subscription plan not found.' });
+
+  if (req.body?.starsMonthly !== undefined || req.body?.starsAnnual !== undefined) {
+    const starsMonthly = Math.max(0, Math.floor(Number(req.body?.starsMonthly ?? Math.round(monthlyPrice * 50))));
+    const starsAnnual = Math.max(0, Math.floor(Number(req.body?.starsAnnual ?? Math.round(annualPrice * 50))));
+    db.prepare(
+      `INSERT INTO subscription_plan_stars (plan_id, stars_monthly, stars_annual, updated_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(plan_id) DO UPDATE SET
+         stars_monthly = excluded.stars_monthly,
+         stars_annual = excluded.stars_annual,
+         updated_at = datetime('now')`
+    ).run(req.params.id, starsMonthly, starsAnnual);
+  }
 
   recordAdminAudit(
     req.adminSession!.adminIdentifier,
@@ -482,13 +564,19 @@ adminRouter.patch('/ai/features/:featureKey', requireAdmin, (req, res) => {
     req.body?.modelName || process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
     64
   );
-  const dailyLimitPerUser = Math.max(0, Number(req.body?.dailyLimitPerUser ?? 30));
+  if (!VALID_CF_MODELS.has(modelName)) {
+    return res.status(400).json({ error: `Unsupported Cloudflare Workers AI model "${modelName}".` });
+  }
+  const dailyLimitPerUser = Math.max(0, Math.floor(Number(req.body?.dailyLimitPerUser ?? 30)));
 
-  db.prepare(
-    `UPDATE ai_feature_settings
-     SET is_enabled = ?, model_name = ?, daily_limit_per_user = ?, updated_by = ?, updated_at = datetime('now')
-     WHERE feature_key = ?`
-  ).run(isEnabled, modelName, dailyLimitPerUser, req.adminSession!.adminIdentifier, req.params.featureKey);
+  const upd = db
+    .prepare(
+      `UPDATE ai_feature_settings
+       SET is_enabled = ?, model_name = ?, daily_limit_per_user = ?, updated_by = ?, updated_at = datetime('now')
+       WHERE feature_key = ?`
+    )
+    .run(isEnabled, modelName, dailyLimitPerUser, req.adminSession!.adminIdentifier, req.params.featureKey);
+  if (upd.changes === 0) return res.status(404).json({ error: 'AI feature setting not found.' });
 
   recordAdminAudit(
     req.adminSession!.adminIdentifier,
@@ -514,11 +602,10 @@ adminRouter.get('/countries', requireAdmin, (_req, res) => {
 adminRouter.patch('/countries/:code', requireAdmin, (req, res) => {
   const isEnabled = req.body?.isEnabled ? 1 : 0;
   const shippingNotes = sanitizeText(req.body?.shippingNotes || '', 300);
-  db.prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ? WHERE code = ?').run(
-    isEnabled,
-    shippingNotes,
-    req.params.code.toUpperCase()
-  );
+  const upd = db
+    .prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ? WHERE code = ?')
+    .run(isEnabled, shippingNotes, req.params.code.toUpperCase());
+  if (upd.changes === 0) return res.status(404).json({ error: 'Country not found.' });
   recordAdminAudit(req.adminSession!.adminIdentifier, 'country.updated', 'country', req.params.code, { isEnabled }, req.ip || '');
   res.json({ updated: true });
 });
@@ -536,6 +623,9 @@ adminRouter.get('/support', requireAdmin, (_req, res) => {
 
 adminRouter.patch('/support/:id', requireAdmin, async (req, res) => {
   const status = String(req.body?.status || 'resolved');
+  if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid support ticket status.' });
+  }
   const adminResponse = sanitizeText(req.body?.adminResponse || '', 1500);
   const ticket = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
@@ -585,9 +675,10 @@ adminRouter.get('/settings', requireAdmin, (_req, res) => {
 
 adminRouter.patch('/settings/:key', requireAdmin, (req, res) => {
   const value = sanitizeText(String(req.body?.value ?? ''), 500);
-  db.prepare(
-    `UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`
-  ).run(value, req.adminSession!.adminIdentifier, req.params.key);
+  const upd = db
+    .prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`)
+    .run(value, req.adminSession!.adminIdentifier, req.params.key);
+  if (upd.changes === 0) return res.status(404).json({ error: 'Setting not found.' });
   recordAdminAudit(req.adminSession!.adminIdentifier, 'setting.updated', 'setting', req.params.key, { value }, req.ip || '');
   res.json({ updated: true });
 });

@@ -5,6 +5,15 @@ import { db, newId } from './db.ts';
 // Runtime-ephemeral secret fallback only for local non-production dev when JWT_SECRET is omitted.
 const EPHEMERAL_DEV_SECRET = crypto.randomBytes(32).toString('hex');
 
+export const VALID_CF_MODELS = new Set([
+  '@cf/meta/llama-3.1-8b-instruct',
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/qwen/qwen2.5-7b-instruct',
+  '@cf/mistral/mistral-7b-instruct-v0.2',
+]);
+
+export const PAID_ORDER_STATUSES = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'] as const;
+
 export function getJwtSecret(): string {
   const configured = (process.env.JWT_SECRET || '').trim();
   if (configured) return configured;
@@ -413,6 +422,118 @@ export function rateLimit(maxRequests: number, windowMs: number, scope = 'api') 
 export function sanitizeText(value: unknown, maxLen = 2000): string {
   if (typeof value !== 'string') return '';
   return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim().slice(0, maxLen);
+}
+
+export function isSafeUrlOrEmpty(value: unknown, maxLen = 400): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value !== 'string') return false;
+  const cleaned = sanitizeText(value, maxLen);
+  if (!cleaned) return true;
+  if (cleaned.startsWith('/') && !cleaned.startsWith('//')) {
+    return !/[\s<>"'`]/.test(cleaned);
+  }
+  try {
+    const parsed = new URL(cleaned);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeSafeUrl(value: unknown, maxLen = 400): string {
+  if (typeof value !== 'string') return '';
+  const cleaned = sanitizeText(value, maxLen);
+  if (!cleaned) return '';
+  return isSafeUrlOrEmpty(cleaned, maxLen) ? cleaned : '';
+}
+
+export function escapeSqlLike(input: string): string {
+  return input.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+export function verifyCookieCsrf(req: Request, res: Response, next: NextFunction) {
+  if (!['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) return next();
+  if (!req.path.startsWith('/api/')) return next();
+  if (req.path === '/api/telegram/webhook' || req.path === '/api/auth/telegram') return next();
+
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ') && authHeader.slice(7).trim()) {
+    return next();
+  }
+
+  const rawCookie = req.headers.cookie || '';
+  if (!rawCookie.includes('sofumer_session=')) {
+    return next();
+  }
+
+  const reqOrigin = `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+  const allowedOrigins = new Set<string>([reqOrigin]);
+  const miniAppUrl = process.env.MINI_APP_URL || process.env.APP_URL || '';
+  if (miniAppUrl) {
+    try {
+      allowedOrigins.add(new URL(miniAppUrl).origin);
+    } catch {
+      // Ignore invalid MINI_APP_URL
+    }
+  }
+
+  const origin = req.headers.origin;
+  if (origin) {
+    if (!allowedOrigins.has(origin)) {
+      return res.status(403).json({ error: 'Cross-site request origin rejected.' });
+    }
+    return next();
+  }
+
+  const referer = req.headers.referer;
+  if (referer) {
+    try {
+      if (allowedOrigins.has(new URL(referer).origin)) {
+        return next();
+      }
+    } catch {
+      // Fall through to reject
+    }
+  }
+
+  return res.status(403).json({ error: 'Missing Origin header for cookie-authenticated state mutation.' });
+}
+
+export function getActiveSubscriptionLocal(opts: { sellerId?: string; userId?: string }) {
+  const whereField = opts.sellerId ? 'seller_id' : 'user_id';
+  const whereVal = opts.sellerId || opts.userId || '';
+  if (!whereVal) return undefined;
+
+  db.prepare(
+    `UPDATE subscriptions
+     SET status = 'expired'
+     WHERE ${whereField} = ? AND status = 'active' AND ends_at IS NOT NULL AND datetime(ends_at) <= datetime('now')`
+  ).run(whereVal);
+
+  return db
+    .prepare(
+      `SELECT s.*, sp.code as plan_code, sp.name as plan_name, sp.max_products, sp.ai_daily_limit,
+              sp.featured_slots, sp.promotional_discount_pct, sp.analytics_level
+       FROM subscriptions s
+       JOIN subscription_plans sp ON sp.id = s.plan_id
+       WHERE s.${whereField} = ? AND s.status = 'active'
+         AND (s.ends_at IS NULL OR datetime(s.ends_at) > datetime('now'))
+       ORDER BY s.created_at DESC LIMIT 1`
+    )
+    .get(whereVal) as Record<string, unknown> | undefined;
+}
+
+export function getStarsPerUsdLocal(): number {
+  const row = db
+    .prepare("SELECT value FROM platform_settings WHERE key = 'stars_per_usd'")
+    .get() as { value: string } | undefined;
+  const parsed = Number(row?.value || 50);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+}
+
+export function computeStarsFromUsd(usdAmount: number, starsPerUsd = 50): number {
+  if (!Number.isFinite(usdAmount) || usdAmount <= 0) return 0;
+  return Math.max(1, Math.round(usdAmount * starsPerUsd));
 }
 
 export function checkProhibitedKeywords(text: string): string[] {

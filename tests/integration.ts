@@ -502,6 +502,139 @@ async function runTests() {
       mockEnv
     );
     assert.equal(archiveRes.status, 200);
+
+    // 9. Analytics RBAC, Telegram Stars 402 enforcement, protected digital delivery & review moderation recalculation
+    const buyerAnalytics = await worker.fetch(
+      new Request('https://sofumer.example/api/ai/seller/assist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
+        body: JSON.stringify({ action: 'analytics' }),
+      }),
+      mockEnv
+    );
+    assert.equal(buyerAnalytics.status, 403);
+
+    const paidPlanBlocked = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/subscriptions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({ planCode: 'PRO', billingCycle: 'monthly' }),
+      }),
+      mockEnv
+    );
+    assert.equal(paidPlanBlocked.status, 402);
+
+    const digPubRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          listingType: 'digital',
+          title: 'Integration Digital Guide',
+          description: 'Protected PDF and license key delivery test.',
+          categoryId: 'cat_electronics',
+          price: 15,
+          currency: 'USD',
+          status: 'published',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(digPubRes.status, 201);
+    const digPubJson = (await digPubRes.json()) as { product: { id: string } };
+
+    const digAssetRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/seller/products/${digPubJson.product.id}/digital-asset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          fileName: 'guide.txt',
+          deliveryInstructions: 'Extract archive and run setup.',
+          licenseKeyTemplate: 'INT-{ORDER}',
+          downloadLimit: 1,
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(digAssetRes.status, 201);
+
+    const digOrdRes = await worker.fetch(
+      new Request('https://sofumer.example/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          productId: digPubJson.product.id,
+          buyerUserId,
+          quantity: 1,
+          agreedTotal: 15,
+          currency: 'USD',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(digOrdRes.status, 201);
+    const digOrdJson = (await digOrdRes.json()) as { orderId: string; orderNumber: string };
+
+    const lockedDigital = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${digOrdJson.orderId}/digital`, {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(lockedDigital.status, 403);
+
+    const confirmDig = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${digOrdJson.orderId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerAuth.token}` },
+        body: JSON.stringify({ status: 'Confirmed' }),
+      }),
+      mockEnv
+    );
+    assert.equal(confirmDig.status, 200);
+
+    const unlockedDigital = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${digOrdJson.orderId}/digital`, {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(unlockedDigital.status, 200);
+
+    const dl1 = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${digOrdJson.orderId}/digital/${digPubJson.product.id}/download`, {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(dl1.status, 200);
+    const dl2 = await worker.fetch(
+      new Request(`https://sofumer.example/api/orders/${digOrdJson.orderId}/digital/${digPubJson.product.id}/download`, {
+        headers: { Authorization: `Bearer ${buyerAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(dl2.status, 403);
+
+    // Admin hiding a review recalculates product rating_avg & review_count
+    const revRow = db.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').get(createdProductId) as
+      | { id: string }
+      | undefined;
+    assert.ok(revRow?.id);
+    const hideRevRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/reviews/${revRow.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ status: 'hidden', reason: 'Moderation test' }),
+      }),
+      mockEnv
+    );
+    assert.equal(hideRevRes.status, 200);
+    const prodRatingAfterHide = db
+      .prepare('SELECT rating_avg, review_count FROM products WHERE id = ?')
+      .get(createdProductId) as { rating_avg: number; review_count: number };
+    assert.equal(prodRatingAfterHide.review_count, 0);
+    assert.equal(prodRatingAfterHide.rating_avg, 0);
   });
 
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);

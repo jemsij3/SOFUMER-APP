@@ -23,6 +23,7 @@ interface TelegramWebApp {
     impactOccurred: (style: 'light' | 'medium' | 'heavy') => void;
   };
   openTelegramLink?: (url: string) => void;
+  openInvoice?: (url: string, callback?: (status: string) => void) => void;
 }
 
 declare global {
@@ -84,4 +85,26 @@ export function syncTelegramBackButton(show: boolean, onBack: () => void) {
   } catch {
     return () => {};
   }
+}
+
+export type TelegramInvoiceStatus = 'paid' | 'cancelled' | 'failed' | 'pending' | 'unavailable';
+
+export function openTelegramInvoice(invoiceUrl: string): Promise<TelegramInvoiceStatus> {
+  const tg = getTelegramWebApp();
+  if (!tg || typeof tg.openInvoice !== 'function') {
+    return Promise.resolve('unavailable');
+  }
+  return new Promise((resolve) => {
+    try {
+      tg.openInvoice!(invoiceUrl, (status: string) => {
+        if (status === 'paid' || status === 'cancelled' || status === 'failed' || status === 'pending') {
+          resolve(status);
+        } else {
+          resolve('pending');
+        }
+      });
+    } catch {
+      resolve('unavailable');
+    }
+  });
 }

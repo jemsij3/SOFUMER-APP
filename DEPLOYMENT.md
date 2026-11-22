@@ -20,14 +20,14 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 1. Open `@BotFather` on Telegram and run `/newbot`.
 2. Choose your bot display name and handle (public bot info is automatically retrieved via Telegram `getMe` from `TELEGRAM_BOT_TOKEN`).
 3. Copy the Bot Token (`TELEGRAM_BOT_TOKEN`).
-4. Configure the Mini App button in `@BotFather` (`/newapp` or `/setmenubutton`) pointing to your production HTTPS URL (`https://sofumer-app.derartuaman8.workers.dev`).
+4. Configure the Mini App button in `@BotFather` (`/newapp` or `/setmenubutton`) pointing to your production HTTPS URL (`<YOUR_WORKER_URL>`).
 5. Generate a random 32+ character webhook secret (`TELEGRAM_WEBHOOK_SECRET`).
 6. Register the webhook:
    ```bash
    curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
      -H "Content-Type: application/json" \
      -d '{
-       "url": "https://<YOUR_DOMAIN>/api/telegram/webhook",
+       "url": "<YOUR_WORKER_URL>/api/telegram/webhook",
        "secret_token": "<TELEGRAM_WEBHOOK_SECRET>"
      }'
    ```
@@ -38,8 +38,8 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 | Variable / Secret | Scope | Required | Purpose |
 | :--- | :--- | :--- | :--- |
-| `TELEGRAM_BOT_TOKEN` | Cloudflare Secret | Yes | Verifies Telegram `initData` HMAC-SHA256, resolves bot info via `getMe`, and sends bot messages |
-| `TELEGRAM_WEBHOOK_SECRET` | Cloudflare Secret | Yes | Validates `X-Telegram-Bot-Api-Secret-Token` header on webhook |
+| `TELEGRAM_BOT_TOKEN` | Cloudflare Secret | Yes | Verifies Telegram `initData` HMAC-SHA256, resolves bot info via `getMe`, sends bot messages, and creates Telegram Stars (`XTR`) invoice links |
+| `TELEGRAM_WEBHOOK_SECRET` | Cloudflare Secret | Yes | Validates `X-Telegram-Bot-Api-Secret-Token` header on webhook (`pre_checkout_query` & `successful_payment`) |
 | `JWT_SECRET` | Cloudflare Secret | Yes | Signs & verifies HS256 JWT authentication tokens for Telegram users |
 | `ADMIN_TELEGRAM_IDS` | Cloudflare Secret | Yes | Comma-separated numeric Telegram user IDs authorized for the Admin Governance Console |
 | `MINI_APP_URL` | Env Var (Optional) | No | Optional override for Mini App URL used in Telegram bot buttons |
@@ -51,15 +51,23 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 ---
 
-## 4. Automatic Cloudflare D1 Provisioning, Workers AI & Deployment
+## 4. Telegram Stars (`XTR`) Billing & Protected Digital Delivery
 
-`wrangler.jsonc` declares `"database_name": "sofumer-db"` without a hardcoded `database_id` so Cloudflare / Wrangler automatically creates and binds `sofumer-db` on first deploy (and reconnects to `sofumer-db` by name on subsequent deploys). R2 (`MEDIA_BUCKET`) is intentionally excluded for now and can be added later.
+- **Telegram Stars (`XTR`) Payments**: Paid seller plans (`PRO`, `BUSINESS`) and promotional placements require real Telegram Stars invoices created via Bot API `createInvoiceLink` (`POST /api/seller/subscriptions/invoice`, `POST /api/seller/promotions/invoice`), opened natively via `Telegram.WebApp.openInvoice(...)`, verified synchronously on `pre_checkout_query`, and fulfilled idempotently on `message.successful_payment`. Ensure your webhook is registered so Telegram delivers payment updates.
+- **Protected Digital Product Delivery**: Digital product packages (`product_digital_assets`) are blocked from public `/r2/digital/*` access and unlock only for confirmed/completed orders (`GET /api/orders/:id/digital` and `/api/orders/:id/digital/:productId/download`).
+- **Optional Future R2 Storage**: `MEDIA_BUCKET` is intentionally omitted from `wrangler.jsonc` for now and can be bound later when binary asset hosting in R2 is enabled.
 
-1. **Deploy Worker (Auto-Creates `sofumer-db`)**:
+---
+
+## 5. Automatic Cloudflare D1 Provisioning, Workers AI & Deployment
+
+`wrangler.jsonc` binds `sofumer-db` (`database_id`: `37387526-bf6a-4a2d-bf61-70dece9eb2f5`) and excludes R2 (`MEDIA_BUCKET`) for now. Migrations `0001`–`0004` define all tables, indexes, and system seeds.
+
+1. **Deploy Worker**:
    - **Via Cloudflare Workers Builds / Cloudflare AI** (GitHub integration for Worker `sofumer-app`):
      - **Build command**: `npm run build`
      - **Deploy command**: `npx wrangler deploy --x-provision`
-     - Cloudflare automatically creates `sofumer-db` and binds it as `env.DB`. On the first `/api/*` request, the Worker's built-in `ensureD1Schema(env.DB)` bootstrapper automatically creates all 40 tables, indexes, and system configuration seeds if the database is empty.
+     - On the first `/api/*` request, the Worker's built-in `ensureD1Schema(env.DB)` bootstrapper automatically creates any missing tables, indexes, and system configuration seeds if the database is empty.
    - **Via CLI**:
      ```bash
      npm run build
@@ -74,5 +82,6 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
    npx wrangler secret put ADMIN_TELEGRAM_IDS
    ```
 3. **GitHub Actions CI/CD**:
-   Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` to your GitHub Repository Secrets. Pushing to `main` automatically runs `npm run lint`, `npm run build`, `npm test`, deploys the Worker with `--x-provision` (creating `sofumer-db` if needed), and applies `migrations/`.
+   Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` to your GitHub Repository Secrets. Pushing to `main` runs `npm run lint`, `npm run build`, `npm test`, deploys the Worker with `--x-provision`, and applies `migrations/`.
+
 

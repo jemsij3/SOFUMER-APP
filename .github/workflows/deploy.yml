@@ -39,9 +39,9 @@ jobs:
         id: cf_ready
         run: |
           if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ]; then
-            echo "::notice::Skipping Cloudflare deploy: set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in GitHub Repository Secrets to enable automatic deployment."
+            echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID in GitHub Repository Secrets. Configure both secrets to deploy sofumer-app."
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
           DB_NAME=$(node -e "const fs=require('fs');const raw=fs.readFileSync('wrangler.jsonc','utf8').replace(/\/\/.*$/gm,'');const cfg=JSON.parse(raw);console.log(cfg.d1_databases?.[0]?.database_name || 'sofumer-db');")
           echo "db_name=$DB_NAME" >> "$GITHUB_OUTPUT"

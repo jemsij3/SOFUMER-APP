@@ -1,5 +1,6 @@
 import {
   type Env,
+  VALID_CF_MODELS,
   json,
   methodNotAllowed,
   newId,
@@ -62,6 +63,8 @@ export async function handleAdminRoutes(
          (SELECT COUNT(*) FROM support_tickets WHERE status IN ('open', 'in_progress')) as open_tickets,
          (SELECT COALESCE(SUM(amount_recorded), 0) FROM subscriptions WHERE status = 'active') as subscription_revenue_usd,
          (SELECT COALESCE(SUM(amount), 0) FROM promotion_transactions WHERE status = 'recorded') as promotion_revenue_usd,
+         (SELECT COALESCE(SUM(stars_amount), 0) FROM telegram_stars_payments WHERE status = 'paid') as stars_revenue_xtr,
+         (SELECT COUNT(*) FROM telegram_stars_payments WHERE status = 'pending') as pending_stars_payments,
          (SELECT COUNT(*) FROM ai_usage WHERE date(created_at) = date('now')) as ai_calls_today,
          (SELECT COUNT(*) FROM ai_usage WHERE status = 'error' AND date(created_at) = date('now')) as ai_errors_today`
     ).first();
@@ -89,9 +92,10 @@ export async function handleAdminRoutes(
     if (!['active', 'restricted', 'suspended'].includes(status)) {
       return json({ error: 'Invalid user status.' }, 400);
     }
-    await env.DB.prepare("UPDATE users SET status = ?, restriction_reason = ?, updated_at = datetime('now') WHERE id = ?")
+    const upd = await env.DB.prepare("UPDATE users SET status = ?, restriction_reason = ?, updated_at = datetime('now') WHERE id = ?")
       .bind(status, reason, userId)
       .run();
+    if ((upd.meta?.changes ?? 0) === 0) return json({ error: 'User not found.' }, 404);
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'user.status_updated', 'user', userId, { status, reason }, ip);
     return json({ updated: true });
   }
@@ -311,7 +315,7 @@ export async function handleAdminRoutes(
     }
     const notes = sanitizeText(body.data.resolutionNotes || '', 500);
     const isResolved = status === 'resolved' || status === 'dismissed';
-    await env.DB.prepare(
+    const repUpd = await env.DB.prepare(
       `UPDATE reports
        SET status = ?,
            resolution_notes = ?,
@@ -323,6 +327,7 @@ export async function handleAdminRoutes(
     )
       .bind(status, notes, admin.adminIdentifier, isResolved ? 1 : 0, admin.adminIdentifier, isResolved ? 1 : 0, repId)
       .run();
+    if ((repUpd.meta?.changes ?? 0) === 0) return json({ error: 'Report not found.' }, 404);
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'report.resolved', 'report', repId, { status, notes }, ip);
     return json({ updated: true });
   }
@@ -354,16 +359,50 @@ export async function handleAdminRoutes(
     const revId = decodeURIComponent(sub.slice('/reviews/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
-    const status = body.data.status === 'hidden' ? 'hidden' : 'published';
+    const status = String(body.data.status || 'published');
+    if (!['published', 'hidden', 'removed'].includes(status)) {
+      return json({ error: 'Invalid review status.' }, 400);
+    }
+    const review = await env.DB.prepare('SELECT id, product_id, shop_id FROM reviews WHERE id = ?')
+      .bind(revId)
+      .first<{ id: string; product_id: string; shop_id: string }>();
+    if (!review) return json({ error: 'Review not found.' }, 404);
+
     await env.DB.prepare('UPDATE reviews SET status = ? WHERE id = ?').bind(status, revId).run();
+
+    const [prodAgg, shopAgg] = await Promise.all([
+      env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE product_id = ? AND status = 'published'")
+        .bind(review.product_id)
+        .first<{ avg_r: number; cnt: number }>(),
+      env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE shop_id = ? AND status = 'published'")
+        .bind(review.shop_id)
+        .first<{ avg_r: number; cnt: number }>(),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare('UPDATE products SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
+        Number((prodAgg?.avg_r || 0).toFixed(2)),
+        prodAgg?.cnt || 0,
+        review.product_id
+      ),
+      env.DB.prepare('UPDATE shops SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
+        Number((shopAgg?.avg_r || 0).toFixed(2)),
+        shopAgg?.cnt || 0,
+        review.shop_id
+      ),
+    ]);
+
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'review.moderated', 'review', revId, { status }, ip);
     return json({ updated: true });
   }
 
   if (sub === '/monetization') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const [plans, subscriptions, promotions, promotionTransactions] = await Promise.all([
-      env.DB.prepare('SELECT * FROM subscription_plans ORDER BY monthly_price ASC').all(),
+    const [plans, subscriptions, promotions, promotionTransactions, starsPayments] = await Promise.all([
+      env.DB.prepare(
+        `SELECT sp.*, COALESCE(sps.stars_monthly, 0) as stars_monthly, COALESCE(sps.stars_annual, 0) as stars_annual
+         FROM subscription_plans sp LEFT JOIN subscription_plan_stars sps ON sps.plan_id = sp.id
+         ORDER BY sp.monthly_price ASC`
+      ).all(),
       env.DB.prepare(
         `SELECT s.*, sp.name as plan_name, u.display_name as seller_name, sh.name as shop_name
          FROM subscriptions s JOIN subscription_plans sp ON sp.id = s.plan_id
@@ -376,12 +415,18 @@ export async function handleAdminRoutes(
          LEFT JOIN products p ON p.id = pr.product_id ORDER BY pr.created_at DESC`
       ).all(),
       env.DB.prepare('SELECT * FROM promotion_transactions ORDER BY created_at DESC LIMIT 100').all(),
+      env.DB.prepare(
+        `SELECT x.*, u.display_name as payer_name, u.telegram_username as payer_username
+         FROM telegram_stars_payments x LEFT JOIN users u ON u.id = x.user_id
+         ORDER BY x.created_at DESC LIMIT 100`
+      ).all(),
     ]);
     return json({
       plans: plans.results,
       subscriptions: subscriptions.results,
       promotions: promotions.results,
       promotionTransactions: promotionTransactions.results,
+      starsPayments: starsPayments.results,
     });
   }
 
@@ -392,18 +437,50 @@ export async function handleAdminRoutes(
     if (!body.ok) return body.error;
     const monthlyPrice = Number(body.data.monthlyPrice ?? 0);
     const annualPrice = Number(body.data.annualPrice ?? 0);
-    const maxProducts = Math.max(1, Number(body.data.maxProducts ?? 10));
-    const aiDailyLimit = Math.max(0, Number(body.data.aiDailyLimit ?? 15));
-    const featuredSlots = Math.max(0, Number(body.data.featuredSlots ?? 0));
-    const promotionalDiscountPct = Math.min(90, Math.max(0, Number(body.data.promotionalDiscountPct ?? 0)));
+    const maxProductsRaw = Number(body.data.maxProducts ?? 10);
+    const aiDailyLimitRaw = Number(body.data.aiDailyLimit ?? 15);
+    const featuredSlotsRaw = Number(body.data.featuredSlots ?? 0);
+    const promotionalDiscountPctRaw = Number(body.data.promotionalDiscountPct ?? 0);
 
-    await env.DB.prepare(
+    if (
+      !Number.isFinite(monthlyPrice) || monthlyPrice < 0 ||
+      !Number.isFinite(annualPrice) || annualPrice < 0 ||
+      !Number.isFinite(maxProductsRaw) || maxProductsRaw < 1 ||
+      !Number.isFinite(aiDailyLimitRaw) || aiDailyLimitRaw < 0 ||
+      !Number.isFinite(featuredSlotsRaw) || featuredSlotsRaw < 0 ||
+      !Number.isFinite(promotionalDiscountPctRaw)
+    ) {
+      return json({ error: 'All plan pricing and limit fields must be valid non-negative numbers.' }, 400);
+    }
+
+    const maxProducts = Math.max(1, Math.floor(maxProductsRaw));
+    const aiDailyLimit = Math.max(0, Math.floor(aiDailyLimitRaw));
+    const featuredSlots = Math.max(0, Math.floor(featuredSlotsRaw));
+    const promotionalDiscountPct = Math.min(90, Math.max(0, promotionalDiscountPctRaw));
+
+    const planUpd = await env.DB.prepare(
       `UPDATE subscription_plans
        SET monthly_price = ?, annual_price = ?, max_products = ?, ai_daily_limit = ?, featured_slots = ?, promotional_discount_pct = ?, updated_at = datetime('now')
        WHERE id = ?`
     )
       .bind(monthlyPrice, annualPrice, maxProducts, aiDailyLimit, featuredSlots, promotionalDiscountPct, planId)
       .run();
+    if ((planUpd.meta?.changes ?? 0) === 0) return json({ error: 'Subscription plan not found.' }, 404);
+
+    if (body.data.starsMonthly !== undefined || body.data.starsAnnual !== undefined) {
+      const starsMonthly = Math.max(0, Math.floor(Number(body.data.starsMonthly ?? Math.round(monthlyPrice * 50))));
+      const starsAnnual = Math.max(0, Math.floor(Number(body.data.starsAnnual ?? Math.round(annualPrice * 50))));
+      await env.DB.prepare(
+        `INSERT INTO subscription_plan_stars (plan_id, stars_monthly, stars_annual, updated_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(plan_id) DO UPDATE SET
+           stars_monthly = excluded.stars_monthly,
+           stars_annual = excluded.stars_annual,
+           updated_at = datetime('now')`
+      )
+        .bind(planId, starsMonthly, starsAnnual)
+        .run();
+    }
 
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'plan.updated', 'subscription_plan', planId, { monthlyPrice, annualPrice, maxProducts, aiDailyLimit }, ip);
     return json({ updated: true });
@@ -468,15 +545,19 @@ export async function handleAdminRoutes(
       body.data.modelName || env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
       64
     );
-    const dailyLimitPerUser = Math.max(0, Number(body.data.dailyLimitPerUser ?? 30));
+    if (!VALID_CF_MODELS.has(modelName)) {
+      return json({ error: `Unsupported Cloudflare Workers AI model "${modelName}".` }, 400);
+    }
+    const dailyLimitPerUser = Math.max(0, Math.floor(Number(body.data.dailyLimitPerUser ?? 30)));
 
-    await env.DB.prepare(
+    const aiUpd = await env.DB.prepare(
       `UPDATE ai_feature_settings
        SET is_enabled = ?, model_name = ?, daily_limit_per_user = ?, updated_by = ?, updated_at = datetime('now')
        WHERE feature_key = ?`
     )
       .bind(isEnabled, modelName, dailyLimitPerUser, admin.adminIdentifier, featureKey)
       .run();
+    if ((aiUpd.meta?.changes ?? 0) === 0) return json({ error: 'AI feature setting not found.' }, 404);
 
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'ai.feature_updated', 'ai_feature', featureKey, { isEnabled: Boolean(isEnabled), modelName, dailyLimitPerUser }, ip);
     return json({ updated: true });
@@ -498,9 +579,10 @@ export async function handleAdminRoutes(
     if (!body.ok) return body.error;
     const isEnabled = body.data.isEnabled ? 1 : 0;
     const shippingNotes = sanitizeText(body.data.shippingNotes || '', 300);
-    await env.DB.prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ? WHERE code = ?')
+    const countryUpd = await env.DB.prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ? WHERE code = ?')
       .bind(isEnabled, shippingNotes, code)
       .run();
+    if ((countryUpd.meta?.changes ?? 0) === 0) return json({ error: 'Country not found.' }, 404);
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'country.updated', 'country', code, { isEnabled }, ip);
     return json({ updated: true });
   }
@@ -525,6 +607,9 @@ export async function handleAdminRoutes(
       .first<Record<string, unknown>>();
     if (!ticket) return json({ error: 'Ticket not found.' }, 404);
     const status = String(body.data.status || 'resolved');
+    if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
+      return json({ error: 'Invalid support ticket status.' }, 400);
+    }
     const adminResponse = sanitizeText(body.data.adminResponse || '', 1500);
 
     await env.DB.prepare(
@@ -587,9 +672,10 @@ export async function handleAdminRoutes(
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const value = sanitizeText(String(body.data.value ?? ''), 500);
-    await env.DB.prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`)
+    const stUpd = await env.DB.prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`)
       .bind(value, admin.adminIdentifier, key)
       .run();
+    if ((stUpd.meta?.changes ?? 0) === 0) return json({ error: 'Setting not found.' }, 404);
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'setting.updated', 'setting', key, { value }, ip);
     return json({ updated: true });
   }
