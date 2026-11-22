@@ -545,7 +545,7 @@ const SCHEMA_STATEMENTS: string[] = [
     label TEXT NOT NULL,
     description TEXT DEFAULT '',
     is_enabled INTEGER NOT NULL DEFAULT 1,
-    model_name TEXT NOT NULL DEFAULT '@cf/meta/llama-3.1-8b-instruct',
+    model_name TEXT NOT NULL DEFAULT '@cf/meta/llama-3.1-8b-instruct-fast',
     daily_limit_per_user INTEGER NOT NULL DEFAULT 30,
     updated_by TEXT DEFAULT 'system',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -603,6 +603,19 @@ const SCHEMA_STATEMENTS: string[] = [
     UNIQUE(role_id, permission_key)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_admin_permissions_role_id ON admin_permissions(role_id)`,
+
+  `CREATE TABLE IF NOT EXISTS admin_role_assignments (
+    id TEXT PRIMARY KEY,
+    telegram_id TEXT UNIQUE NOT NULL,
+    role_id TEXT NOT NULL REFERENCES admin_roles(id),
+    display_label TEXT DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    assigned_by TEXT DEFAULT 'system',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_role_assignments_telegram_id ON admin_role_assignments(telegram_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_role_assignments_role_id ON admin_role_assignments(role_id)`,
 
   `CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id TEXT PRIMARY KEY,
@@ -746,13 +759,13 @@ const SCHEMA_STATEMENTS: string[] = [
     )`,
 
   `INSERT OR IGNORE INTO ai_feature_settings (id, feature_key, label, description, is_enabled, model_name, daily_limit_per_user) VALUES
-    ('ai_global', 'global_ai', 'Global AI Engine', 'Master switch controlling all SOFUMER AI endpoints.', 1, '@cf/meta/llama-3.1-8b-instruct', 100),
-    ('ai_buyer_search', 'buyer_search', 'AI Product & Shop Discovery', 'Natural-language search grounded strictly in published SOFUMER catalog records.', 1, '@cf/meta/llama-3.1-8b-instruct', 40),
-    ('ai_buyer_compare', 'buyer_compare', 'AI Product Comparison', 'Side-by-side comparison of real SOFUMER listings.', 1, '@cf/meta/llama-3.1-8b-instruct', 25),
-    ('ai_seller_listing', 'seller_listing', 'AI Seller Listing Writer', 'Generates title suggestions, descriptions, category picks, keywords, and FAQs for seller review.', 1, '@cf/meta/llama-3.1-8b-instruct', 40),
-    ('ai_seller_translate', 'seller_translate', 'AI Listing Translation', 'Translates listing titles and descriptions for global buyers.', 1, '@cf/meta/llama-3.1-8b-instruct', 30),
-    ('ai_seller_analytics', 'seller_analytics', 'AI Shop Analytics Insights', 'Explains real shop metrics and listing engagement.', 1, '@cf/meta/llama-3.1-8b-instruct', 20),
-    ('ai_platform_support', 'platform_support', 'AI Platform Support & Trust', 'Explains SOFUMER rules, direct transactions, and assists flagging suspicious listings.', 1, '@cf/meta/llama-3.1-8b-instruct', 40)`,
+    ('ai_global', 'global_ai', 'Global AI Engine', 'Master switch controlling all SOFUMER AI endpoints.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 100),
+    ('ai_buyer_search', 'buyer_search', 'AI Product & Shop Discovery', 'Natural-language search grounded strictly in published SOFUMER catalog records.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40),
+    ('ai_buyer_compare', 'buyer_compare', 'AI Product Comparison', 'Side-by-side comparison of real SOFUMER listings.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 25),
+    ('ai_seller_listing', 'seller_listing', 'AI Seller Listing Writer', 'Generates title suggestions, descriptions, category picks, keywords, and FAQs for seller review.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40),
+    ('ai_seller_translate', 'seller_translate', 'AI Listing Translation', 'Translates listing titles and descriptions for global buyers.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 30),
+    ('ai_seller_analytics', 'seller_analytics', 'AI Shop Analytics Insights', 'Explains real shop metrics and listing engagement.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 20),
+    ('ai_platform_support', 'platform_support', 'AI Platform Support & Trust', 'Explains SOFUMER rules, direct transactions, and assists flagging suspicious listings.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40)`,
 
   `INSERT OR IGNORE INTO platform_settings (key, value, value_type, description) VALUES
     ('seller_registration_enabled', 'true', 'boolean', 'Allow Telegram users to register seller profiles and shops'),
@@ -774,9 +787,23 @@ const SCHEMA_STATEMENTS: string[] = [
     ('perm_2', 'role_mod', 'moderation.manage'),
     ('perm_3', 'role_mod', 'reports.manage'),
     ('perm_4', 'role_mod', 'sellers.suspend'),
+    ('perm_mod_overview', 'role_mod', 'overview.view'),
+    ('perm_mod_analytics', 'role_mod', 'analytics.view'),
+    ('perm_mod_sellers', 'role_mod', 'sellers.manage'),
+    ('perm_mod_shops', 'role_mod', 'shops.manage'),
+    ('perm_mod_orders', 'role_mod', 'orders.manage'),
+    ('perm_mod_reviews', 'role_mod', 'reviews.manage'),
+    ('perm_mod_messages', 'role_mod', 'messages.moderate'),
+    ('perm_mod_support', 'role_mod', 'support.manage'),
+    ('perm_mod_audit', 'role_mod', 'audit.view'),
     ('perm_5', 'role_ops', 'catalog.manage'),
     ('perm_6', 'role_ops', 'monetization.manage'),
-    ('perm_7', 'role_ops', 'support.manage')`,
+    ('perm_7', 'role_ops', 'support.manage'),
+    ('perm_ops_overview', 'role_ops', 'overview.view'),
+    ('perm_ops_analytics', 'role_ops', 'analytics.view'),
+    ('perm_ops_countries', 'role_ops', 'countries.manage'),
+    ('perm_ops_notifications', 'role_ops', 'notifications.manage'),
+    ('perm_ops_orders', 'role_ops', 'orders.manage')`,
 
   // 14. Telegram Stars (XTR), Protected Digital Delivery & Edge Rate Limiting (Migration 0004)
   `CREATE TABLE IF NOT EXISTS subscription_plan_stars (
@@ -859,6 +886,48 @@ const SCHEMA_STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_edge_rate_limits_reset_at ON edge_rate_limits(reset_at)`,
 ];
 
+const UPGRADE_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS admin_role_assignments (
+    id TEXT PRIMARY KEY,
+    telegram_id TEXT UNIQUE NOT NULL,
+    role_id TEXT NOT NULL REFERENCES admin_roles(id),
+    display_label TEXT DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    assigned_by TEXT DEFAULT 'system',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_role_assignments_telegram_id ON admin_role_assignments(telegram_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_role_assignments_role_id ON admin_role_assignments(role_id)`,
+  `INSERT OR IGNORE INTO admin_permissions (id, role_id, permission_key) VALUES
+    ('perm_1', 'role_owner', '*'),
+    ('perm_mod_overview', 'role_mod', 'overview.view'),
+    ('perm_mod_analytics', 'role_mod', 'analytics.view'),
+    ('perm_mod_sellers', 'role_mod', 'sellers.manage'),
+    ('perm_mod_shops', 'role_mod', 'shops.manage'),
+    ('perm_mod_orders', 'role_mod', 'orders.manage'),
+    ('perm_mod_reviews', 'role_mod', 'reviews.manage'),
+    ('perm_mod_messages', 'role_mod', 'messages.moderate'),
+    ('perm_mod_support', 'role_mod', 'support.manage'),
+    ('perm_mod_audit', 'role_mod', 'audit.view'),
+    ('perm_ops_overview', 'role_ops', 'overview.view'),
+    ('perm_ops_analytics', 'role_ops', 'analytics.view'),
+    ('perm_ops_countries', 'role_ops', 'countries.manage'),
+    ('perm_ops_notifications', 'role_ops', 'notifications.manage'),
+    ('perm_ops_orders', 'role_ops', 'orders.manage')`,
+  `UPDATE ai_feature_settings
+   SET model_name = '@cf/meta/llama-3.1-8b-instruct-fast',
+       updated_by = 'd1_bootstrap_upgrade',
+       updated_at = datetime('now')
+   WHERE model_name IN (
+     '@cf/meta/llama-3.1-8b-instruct',
+     '@cf/meta/infire-llama-3.1-8b-instruct',
+     '@cf/mistral/mistral-7b-instruct-v0.1',
+     '@cf/mistral/mistral-7b-instruct-v0.2',
+     '@cf/qwen/qwen2.5-7b-instruct'
+   ) OR model_name NOT LIKE '@cf/%'`,
+];
+
 let schemaVerified = false;
 let inFlightBootstrap: Promise<boolean> | null = null;
 
@@ -867,12 +936,18 @@ export async function isD1Initialized(db?: D1Database): Promise<boolean> {
   try {
     const tablesRow = await db
       .prepare(
-        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'categories', 'platform_settings', 'ai_feature_settings', 'subscription_plan_stars', 'telegram_stars_payments', 'product_digital_assets', 'edge_rate_limits')"
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'categories', 'platform_settings', 'ai_feature_settings', 'subscription_plan_stars', 'telegram_stars_payments', 'product_digital_assets', 'edge_rate_limits', 'admin_role_assignments')"
       )
       .first<{ cnt: number }>();
-    if ((tablesRow?.cnt ?? 0) < 8) return false;
+    if ((tablesRow?.cnt ?? 0) < 9) return false;
     const catRow = await db.prepare('SELECT COUNT(*) as cnt FROM categories').first<{ cnt: number }>();
-    return (catRow?.cnt ?? 0) > 0;
+    if ((catRow?.cnt ?? 0) === 0) return false;
+    const staleModel = await db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM ai_feature_settings WHERE model_name IN ('@cf/meta/llama-3.1-8b-instruct', '@cf/meta/infire-llama-3.1-8b-instruct', '@cf/mistral/mistral-7b-instruct-v0.1', '@cf/mistral/mistral-7b-instruct-v0.2', '@cf/qwen/qwen2.5-7b-instruct') OR model_name NOT LIKE '@cf/%'"
+      )
+      .first<{ cnt: number }>();
+    return (staleModel?.cnt ?? 0) === 0;
   } catch {
     return false;
   }
@@ -896,6 +971,8 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
         const chunk = SCHEMA_STATEMENTS.slice(i, i + CHUNK_SIZE);
         await db.batch(chunk.map((sql) => db.prepare(sql)));
       }
+
+      await db.batch(UPGRADE_STATEMENTS.map((sql) => db.prepare(sql)));
 
       schemaVerified = true;
       return true;

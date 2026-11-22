@@ -599,7 +599,7 @@ CREATE TABLE IF NOT EXISTS ai_feature_settings (
   label TEXT NOT NULL,
   description TEXT DEFAULT '',
   is_enabled INTEGER NOT NULL DEFAULT 1,
-  model_name TEXT NOT NULL DEFAULT '@cf/meta/llama-3.1-8b-instruct',
+  model_name TEXT NOT NULL DEFAULT '@cf/meta/llama-3.1-8b-instruct-fast',
   daily_limit_per_user INTEGER NOT NULL DEFAULT 30,
   updated_by TEXT DEFAULT 'system',
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -813,13 +813,13 @@ INSERT OR IGNORE INTO subscription_plans (
   );
 
 INSERT OR IGNORE INTO ai_feature_settings (id, feature_key, label, description, is_enabled, model_name, daily_limit_per_user) VALUES
-  ('ai_global', 'global_ai', 'Global AI Engine', 'Master switch controlling all SOFUMER AI endpoints.', 1, '@cf/meta/llama-3.1-8b-instruct', 100),
-  ('ai_buyer_search', 'buyer_search', 'AI Product & Shop Discovery', 'Natural-language search grounded strictly in published SOFUMER catalog records.', 1, '@cf/meta/llama-3.1-8b-instruct', 40),
-  ('ai_buyer_compare', 'buyer_compare', 'AI Product Comparison', 'Side-by-side comparison of real SOFUMER listings.', 1, '@cf/meta/llama-3.1-8b-instruct', 25),
-  ('ai_seller_listing', 'seller_listing', 'AI Seller Listing Writer', 'Generates title suggestions, descriptions, category picks, keywords, and FAQs for seller review.', 1, '@cf/meta/llama-3.1-8b-instruct', 40),
-  ('ai_seller_translate', 'seller_translate', 'AI Listing Translation', 'Translates listing titles and descriptions for global buyers.', 1, '@cf/meta/llama-3.1-8b-instruct', 30),
-  ('ai_seller_analytics', 'seller_analytics', 'AI Shop Analytics Insights', 'Explains real shop metrics and listing engagement.', 1, '@cf/meta/llama-3.1-8b-instruct', 20),
-  ('ai_platform_support', 'platform_support', 'AI Platform Support & Trust', 'Explains SOFUMER rules, direct transactions, and assists flagging suspicious listings.', 1, '@cf/meta/llama-3.1-8b-instruct', 40);
+  ('ai_global', 'global_ai', 'Global AI Engine', 'Master switch controlling all SOFUMER AI endpoints.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 100),
+  ('ai_buyer_search', 'buyer_search', 'AI Product & Shop Discovery', 'Natural-language search grounded strictly in published SOFUMER catalog records.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40),
+  ('ai_buyer_compare', 'buyer_compare', 'AI Product Comparison', 'Side-by-side comparison of real SOFUMER listings.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 25),
+  ('ai_seller_listing', 'seller_listing', 'AI Seller Listing Writer', 'Generates title suggestions, descriptions, category picks, keywords, and FAQs for seller review.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40),
+  ('ai_seller_translate', 'seller_translate', 'AI Listing Translation', 'Translates listing titles and descriptions for global buyers.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 30),
+  ('ai_seller_analytics', 'seller_analytics', 'AI Shop Analytics Insights', 'Explains real shop metrics and listing engagement.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 20),
+  ('ai_platform_support', 'platform_support', 'AI Platform Support & Trust', 'Explains SOFUMER rules, direct transactions, and assists flagging suspicious listings.', 1, '@cf/meta/llama-3.1-8b-instruct-fast', 40);
 
 INSERT OR IGNORE INTO platform_settings (key, value, value_type, description) VALUES
   ('seller_registration_enabled', 'true', 'boolean', 'Allow Telegram users to register seller profiles and shops'),

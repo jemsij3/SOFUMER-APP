@@ -3,9 +3,9 @@ import { db, newId } from '../db.ts';
 import {
   getJwtSecret,
   hashSessionId,
-  isTelegramIdAdmin,
   rateLimit,
   requireAuth,
+  resolveAdminContext,
   resolveUserSession,
   sanitizeSafeUrl,
   sanitizeText,
@@ -92,7 +92,7 @@ function createSessionForTelegramUser(
      VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
   ).run(sessionId, userId, tokenHash, ipAddress, userAgent.slice(0, 200), expiresAt);
 
-  const isAdmin = isTelegramIdAdmin(tgId);
+  const isAdmin = Boolean(resolveAdminContext(tgId));
   const jwtToken = signJwt({ sub: userId, tid: tgId, sid: sessionId, adm: isAdmin }, 7 * 86400);
 
   return { userId, jwtToken, expiresAt, isAdmin };

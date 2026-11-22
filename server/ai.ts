@@ -1,9 +1,9 @@
 import { db, newId } from './db.ts';
-import { VALID_CF_MODELS, getActiveSubscriptionLocal } from './security.ts';
+import { DEFAULT_CF_AI_MODEL, VALID_CF_MODELS, getActiveSubscriptionLocal } from './security.ts';
 
 export const DEFAULT_CLOUDFLARE_AI_MODEL = VALID_CF_MODELS.has(process.env.CLOUDFLARE_AI_MODEL || '')
   ? String(process.env.CLOUDFLARE_AI_MODEL)
-  : '@cf/meta/llama-3.1-8b-instruct';
+  : DEFAULT_CF_AI_MODEL;
 
 export interface WorkersAiBinding {
   run(
@@ -35,7 +35,7 @@ function extractJsonObject(raw: string): Record<string, unknown> {
   return JSON.parse(candidate) as Record<string, unknown>;
 }
 
-async function invokeCloudflareWorkersAi(
+export async function invokeCloudflareWorkersAi(
   modelName: string,
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   expectJson = false

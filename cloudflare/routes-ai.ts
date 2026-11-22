@@ -1,5 +1,6 @@
 import {
   type Env,
+  DEFAULT_CF_AI_MODEL,
   VALID_CF_MODELS,
   checkEdgeRateLimit,
   getActiveSubscriptionEdge,
@@ -13,7 +14,7 @@ import {
 async function checkEdgeAiPermission(env: Env, userId: string, featureKey: string) {
   const defaultModel = VALID_CF_MODELS.has(env.CLOUDFLARE_AI_MODEL || '')
     ? String(env.CLOUDFLARE_AI_MODEL)
-    : '@cf/meta/llama-3.1-8b-instruct';
+    : DEFAULT_CF_AI_MODEL;
 
   const globalSetting = await env.DB!.prepare(
     "SELECT is_enabled, model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'"

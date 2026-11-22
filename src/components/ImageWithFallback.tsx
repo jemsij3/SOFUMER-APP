@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Package } from 'lucide-react';
 
 interface Props {
@@ -23,8 +23,12 @@ function isSafeImageSrc(raw?: string | null): string | null {
 }
 
 export function ImageWithFallback({ src, alt, className = '', fallbackLabel }: Props) {
-  const [failed, setFailed] = useState(false);
   const safeSrc = isSafeImageSrc(src);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [safeSrc]);
 
   if (!safeSrc || failed) {
     return (

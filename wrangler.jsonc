@@ -10,7 +10,7 @@
     "not_found_handling": "single-page-application"
   },
   "vars": {
-    "CLOUDFLARE_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct"
+    "CLOUDFLARE_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast"
   },
   "d1_databases": [
     {

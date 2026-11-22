@@ -1,6 +1,14 @@
 import {
+  type D1Database,
   type Env,
+  ADMIN_PERMISSION_CATALOG,
+  DEFAULT_CF_AI_MODEL,
+  OWNER_ONLY_PERMISSIONS,
   VALID_CF_MODELS,
+  VALID_PERMISSION_KEYS,
+  checkProhibitedKeywordsEdge,
+  hasEdgeAdminPermission,
+  isTelegramIdAdmin,
   json,
   methodNotAllowed,
   newId,
@@ -11,6 +19,96 @@ import {
   sanitizeText,
   slugify,
 } from './helpers.ts';
+
+async function validateAndNormalizeSetting(
+  db: D1Database,
+  key: string,
+  rawValue: unknown
+): Promise<{ ok: true; value: string } | { ok: false; error: string; status?: number }> {
+  const row = await db
+    .prepare('SELECT key, value_type FROM platform_settings WHERE key = ?')
+    .bind(key)
+    .first<{ key: string; value_type: string }>();
+  if (!row) {
+    return { ok: false, error: `Setting "${key}" not found.`, status: 404 };
+  }
+
+  if (
+    row.value_type === 'boolean' ||
+    key === 'seller_registration_enabled' ||
+    key === 'product_submissions_enabled' ||
+    key === 'auto_approve_products'
+  ) {
+    if (typeof rawValue === 'boolean') {
+      return { ok: true, value: rawValue ? 'true' : 'false' };
+    }
+    const str = String(rawValue ?? '').trim().toLowerCase();
+    if (str !== 'true' && str !== 'false') {
+      return { ok: false, error: `Setting "${key}" must be "true" or "false".`, status: 400 };
+    }
+    return { ok: true, value: str };
+  }
+
+  if (
+    row.value_type === 'number' ||
+    key === 'stars_per_usd' ||
+    key === 'featured_product_price_7d' ||
+    key === 'sponsored_placement_price_7d' ||
+    key === 'banner_ad_price_7d'
+  ) {
+    const num = Number(rawValue);
+    if (!Number.isFinite(num)) {
+      return { ok: false, error: `Setting "${key}" must be a valid finite number.`, status: 400 };
+    }
+    if (key === 'stars_per_usd') {
+      if (!Number.isInteger(num) || num < 1 || num > 10000) {
+        return { ok: false, error: 'stars_per_usd must be a whole number between 1 and 10,000.', status: 400 };
+      }
+      return { ok: true, value: String(num) };
+    }
+    if (key.endsWith('_price_7d')) {
+      if (num < 1 || num > 10000) {
+        return { ok: false, error: `${key} must be between 1 and 10,000 USD.`, status: 400 };
+      }
+      return { ok: true, value: String(Number(num.toFixed(2))) };
+    }
+    if (num < 0) {
+      return { ok: false, error: `${key} must be a non-negative number.`, status: 400 };
+    }
+    return { ok: true, value: String(num) };
+  }
+
+  if (key === 'prohibited_keywords') {
+    const cleaned = Array.from(
+      new Set(
+        String(rawValue ?? '')
+          .split(',')
+          .map((item) => sanitizeText(item, 60).toLowerCase())
+          .filter(Boolean)
+      )
+    )
+      .join(', ')
+      .slice(0, 500);
+    return { ok: true, value: cleaned };
+  }
+
+  return { ok: true, value: sanitizeText(String(rawValue ?? ''), 500) };
+}
+
+function getEnvOwnerTelegramIds(env: Env): string[] {
+  return String(env.ADMIN_TELEGRAM_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter((id) => /^\d+$/.test(id));
+}
+
+async function roleHasOwnerOnlyPermissionsEdge(db: D1Database, roleId: string): Promise<boolean> {
+  const perms = await db
+    .prepare('SELECT permission_key FROM admin_permissions WHERE role_id = ?')
+    .bind(roleId)
+    .all<{ permission_key: string }>();
+  return perms.results.some((p) => OWNER_ONLY_PERMISSIONS.has(p.permission_key));
+}
 
 export async function handleAdminRoutes(
   request: Request,
@@ -27,7 +125,11 @@ export async function handleAdminRoutes(
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const auth = await requireEdgeAdmin(request, env);
     if ('error' in auth) return auth.error;
-    return json({ authenticated: true, admin: auth.admin });
+    return json({
+      authenticated: true,
+      admin: auth.admin,
+      permissionCatalog: ADMIN_PERMISSION_CATALOG,
+    });
   }
 
   if (sub === '/auth/logout') {
@@ -44,12 +146,10 @@ export async function handleAdminRoutes(
     );
   }
 
-  const auth = await requireEdgeAdmin(request, env);
-  if ('error' in auth) return auth.error;
-  const admin = auth.admin;
-
   if (sub === '/overview') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'overview.view');
+    if ('error' in auth) return auth.error;
     const counts = await env.DB.prepare(
       `SELECT
          (SELECT COUNT(*) FROM users) as total_users,
@@ -71,8 +171,62 @@ export async function handleAdminRoutes(
     return json({ overview: counts });
   }
 
+  if (sub === '/analytics') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'analytics.view');
+    if ('error' in auth) return auth.error;
+
+    const [
+      productsByStatus,
+      productsByType,
+      ordersByStatus,
+      topCategories,
+      aiByFeature,
+      engagementTotals,
+      verificationBreakdown,
+    ] = await Promise.all([
+      env.DB.prepare('SELECT status, COUNT(*) as cnt FROM products GROUP BY status ORDER BY cnt DESC').all(),
+      env.DB.prepare('SELECT listing_type, COUNT(*) as cnt FROM products GROUP BY listing_type ORDER BY cnt DESC').all(),
+      env.DB.prepare('SELECT status, COUNT(*) as cnt, COALESCE(SUM(agreed_total), 0) as volume_usd FROM orders GROUP BY status ORDER BY cnt DESC').all(),
+      env.DB.prepare(
+        `SELECT c.id, c.name, COUNT(p.id) as product_count, COALESCE(SUM(p.view_count), 0) as total_views
+         FROM categories c LEFT JOIN products p ON p.category_id = c.id
+         GROUP BY c.id, c.name ORDER BY product_count DESC, total_views DESC LIMIT 10`
+      ).all(),
+      env.DB.prepare(
+        `SELECT feature_key,
+                COUNT(*) as total_calls,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_calls,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_calls,
+                COALESCE(AVG(latency_ms), 0) as avg_latency_ms
+         FROM ai_usage GROUP BY feature_key ORDER BY total_calls DESC`
+      ).all(),
+      env.DB.prepare(
+        `SELECT COALESCE(SUM(view_count), 0) as total_views,
+                COALESCE(SUM(favorite_count), 0) as total_favorites,
+                COALESCE(SUM(inquiry_count), 0) as total_inquiries,
+                (SELECT COUNT(*) FROM conversations) as total_conversations,
+                (SELECT COUNT(*) FROM reviews WHERE status = 'published') as published_reviews
+         FROM products`
+      ).first(),
+      env.DB.prepare('SELECT verification_status, COUNT(*) as cnt FROM shops GROUP BY verification_status').all(),
+    ]);
+
+    return json({
+      productsByStatus: productsByStatus.results,
+      productsByType: productsByType.results,
+      ordersByStatus: ordersByStatus.results,
+      topCategories: topCategories.results,
+      aiByFeature: aiByFeature.results,
+      engagementTotals,
+      verificationBreakdown: verificationBreakdown.results,
+    });
+  }
+
   if (sub === '/users') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'users.manage');
+    if ('error' in auth) return auth.error;
     const users = await env.DB.prepare(
       `SELECT u.*, COALESCE(ap.ai_enabled, 1) as ai_enabled, ap.custom_daily_limit,
               (SELECT GROUP_CONCAT(role) FROM user_roles ur WHERE ur.user_id = u.id) as roles
@@ -84,6 +238,10 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/users/') && sub.endsWith('/status')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'users.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
     const userId = decodeURIComponent(sub.slice('/users/'.length, -'/status'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -102,14 +260,21 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/users/') && sub.endsWith('/ai-access')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'users.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
     const userId = decodeURIComponent(sub.slice('/users/'.length, -'/ai-access'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const aiEnabled = body.data.aiEnabled ? 1 : 0;
     const customDailyLimit =
-      body.data.customDailyLimit !== undefined && body.data.customDailyLimit !== ''
+      body.data.customDailyLimit !== undefined && body.data.customDailyLimit !== '' && body.data.customDailyLimit !== null
         ? Number(body.data.customDailyLimit)
         : null;
+    if (customDailyLimit !== null && (!Number.isFinite(customDailyLimit) || customDailyLimit < 0)) {
+      return json({ error: 'customDailyLimit must be a non-negative number.' }, 400);
+    }
     const reason = sanitizeText(body.data.reason || '', 300);
 
     const userExists = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
@@ -134,6 +299,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/sellers') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, ['sellers.manage', 'sellers.suspend', 'shops.manage']);
+    if ('error' in auth) return auth.error;
     const sellers = await env.DB.prepare(
       `SELECT sp.*, u.display_name, u.telegram_username, s.id as shop_id, s.name as shop_name,
               s.slug as shop_slug, s.status as shop_status, s.is_featured, s.verification_status as shop_verification_status
@@ -145,6 +312,10 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/sellers/') && sub.endsWith('/status')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, ['sellers.manage', 'sellers.suspend', 'shops.manage']);
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
     const sellerId = decodeURIComponent(sub.slice('/sellers/'.length, -'/status'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -156,6 +327,10 @@ export async function handleAdminRoutes(
     const status = String(body.data.status || '');
     const verificationStatus = body.data.verificationStatus ? String(body.data.verificationStatus) : null;
     const isFeatured = body.data.isFeatured;
+
+    if ((verificationStatus || typeof isFeatured === 'boolean') && !hasEdgeAdminPermission(admin, ['sellers.manage', 'shops.manage'])) {
+      return json({ error: 'Insufficient administrative permissions to change shop verification or featured status.' }, 403);
+    }
 
     if (['active', 'suspended'].includes(status)) {
       await env.DB.prepare("UPDATE seller_profiles SET status = ?, updated_at = datetime('now') WHERE id = ?")
@@ -192,6 +367,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/products') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, ['moderation.manage', 'catalog.manage']);
+    if ('error' in auth) return auth.error;
     const products = await env.DB.prepare(
       `SELECT p.*, s.name as shop_name, c.name as category_name, u.display_name as seller_name
        FROM products p JOIN shops s ON s.id = p.shop_id JOIN categories c ON c.id = p.category_id JOIN users u ON u.id = p.seller_user_id
@@ -202,6 +379,10 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/products/') && sub.endsWith('/moderate')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'moderation.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
     const prodId = decodeURIComponent(sub.slice('/products/'.length, -'/moderate'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -238,8 +419,126 @@ export async function handleAdminRoutes(
     return json({ updated: true });
   }
 
+  if (sub.startsWith('/moderation/products/') && sub.endsWith('/ai-scan')) {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'moderation.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
+    const prodId = decodeURIComponent(sub.slice('/moderation/products/'.length, -'/ai-scan'.length));
+    const product = await env.DB.prepare(
+      `SELECT p.*, c.name as category_name, s.name as shop_name
+       FROM products p
+       JOIN categories c ON c.id = p.category_id
+       JOIN shops s ON s.id = p.shop_id
+       WHERE p.id = ?`
+    )
+      .bind(prodId)
+      .first<Record<string, unknown>>();
+    if (!product) return json({ error: 'Product not found.' }, 404);
+
+    const textBlob = `${String(product.title || '')} ${String(product.description || '')} ${String(product.keywords || '')}`;
+    const keywordMatches = await checkProhibitedKeywordsEdge(env, textBlob);
+
+    const settingRow = await env.DB.prepare(
+      "SELECT model_name FROM ai_feature_settings WHERE feature_key = 'platform_support'"
+    ).first<{ model_name: string }>();
+    const candidateModel = settingRow?.model_name || env.CLOUDFLARE_AI_MODEL || DEFAULT_CF_AI_MODEL;
+    const modelName = VALID_CF_MODELS.has(candidateModel) ? candidateModel : DEFAULT_CF_AI_MODEL;
+
+    let riskLevel: 'low' | 'medium' | 'high' = keywordMatches.length > 0 ? 'high' : 'low';
+    let rationale = keywordMatches.length
+      ? `Matched prohibited keywords: ${keywordMatches.join(', ')}.`
+      : 'No prohibited marketplace keywords detected.';
+    let recommendedStatus: 'published' | 'pending_review' | 'rejected' = keywordMatches.length > 0 ? 'rejected' : 'published';
+    let aiEvaluated = false;
+
+    if (env.AI) {
+      try {
+        const start = Date.now();
+        const aiOut = await env.AI.run(modelName, {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are SOFUMER Trust & Safety AI Moderator. Evaluate marketplace listings for prohibited/illegal goods, fraud, counterfeit indicators, or policy violations. Respond ONLY with valid JSON: {"riskLevel": "low"|"medium"|"high", "recommendedStatus": "published"|"pending_review"|"rejected", "rationale": string}.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                title: product.title,
+                description: product.description,
+                listingType: product.listing_type,
+                category: product.category_name,
+                price: product.price,
+                currency: product.currency,
+                keywordMatches,
+              }),
+            },
+          ],
+          max_tokens: 400,
+          temperature: 0.1,
+          response_format: { type: 'json_object' },
+        });
+        const rawText = aiOut?.response ?? aiOut?.result?.response ?? '';
+        const matchJson = rawText.match(/\{[\s\S]*\}/);
+        if (matchJson) {
+          const parsed = JSON.parse(matchJson[0]) as {
+            riskLevel?: string;
+            recommendedStatus?: string;
+            rationale?: string;
+          };
+          if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium' || parsed.riskLevel === 'high') {
+            riskLevel = keywordMatches.length > 0 ? 'high' : parsed.riskLevel;
+          }
+          if (
+            parsed.recommendedStatus === 'published' ||
+            parsed.recommendedStatus === 'pending_review' ||
+            parsed.recommendedStatus === 'rejected'
+          ) {
+            recommendedStatus = keywordMatches.length > 0 ? 'rejected' : parsed.recommendedStatus;
+          }
+          if (parsed.rationale) {
+            rationale = sanitizeText(parsed.rationale, 400);
+          }
+          aiEvaluated = true;
+        }
+        await env.DB.prepare(
+          `INSERT INTO ai_usage (id, user_id, feature_key, model_name, prompt_summary, tokens_estimated, status, latency_ms)
+           VALUES (?, ?, 'platform_support', ?, ?, ?, 'success', ?)`
+        )
+          .bind(newId('ai'), admin.userId, modelName, `admin_scan:${prodId}`, Math.ceil(rawText.length / 4), Date.now() - start)
+          .run();
+      } catch {
+        // Fall back to deterministic keyword scan when AI model binding is offline
+      }
+    }
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'product.ai_moderation_scan',
+      'product',
+      prodId,
+      { riskLevel, recommendedStatus, keywordMatches, aiEvaluated, modelName },
+      ip
+    );
+
+    return json({
+      productId: prodId,
+      riskLevel,
+      recommendedStatus,
+      keywordMatches,
+      rationale,
+      aiEvaluated,
+      model: modelName,
+    });
+  }
+
   if (sub === '/categories') {
     if (request.method === 'GET') {
+      const auth = await requireEdgeAdmin(request, env, ['catalog.manage', 'moderation.manage']);
+      if ('error' in auth) return auth.error;
       const [categories, subcategories] = await Promise.all([
         env.DB.prepare('SELECT * FROM categories ORDER BY sort_order ASC, name ASC').all(),
         env.DB.prepare('SELECT * FROM subcategories ORDER BY sort_order ASC, name ASC').all(),
@@ -247,6 +546,9 @@ export async function handleAdminRoutes(
       return json({ categories: categories.results, subcategories: subcategories.results });
     }
     if (request.method === 'POST') {
+      const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
       const body = await parseJsonBody(request);
       if (!body.ok) return body.error;
       const name = sanitizeText(body.data.name || '', 80);
@@ -262,8 +564,40 @@ export async function handleAdminRoutes(
     return methodNotAllowed(['GET', 'POST']);
   }
 
+  if (sub.startsWith('/categories/')) {
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
+    const catId = decodeURIComponent(sub.slice('/categories/'.length));
+    const existing = await env.DB.prepare('SELECT * FROM categories WHERE id = ?')
+      .bind(catId)
+      .first<Record<string, unknown>>();
+    if (!existing) return json({ error: 'Category not found.' }, 404);
+
+    const body = await parseJsonBody(request);
+    if (!body.ok) return body.error;
+
+    const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
+    const description =
+      body.data.description !== undefined ? sanitizeText(body.data.description, 240) : String(existing.description || '');
+    const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
+    if (!name) return json({ error: 'Category name cannot be empty.' }, 400);
+
+    await env.DB.prepare('UPDATE categories SET name = ?, description = ?, is_active = ? WHERE id = ?')
+      .bind(name, description, isActive, catId)
+      .run();
+
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'category.updated', 'category', catId, { name, isActive: Boolean(isActive) }, ip);
+    return json({ updated: true });
+  }
+
   if (sub === '/subcategories') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const categoryId = sanitizeText(body.data.categoryId || '', 64);
@@ -275,11 +609,36 @@ export async function handleAdminRoutes(
     await env.DB.prepare(`INSERT INTO subcategories (id, category_id, slug, name, sort_order) VALUES (?, ?, ?, ?, 50)`)
       .bind(id, categoryId, `${slugify(name)}-${id.slice(-4)}`, name)
       .run();
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'subcategory.created', 'subcategory', id, { categoryId, name }, ip);
     return json({ id, name }, 201);
+  }
+
+  if (sub.startsWith('/subcategories/')) {
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const subId = decodeURIComponent(sub.slice('/subcategories/'.length));
+    const existing = await env.DB.prepare('SELECT * FROM subcategories WHERE id = ?')
+      .bind(subId)
+      .first<Record<string, unknown>>();
+    if (!existing) return json({ error: 'Subcategory not found.' }, 404);
+    const body = await parseJsonBody(request);
+    if (!body.ok) return body.error;
+    const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
+    const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
+    if (!name) return json({ error: 'Subcategory name cannot be empty.' }, 400);
+    await env.DB.prepare('UPDATE subcategories SET name = ?, is_active = ? WHERE id = ?')
+      .bind(name, isActive, subId)
+      .run();
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'subcategory.updated', 'subcategory', subId, { name, isActive: Boolean(isActive) }, ip);
+    return json({ updated: true });
   }
 
   if (sub === '/orders') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'orders.manage');
+    if ('error' in auth) return auth.error;
     const orders = await env.DB.prepare(
       `SELECT o.*, s.name as shop_name, bu.display_name as buyer_name, su.display_name as seller_name
        FROM orders o JOIN shops s ON s.id = o.shop_id
@@ -291,6 +650,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/reports') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, ['reports.manage', 'messages.moderate']);
+    if ('error' in auth) return auth.error;
     const [reports, flaggedConversations] = await Promise.all([
       env.DB.prepare(
         `SELECT r.*, u.display_name as reporter_name FROM reports r
@@ -306,6 +667,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/reports/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'reports.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const repId = decodeURIComponent(sub.slice('/reports/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -334,6 +698,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/conversations/') && sub.endsWith('/messages')) {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, ['reports.manage', 'messages.moderate']);
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const convId = decodeURIComponent(sub.slice('/conversations/'.length, -'/messages'.length));
     const messages = await env.DB.prepare(
       `SELECT m.*, u.display_name as sender_name FROM messages m
@@ -341,14 +708,18 @@ export async function handleAdminRoutes(
     )
       .bind(convId)
       .all();
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'conversation.investigated', 'conversation', convId, {}, ip);
     return json({ messages: messages.results });
   }
 
   if (sub === '/reviews') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'reviews.manage');
+    if ('error' in auth) return auth.error;
     const reviews = await env.DB.prepare(
-      `SELECT r.*, p.title as product_title, u.display_name as reviewer_name
+      `SELECT r.*, p.title as product_title, u.display_name as reviewer_name, s.name as shop_name
        FROM reviews r JOIN products p ON p.id = r.product_id JOIN users u ON u.id = r.reviewer_user_id
+       JOIN shops s ON s.id = r.shop_id
        ORDER BY r.created_at DESC LIMIT 100`
     ).all();
     return json({ reviews: reviews.results });
@@ -356,6 +727,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/reviews/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'reviews.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const revId = decodeURIComponent(sub.slice('/reviews/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -397,6 +771,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/monetization') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
+    if ('error' in auth) return auth.error;
     const [plans, subscriptions, promotions, promotionTransactions, starsPayments] = await Promise.all([
       env.DB.prepare(
         `SELECT sp.*, COALESCE(sps.stars_monthly, 0) as stars_monthly, COALESCE(sps.stars_annual, 0) as stars_annual
@@ -404,9 +780,9 @@ export async function handleAdminRoutes(
          ORDER BY sp.monthly_price ASC`
       ).all(),
       env.DB.prepare(
-        `SELECT s.*, sp.name as plan_name, u.display_name as seller_name, sh.name as shop_name
+        `SELECT s.*, sp.code as plan_code, sp.name as plan_name, u.display_name as seller_name, sh.name as shop_name
          FROM subscriptions s JOIN subscription_plans sp ON sp.id = s.plan_id
-         JOIN users u ON u.id = s.user_id JOIN shops sh ON sh.seller_id = s.seller_id
+         JOIN users u ON u.id = s.user_id LEFT JOIN shops sh ON sh.seller_id = s.seller_id
          ORDER BY s.created_at DESC LIMIT 100`
       ).all(),
       env.DB.prepare(
@@ -432,6 +808,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/plans/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const planId = decodeURIComponent(sub.slice('/plans/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -488,6 +867,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/promotions/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const promoId = decodeURIComponent(sub.slice('/promotions/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -517,6 +899,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/ai') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'ai.manage');
+    if ('error' in auth) return auth.error;
     const [features, usageLogs, summary] = await Promise.all([
       env.DB.prepare('SELECT * FROM ai_feature_settings ORDER BY id ASC').all(),
       env.DB.prepare(
@@ -532,23 +916,41 @@ export async function handleAdminRoutes(
          FROM ai_usage`
       ).first(),
     ]);
-    return json({ features: features.results, usageLogs: usageLogs.results, summary });
+    return json({
+      features: features.results,
+      usageLogs: usageLogs.results,
+      summary,
+      availableModels: Array.from(VALID_CF_MODELS),
+      defaultModel: DEFAULT_CF_AI_MODEL,
+    });
   }
 
   if (sub.startsWith('/ai/features/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'ai.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const featureKey = decodeURIComponent(sub.slice('/ai/features/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const isEnabled = body.data.isEnabled ? 1 : 0;
     const modelName = sanitizeText(
-      body.data.modelName || env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
+      body.data.modelName || (VALID_CF_MODELS.has(env.CLOUDFLARE_AI_MODEL || '') ? env.CLOUDFLARE_AI_MODEL : DEFAULT_CF_AI_MODEL),
       64
     );
     if (!VALID_CF_MODELS.has(modelName)) {
-      return json({ error: `Unsupported Cloudflare Workers AI model "${modelName}".` }, 400);
+      return json(
+        {
+          error: `Unsupported or deprecated Cloudflare Workers AI model "${modelName}". Choose one of: ${Array.from(VALID_CF_MODELS).join(', ')}`,
+        },
+        400
+      );
     }
-    const dailyLimitPerUser = Math.max(0, Math.floor(Number(body.data.dailyLimitPerUser ?? 30)));
+    const dailyLimitRaw = Number(body.data.dailyLimitPerUser ?? 30);
+    if (!Number.isFinite(dailyLimitRaw) || dailyLimitRaw < 0 || dailyLimitRaw > 10000) {
+      return json({ error: 'dailyLimitPerUser must be a valid number between 0 and 10,000.' }, 400);
+    }
+    const dailyLimitPerUser = Math.max(0, Math.floor(dailyLimitRaw));
 
     const aiUpd = await env.DB.prepare(
       `UPDATE ai_feature_settings
@@ -565,6 +967,8 @@ export async function handleAdminRoutes(
 
   if (sub === '/countries') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'countries.manage');
+    if ('error' in auth) return auth.error;
     const [countries, currencies] = await Promise.all([
       env.DB.prepare('SELECT * FROM countries ORDER BY name ASC').all(),
       env.DB.prepare('SELECT * FROM currencies ORDER BY code ASC').all(),
@@ -574,21 +978,34 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/countries/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'countries.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const code = decodeURIComponent(sub.slice('/countries/'.length)).toUpperCase();
+    const existing = await env.DB.prepare('SELECT * FROM countries WHERE code = ?').bind(code).first<Record<string, unknown>>();
+    if (!existing) return json({ error: 'Country not found.' }, 404);
+
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
-    const isEnabled = body.data.isEnabled ? 1 : 0;
-    const shippingNotes = sanitizeText(body.data.shippingNotes || '', 300);
-    const countryUpd = await env.DB.prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ? WHERE code = ?')
-      .bind(isEnabled, shippingNotes, code)
+    const isEnabled = body.data.isEnabled !== undefined ? (body.data.isEnabled ? 1 : 0) : Number(existing.is_enabled ?? 1);
+    const shippingNotes =
+      body.data.shippingNotes !== undefined ? sanitizeText(body.data.shippingNotes, 300) : String(existing.shipping_notes || '');
+    const verificationNotes =
+      body.data.verificationNotes !== undefined
+        ? sanitizeText(body.data.verificationNotes, 300)
+        : String(existing.verification_notes || '');
+
+    await env.DB.prepare('UPDATE countries SET is_enabled = ?, shipping_notes = ?, verification_notes = ? WHERE code = ?')
+      .bind(isEnabled, shippingNotes, verificationNotes, code)
       .run();
-    if ((countryUpd.meta?.changes ?? 0) === 0) return json({ error: 'Country not found.' }, 404);
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'country.updated', 'country', code, { isEnabled }, ip);
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'country.updated', 'country', code, { isEnabled: Boolean(isEnabled) }, ip);
     return json({ updated: true });
   }
 
   if (sub === '/support') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'support.manage');
+    if ('error' in auth) return auth.error;
     const tickets = await env.DB.prepare(
       `SELECT t.*, u.display_name, u.telegram_username FROM support_tickets t
        JOIN users u ON u.id = t.user_id
@@ -599,6 +1016,9 @@ export async function handleAdminRoutes(
 
   if (sub.startsWith('/support/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'support.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const ticketId = decodeURIComponent(sub.slice('/support/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -630,18 +1050,35 @@ export async function handleAdminRoutes(
     return json({ updated: true });
   }
 
+  if (sub === '/notifications') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'notifications.manage');
+    if ('error' in auth) return auth.error;
+    const notifications = await env.DB.prepare(
+      `SELECT n.*, u.display_name as recipient_name
+       FROM notifications n LEFT JOIN users u ON u.id = n.user_id
+       WHERE n.scope = 'global' OR n.type = 'announcement'
+       ORDER BY n.created_at DESC LIMIT 80`
+    ).all();
+    return json({ notifications: notifications.results });
+  }
+
   if (sub === '/notifications/broadcast') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'notifications.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
     const title = sanitizeText(body.data.title || '', 120);
     const msgBody = sanitizeText(body.data.body || '', 600);
     if (!title || !msgBody) return json({ error: 'Title and body required.' }, 400);
 
+    const id = newId('notif');
     await env.DB.prepare(
       `INSERT INTO notifications (id, user_id, scope, type, title, body) VALUES (?, NULL, 'global', 'announcement', ?, ?)`
     )
-      .bind(newId('notif'), title, msgBody)
+      .bind(id, title, msgBody)
       .run();
 
     await env.DB.prepare(
@@ -652,36 +1089,452 @@ export async function handleAdminRoutes(
       .bind(`${title} — ${msgBody}`, admin.adminIdentifier)
       .run();
 
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'notification.broadcast', 'global', 'announcement', { title }, ip);
-    return json({ broadcast: true }, 201);
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'notification.broadcast', 'global', id, { title }, ip);
+    return json({ broadcast: true, id }, 201);
   }
 
   if (sub === '/settings') {
-    if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const [settings, roles, permissions] = await Promise.all([
-      env.DB.prepare('SELECT * FROM platform_settings ORDER BY key ASC').all(),
-      env.DB.prepare('SELECT * FROM admin_roles').all(),
-      env.DB.prepare('SELECT * FROM admin_permissions').all(),
-    ]);
-    return json({ settings: settings.results, roles: roles.results, permissions: permissions.results });
+    if (request.method === 'GET') {
+      const auth = await requireEdgeAdmin(request, env, ['settings.manage', 'rbac.manage']);
+      if ('error' in auth) return auth.error;
+      const [settings, roles, permissions, roleAssignments] = await Promise.all([
+        env.DB.prepare('SELECT * FROM platform_settings ORDER BY key ASC').all(),
+        env.DB.prepare('SELECT * FROM admin_roles ORDER BY created_at ASC').all(),
+        env.DB.prepare('SELECT * FROM admin_permissions').all(),
+        env.DB.prepare(
+          `SELECT ara.*, ar.code as role_code, ar.name as role_name, u.display_name, u.telegram_username
+           FROM admin_role_assignments ara
+           JOIN admin_roles ar ON ar.id = ara.role_id
+           LEFT JOIN users u ON u.telegram_id = ara.telegram_id
+           ORDER BY ara.created_at DESC`
+        ).all(),
+      ]);
+      return json({
+        settings: settings.results,
+        roles: roles.results,
+        permissions: permissions.results,
+        roleAssignments: roleAssignments.results,
+        permissionCatalog: ADMIN_PERMISSION_CATALOG,
+        envOwnerTelegramIds: getEnvOwnerTelegramIds(env),
+      });
+    }
+
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, 'settings.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const body = await parseJsonBody<{ updates?: Array<{ key?: string; value?: unknown }> }>(request);
+      if (!body.ok) return body.error;
+      const updates = Array.isArray(body.data.updates) ? body.data.updates : [];
+      if (!updates.length) return json({ error: 'Provide an updates array of { key, value }.' }, 400);
+
+      const validated: Array<{ key: string; value: string }> = [];
+      for (const item of updates) {
+        const key = sanitizeText(item.key || '', 80);
+        if (!key) return json({ error: 'Each update item requires a setting key.' }, 400);
+        const res = await validateAndNormalizeSetting(env.DB, key, item.value);
+        if (!res.ok) return json({ error: res.error }, res.status || 400);
+        validated.push({ key, value: res.value });
+      }
+
+      await env.DB.batch(
+        validated.map((item) =>
+          env.DB!.prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`).bind(
+            item.value,
+            admin.adminIdentifier,
+            item.key
+          )
+        )
+      );
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'settings.batch_updated',
+        'setting',
+        'batch',
+        { keys: validated.map((v) => v.key), values: Object.fromEntries(validated.map((v) => [v.key, v.value])) },
+        ip
+      );
+      return json({ updated: true, count: validated.length });
+    }
+
+    return methodNotAllowed(['GET', 'PATCH']);
   }
 
   if (sub.startsWith('/settings/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'settings.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
     const key = decodeURIComponent(sub.slice('/settings/'.length));
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
-    const value = sanitizeText(String(body.data.value ?? ''), 500);
-    const stUpd = await env.DB.prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`)
-      .bind(value, admin.adminIdentifier, key)
+
+    const validated = await validateAndNormalizeSetting(env.DB, key, body.data.value);
+    if (!validated.ok) return json({ error: validated.error }, validated.status || 400);
+
+    await env.DB.prepare(`UPDATE platform_settings SET value = ?, updated_by = ?, updated_at = datetime('now') WHERE key = ?`)
+      .bind(validated.value, admin.adminIdentifier, key)
       .run();
-    if ((stUpd.meta?.changes ?? 0) === 0) return json({ error: 'Setting not found.' }, 404);
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'setting.updated', 'setting', key, { value }, ip);
-    return json({ updated: true });
+    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'setting.updated', 'setting', key, { value: validated.value }, ip);
+    return json({ updated: true, key, value: validated.value });
+  }
+
+  // ==========================================================================
+  // DATABASE-BACKED ADMINISTRATIVE RBAC
+  // ==========================================================================
+  if (sub === '/roles') {
+    if (request.method === 'GET') {
+      const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+      if ('error' in auth) return auth.error;
+      const [roles, permissions, roleAssignments] = await Promise.all([
+        env.DB.prepare('SELECT * FROM admin_roles ORDER BY created_at ASC').all(),
+        env.DB.prepare('SELECT * FROM admin_permissions').all(),
+        env.DB.prepare(
+          `SELECT ara.*, ar.code as role_code, ar.name as role_name, u.display_name, u.telegram_username
+           FROM admin_role_assignments ara
+           JOIN admin_roles ar ON ar.id = ara.role_id
+           LEFT JOIN users u ON u.telegram_id = ara.telegram_id
+           ORDER BY ara.created_at DESC`
+        ).all(),
+      ]);
+      return json({
+        roles: roles.results,
+        permissions: permissions.results,
+        roleAssignments: roleAssignments.results,
+        permissionCatalog: ADMIN_PERMISSION_CATALOG,
+        envOwnerTelegramIds: getEnvOwnerTelegramIds(env),
+      });
+    }
+
+    if (request.method === 'POST') {
+      const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const body = await parseJsonBody<{
+        code?: string;
+        name?: string;
+        description?: string;
+        permissions?: string[];
+      }>(request);
+      if (!body.ok) return body.error;
+
+      const code = sanitizeText(body.data.code || '', 24)
+        .toUpperCase()
+        .replace(/[^A-Z0-9_]/g, '_');
+      const name = sanitizeText(body.data.name || '', 80);
+      const description = sanitizeText(body.data.description || '', 240);
+      const permissions = Array.isArray(body.data.permissions)
+        ? Array.from(new Set(body.data.permissions.map((p) => String(p).trim()).filter(Boolean)))
+        : [];
+
+      if (!code || code.length < 2 || !name) {
+        return json({ error: 'Valid role code (min 2 chars) and name are required.' }, 400);
+      }
+      for (const perm of permissions) {
+        if (!VALID_PERMISSION_KEYS.has(perm)) {
+          return json({ error: `Unknown permission key "${perm}".` }, 400);
+        }
+        if (!admin.isOwner && OWNER_ONLY_PERMISSIONS.has(perm)) {
+          return json({ error: `Only a Platform Owner can grant "${perm}".` }, 403);
+        }
+      }
+
+      const existingCode = await env.DB.prepare('SELECT id FROM admin_roles WHERE code = ?').bind(code).first();
+      if (existingCode) return json({ error: `Role code "${code}" already exists.` }, 409);
+
+      const roleId = newId('role');
+      await env.DB.prepare('INSERT INTO admin_roles (id, code, name, description) VALUES (?, ?, ?, ?)')
+        .bind(roleId, code, name, description)
+        .run();
+
+      if (permissions.length) {
+        await env.DB.batch(
+          permissions.map((perm) =>
+            env.DB!.prepare('INSERT OR IGNORE INTO admin_permissions (id, role_id, permission_key) VALUES (?, ?, ?)').bind(
+              newId('perm'),
+              roleId,
+              perm
+            )
+          )
+        );
+      }
+
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'rbac.role_created', 'admin_role', roleId, { code, name, permissions }, ip);
+      return json({ id: roleId, code, name, description, permissions }, 201);
+    }
+
+    return methodNotAllowed(['GET', 'POST']);
+  }
+
+  if (sub.startsWith('/roles/') && sub.endsWith('/permissions')) {
+    if (request.method !== 'PUT') return methodNotAllowed(['PUT']);
+    const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const roleId = decodeURIComponent(sub.slice('/roles/'.length, -'/permissions'.length));
+    const role = await env.DB.prepare('SELECT * FROM admin_roles WHERE id = ?')
+      .bind(roleId)
+      .first<{ id: string; code: string }>();
+    if (!role) return json({ error: 'Role not found.' }, 404);
+    if (role.id === 'role_owner' || role.code === 'OWNER') {
+      return json({ error: 'Platform Owner (*) permissions are immutable.' }, 403);
+    }
+
+    const body = await parseJsonBody<{ permissions?: string[] }>(request);
+    if (!body.ok) return body.error;
+    const nextPerms = Array.isArray(body.data.permissions)
+      ? Array.from(new Set(body.data.permissions.map((p) => String(p).trim()).filter(Boolean)))
+      : [];
+
+    for (const perm of nextPerms) {
+      if (!VALID_PERMISSION_KEYS.has(perm)) {
+        return json({ error: `Unknown permission key "${perm}".` }, 400);
+      }
+    }
+
+    const currentRows = await env.DB.prepare('SELECT permission_key FROM admin_permissions WHERE role_id = ?')
+      .bind(roleId)
+      .all<{ permission_key: string }>();
+    const currentSet = new Set(currentRows.results.map((r) => r.permission_key));
+
+    if (!admin.isOwner) {
+      for (const perm of nextPerms) {
+        if (OWNER_ONLY_PERMISSIONS.has(perm) && !currentSet.has(perm)) {
+          return json({ error: `Only a Platform Owner can grant "${perm}".` }, 403);
+        }
+      }
+      for (const perm of currentSet) {
+        if (OWNER_ONLY_PERMISSIONS.has(perm) && !nextPerms.includes(perm)) {
+          return json({ error: `Only a Platform Owner can revoke "${perm}".` }, 403);
+        }
+      }
+    }
+
+    await env.DB.prepare('DELETE FROM admin_permissions WHERE role_id = ?').bind(roleId).run();
+    if (nextPerms.length > 0) {
+      await env.DB.batch(
+        nextPerms.map((perm) =>
+          env.DB!.prepare('INSERT OR IGNORE INTO admin_permissions (id, role_id, permission_key) VALUES (?, ?, ?)').bind(
+            newId('perm'),
+            roleId,
+            perm
+          )
+        )
+      );
+    }
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'rbac.permissions_updated',
+      'admin_role',
+      roleId,
+      { roleCode: role.code, permissions: nextPerms },
+      ip
+    );
+    return json({ updated: true, roleId, permissions: nextPerms });
+  }
+
+  if (sub.startsWith('/roles/')) {
+    const roleId = decodeURIComponent(sub.slice('/roles/'.length));
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const role = await env.DB.prepare('SELECT * FROM admin_roles WHERE id = ?')
+        .bind(roleId)
+        .first<{ id: string; code: string; name: string; description: string }>();
+      if (!role) return json({ error: 'Role not found.' }, 404);
+      if ((role.id === 'role_owner' || role.code === 'OWNER') && !admin.isOwner) {
+        return json({ error: 'Only a Platform Owner can edit the OWNER role.' }, 403);
+      }
+      const body = await parseJsonBody<{ name?: string; description?: string }>(request);
+      if (!body.ok) return body.error;
+      const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : role.name;
+      const description = body.data.description !== undefined ? sanitizeText(body.data.description, 240) : role.description;
+      if (!name) return json({ error: 'Role name cannot be empty.' }, 400);
+      await env.DB.prepare('UPDATE admin_roles SET name = ?, description = ? WHERE id = ?')
+        .bind(name, description, roleId)
+        .run();
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'rbac.role_updated', 'admin_role', roleId, { name }, ip);
+      return json({ updated: true });
+    }
+
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      if (['role_owner', 'role_mod', 'role_ops'].includes(roleId)) {
+        return json({ error: 'Built-in system roles cannot be deleted.' }, 403);
+      }
+      const role = await env.DB.prepare('SELECT * FROM admin_roles WHERE id = ?')
+        .bind(roleId)
+        .first<{ id: string; code: string }>();
+      if (!role) return json({ error: 'Role not found.' }, 404);
+      if (!admin.isOwner && (await roleHasOwnerOnlyPermissionsEdge(env.DB, roleId))) {
+        return json({ error: 'Only a Platform Owner can delete a role holding owner-level permissions.' }, 403);
+      }
+      const assigned = await env.DB.prepare('SELECT COUNT(*) as cnt FROM admin_role_assignments WHERE role_id = ?')
+        .bind(roleId)
+        .first<{ cnt: number }>();
+      if ((assigned?.cnt ?? 0) > 0) {
+        return json({ error: 'Revoke or reassign administrators holding this role before deleting it.' }, 409);
+      }
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM admin_permissions WHERE role_id = ?').bind(roleId),
+        env.DB.prepare('DELETE FROM admin_roles WHERE id = ?').bind(roleId),
+      ]);
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'rbac.role_deleted', 'admin_role', roleId, { code: role.code }, ip);
+      return json({ deleted: true });
+    }
+
+    return methodNotAllowed(['PATCH', 'DELETE']);
+  }
+
+  if (sub === '/role-assignments') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
+    const body = await parseJsonBody<{ telegramId?: string; roleId?: string; displayLabel?: string }>(request);
+    if (!body.ok) return body.error;
+    const telegramId = String(body.data.telegramId || '').trim();
+    const roleId = sanitizeText(body.data.roleId || '', 64);
+    const displayLabel = sanitizeText(body.data.displayLabel || '', 80);
+
+    if (!/^\d{3,20}$/.test(telegramId)) {
+      return json({ error: 'Telegram ID must be a numeric Telegram user ID (3–20 digits).' }, 400);
+    }
+    if (isTelegramIdAdmin(telegramId, env.ADMIN_TELEGRAM_IDS)) {
+      return json({ error: 'This Telegram ID is already a permanent Owner configured in ADMIN_TELEGRAM_IDS.' }, 409);
+    }
+    const role = await env.DB.prepare('SELECT * FROM admin_roles WHERE id = ?')
+      .bind(roleId)
+      .first<{ id: string; code: string }>();
+    if (!role) return json({ error: 'Target admin role not found.' }, 404);
+
+    if (!admin.isOwner && (role.code === 'OWNER' || role.id === 'role_owner' || (await roleHasOwnerOnlyPermissionsEdge(env.DB, roleId)))) {
+      return json({ error: 'Only a Platform Owner can assign OWNER or owner-privileged roles.' }, 403);
+    }
+    if (!admin.isOwner && telegramId === admin.telegramId) {
+      return json({ error: 'You cannot modify your own administrative role assignment.' }, 403);
+    }
+
+    const existingAssign = await env.DB.prepare('SELECT id FROM admin_role_assignments WHERE telegram_id = ?')
+      .bind(telegramId)
+      .first();
+    if (existingAssign) {
+      return json({ error: 'An assignment already exists for this Telegram ID. Update the existing assignment instead.' }, 409);
+    }
+
+    const id = newId('assign');
+    await env.DB.prepare(
+      `INSERT INTO admin_role_assignments (id, telegram_id, role_id, display_label, is_active, assigned_by)
+       VALUES (?, ?, ?, ?, 1, ?)`
+    )
+      .bind(id, telegramId, roleId, displayLabel, admin.adminIdentifier)
+      .run();
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'rbac.assignment_created',
+      'admin_role_assignment',
+      id,
+      { telegramId, roleCode: role.code, displayLabel },
+      ip
+    );
+    return json({ id, telegramId, roleId, displayLabel, isActive: true }, 201);
+  }
+
+  if (sub.startsWith('/role-assignments/')) {
+    const assignId = decodeURIComponent(sub.slice('/role-assignments/'.length));
+    const auth = await requireEdgeAdmin(request, env, 'rbac.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
+    const existing = await env.DB.prepare(
+      `SELECT ara.*, ar.code as role_code
+       FROM admin_role_assignments ara JOIN admin_roles ar ON ar.id = ara.role_id
+       WHERE ara.id = ?`
+    )
+      .bind(assignId)
+      .first<{ id: string; telegram_id: string; role_id: string; role_code: string; display_label: string; is_active: number }>();
+    if (!existing) return json({ error: 'Role assignment not found.' }, 404);
+
+    if (!admin.isOwner && existing.telegram_id === admin.telegramId) {
+      return json({ error: 'You cannot modify or revoke your own administrative assignment.' }, 403);
+    }
+    if (
+      !admin.isOwner &&
+      (existing.role_code === 'OWNER' || existing.role_id === 'role_owner' || (await roleHasOwnerOnlyPermissionsEdge(env.DB, existing.role_id)))
+    ) {
+      return json({ error: 'Only a Platform Owner can manage OWNER-level assignments.' }, 403);
+    }
+
+    if (request.method === 'PATCH') {
+      const body = await parseJsonBody<{ roleId?: string; isActive?: boolean; displayLabel?: string }>(request);
+      if (!body.ok) return body.error;
+      const nextRoleId = body.data.roleId !== undefined ? sanitizeText(body.data.roleId, 64) : existing.role_id;
+      const nextIsActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : existing.is_active;
+      const nextLabel =
+        body.data.displayLabel !== undefined ? sanitizeText(body.data.displayLabel, 80) : existing.display_label;
+
+      const targetRole = await env.DB.prepare('SELECT id, code FROM admin_roles WHERE id = ?')
+        .bind(nextRoleId)
+        .first<{ id: string; code: string }>();
+      if (!targetRole) return json({ error: 'Target admin role not found.' }, 404);
+      if (
+        !admin.isOwner &&
+        (targetRole.code === 'OWNER' || targetRole.id === 'role_owner' || (await roleHasOwnerOnlyPermissionsEdge(env.DB, nextRoleId)))
+      ) {
+        return json({ error: 'Only a Platform Owner can assign OWNER-level roles.' }, 403);
+      }
+
+      await env.DB.prepare(
+        `UPDATE admin_role_assignments
+         SET role_id = ?, is_active = ?, display_label = ?, assigned_by = ?, updated_at = datetime('now')
+         WHERE id = ?`
+      )
+        .bind(nextRoleId, nextIsActive, nextLabel, admin.adminIdentifier, assignId)
+        .run();
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'rbac.assignment_updated',
+        'admin_role_assignment',
+        assignId,
+        { telegramId: existing.telegram_id, roleCode: targetRole.code, isActive: Boolean(nextIsActive) },
+        ip
+      );
+      return json({ updated: true });
+    }
+
+    if (request.method === 'DELETE') {
+      await env.DB.prepare('DELETE FROM admin_role_assignments WHERE id = ?').bind(assignId).run();
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'rbac.assignment_revoked',
+        'admin_role_assignment',
+        assignId,
+        { telegramId: existing.telegram_id, roleCode: existing.role_code },
+        ip
+      );
+      return json({ deleted: true });
+    }
+
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/audit-logs') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'audit.view');
+    if ('error' in auth) return auth.error;
     const logs = await env.DB.prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 150').all();
     return json({ logs: logs.results });
   }

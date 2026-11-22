@@ -82,7 +82,7 @@ async function runTests() {
     assert.ok(!serverAi.includes('@google/genai'));
     assert.ok(wrangler.includes('"binding": "AI"') && wrangler.includes('"binding": "DB"'));
     assert.ok(!wrangler.includes('r2_buckets'));
-    assert.ok(wrangler.includes('@cf/meta/llama-3.1-8b-instruct'));
+    assert.ok(wrangler.includes('@cf/meta/llama-3.1-8b-instruct-fast'));
 
     for (const content of [wrangler, envEx, devVarsEx, workerSrc]) {
       assert.ok(!content.includes('TELEGRAM_BOT_NAME'));
@@ -199,7 +199,7 @@ async function runTests() {
       TELEGRAM_WEBHOOK_SECRET: 'wh_secret',
       JWT_SECRET: jwtSecret,
       ADMIN_TELEGRAM_IDS: '999001',
-      CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct',
+      CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct-fast',
     };
 
     const runSuffix = Number(crypto.randomInt(100000, 899999));
@@ -635,6 +635,83 @@ async function runTests() {
       .get(createdProductId) as { rating_avg: number; review_count: number };
     assert.equal(prodRatingAfterHide.review_count, 0);
     assert.equal(prodRatingAfterHide.rating_avg, 0);
+
+    // 10. Active Cloudflare Workers AI model list + Settings validation + DB RBAC enforcement
+    const aiCfgRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/ai', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(aiCfgRes.status, 200);
+    const aiCfgJson = (await aiCfgRes.json()) as {
+      defaultModel: string;
+      availableModels: string[];
+      features: Array<{ model_name: string }>;
+    };
+    assert.equal(aiCfgJson.defaultModel, '@cf/meta/llama-3.1-8b-instruct-fast');
+    assert.ok(aiCfgJson.availableModels.includes('@cf/meta/llama-3.1-8b-instruct-fast'));
+    assert.ok(!aiCfgJson.availableModels.includes('@cf/meta/llama-3.1-8b-instruct'));
+
+    const badSettingRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/settings/stars_per_usd', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ value: '0' }),
+      }),
+      mockEnv
+    );
+    assert.equal(badSettingRes.status, 400);
+
+    const goodSettingRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ updates: [{ key: 'stars_per_usd', value: '55' }] }),
+      }),
+      mockEnv
+    );
+    assert.equal(goodSettingRes.status, 200);
+
+    // Assign MODERATOR role to intruderInit user (3000000 + runSuffix)
+    const modTgId = String(3000000 + runSuffix);
+    const assignRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/role-assignments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ telegramId: modTgId, roleId: 'role_mod', displayLabel: 'Test Mod' }),
+      }),
+      mockEnv
+    );
+    assert.equal(assignRes.status, 201);
+    const assignJson = (await assignRes.json()) as { id: string };
+
+    const modAuth = await authCall(intruderInit);
+    assert.equal(modAuth.isAdmin, true);
+
+    const modAllowed = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/reports', {
+        headers: { Authorization: `Bearer ${modAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(modAllowed.status, 200);
+
+    const modBlocked = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/settings', {
+        headers: { Authorization: `Bearer ${modAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(modBlocked.status, 403);
+
+    await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/role-assignments/${assignJson.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
   });
 
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);

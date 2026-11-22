@@ -1001,4 +1001,293 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     await waitOnExecutionContext(okCtx);
     expect(okRes.status).toBe(200);
   });
+
+  it('15. Deprecated Cloudflare Workers AI models auto-upgrade and /api/admin/ai enforces active models', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    // Simulate legacy D1 rows stuck on deprecated @cf/meta/llama-3.1-8b-instruct
+    await env.DB.prepare("UPDATE ai_feature_settings SET model_name = '@cf/meta/llama-3.1-8b-instruct' WHERE feature_key = 'buyer_search'").run();
+    resetD1BootstrapCacheForTests();
+    await ensureD1Schema(env.DB);
+
+    const upgraded = await env.DB.prepare("SELECT model_name FROM ai_feature_settings WHERE feature_key = 'buyer_search'").first();
+    expect(upgraded?.model_name).toBe('@cf/meta/llama-3.1-8b-instruct-fast');
+
+    const ownerInit = await signTelegramInitData({ id: 999001, first_name: 'Owner', username: 'owner_ai' }, testEnv.TELEGRAM_BOT_TOKEN);
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: ownerInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    // GET /api/admin/ai exposes active models
+    const aiCtx = createExecutionContext();
+    const aiRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/ai', {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      testEnv,
+      aiCtx
+    );
+    await waitOnExecutionContext(aiCtx);
+    expect(aiRes.status).toBe(200);
+    const aiJson = await aiRes.json();
+    expect(aiJson.defaultModel).toBe('@cf/meta/llama-3.1-8b-instruct-fast');
+    expect(aiJson.availableModels).toContain('@cf/meta/llama-3.1-8b-instruct-fast');
+    expect(aiJson.availableModels).not.toContain('@cf/meta/llama-3.1-8b-instruct');
+
+    // Rejects deprecated model on PATCH
+    const badCtx = createExecutionContext();
+    const badRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/ai/features/buyer_search', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ isEnabled: true, modelName: '@cf/meta/llama-3.1-8b-instruct', dailyLimitPerUser: 40 }),
+      }),
+      testEnv,
+      badCtx
+    );
+    await waitOnExecutionContext(badCtx);
+    expect(badRes.status).toBe(400);
+
+    // Accepts supported model on PATCH
+    const goodCtx = createExecutionContext();
+    const goodRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/ai/features/buyer_search', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ isEnabled: true, modelName: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', dailyLimitPerUser: 50 }),
+      }),
+      testEnv,
+      goodCtx
+    );
+    await waitOnExecutionContext(goodCtx);
+    expect(goodRes.status).toBe(200);
+  });
+
+  it('16. Admin Settings enforces typed validation and Plan/Stars pricing updates persist', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const ownerInit = await signTelegramInitData({ id: 999001, first_name: 'Owner', username: 'owner_settings' }, testEnv.TELEGRAM_BOT_TOKEN);
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: ownerInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    // Rejects invalid boolean & invalid stars_per_usd
+    const badBoolCtx = createExecutionContext();
+    const badBool = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/settings/auto_approve_products', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ value: 'maybe' }),
+      }),
+      testEnv,
+      badBoolCtx
+    );
+    await waitOnExecutionContext(badBoolCtx);
+    expect(badBool.status).toBe(400);
+
+    // Batch update settings persists cleanly
+    const batchCtx = createExecutionContext();
+    const batchRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          updates: [
+            { key: 'stars_per_usd', value: '60' },
+            { key: 'prohibited_keywords', value: 'Scam, Counterfeit, Fraud ' },
+            { key: 'featured_product_price_7d', value: '12.5' },
+          ],
+        }),
+      }),
+      testEnv,
+      batchCtx
+    );
+    await waitOnExecutionContext(batchCtx);
+    expect(batchRes.status).toBe(200);
+
+    const kwRow = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'prohibited_keywords'").first();
+    expect(kwRow?.value).toBe('scam, counterfeit, fraud');
+
+    // Update plan + Stars XTR pricing
+    const planCtx = createExecutionContext();
+    const planRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/plans/plan_pro', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          monthlyPrice: 24,
+          annualPrice: 240,
+          starsMonthly: 1200,
+          starsAnnual: 12000,
+          maxProducts: 150,
+          aiDailyLimit: 250,
+          featuredSlots: 4,
+          promotionalDiscountPct: 20,
+        }),
+      }),
+      testEnv,
+      planCtx
+    );
+    await waitOnExecutionContext(planCtx);
+    expect(planRes.status).toBe(200);
+
+    const starsRow = await env.DB.prepare("SELECT stars_monthly, stars_annual FROM subscription_plan_stars WHERE plan_id = 'plan_pro'").first();
+    expect(Number(starsRow?.stars_monthly)).toBe(1200);
+    expect(Number(starsRow?.stars_annual)).toBe(12000);
+  });
+
+  it('17. Database-backed Admin RBAC grants scoped permissions, blocks escalation, and revokes immediately', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const loginByTg = async (tgId, username) => {
+      const initData = await signTelegramInitData({ id: tgId, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return res.json();
+    };
+
+    const ownerAuth = await loginByTg(999001, 'rbac_owner');
+    const staffTgId = '750001';
+
+    // Create custom role scoped ONLY to analytics.view & support.manage
+    const createRoleCtx = createExecutionContext();
+    const createRoleRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAuth.token}` },
+        body: JSON.stringify({
+          code: 'SUPPORT_ANALYST',
+          name: 'Support Analyst',
+          description: 'Handles support tickets and reviews analytics only.',
+          permissions: ['support.manage', 'analytics.view'],
+        }),
+      }),
+      testEnv,
+      createRoleCtx
+    );
+    await waitOnExecutionContext(createRoleCtx);
+    expect(createRoleRes.status).toBe(201);
+    const createdRole = await createRoleRes.json();
+
+    // Assign custom role to Telegram ID 750001
+    const assignCtx = createExecutionContext();
+    const assignRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/role-assignments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAuth.token}` },
+        body: JSON.stringify({ telegramId: staffTgId, roleId: createdRole.id, displayLabel: 'Support Staff' }),
+      }),
+      testEnv,
+      assignCtx
+    );
+    await waitOnExecutionContext(assignCtx);
+    expect(assignRes.status).toBe(201);
+    const assignment = await assignRes.json();
+
+    // Staff user authenticates via Telegram and is recognized as admin with scoped role
+    const staffAuth = await loginByTg(750001, 'support_staff');
+    expect(staffAuth.isAdmin).toBe(true);
+
+    // Allowed endpoints -> 200
+    for (const allowedPath of ['/api/admin/auth/me', '/api/admin/support', '/api/admin/analytics']) {
+      const ctx = createExecutionContext();
+      const r = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${allowedPath}`, {
+          headers: { Authorization: `Bearer ${staffAuth.token}` },
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      expect(r.status).toBe(200);
+    }
+
+    // Disallowed endpoints (settings, AI, RBAC, users) -> 403
+    for (const blockedPath of ['/api/admin/settings', '/api/admin/ai', '/api/admin/roles', '/api/admin/users']) {
+      const ctx = createExecutionContext();
+      const r = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${blockedPath}`, {
+          headers: { Authorization: `Bearer ${staffAuth.token}` },
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      expect(r.status).toBe(403);
+    }
+
+    // Deactivate assignment -> immediate revocation of admin endpoints & auth
+    const deactCtx = createExecutionContext();
+    const deactRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/admin/role-assignments/${assignment.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAuth.token}` },
+        body: JSON.stringify({ isActive: false }),
+      }),
+      testEnv,
+      deactCtx
+    );
+    await waitOnExecutionContext(deactCtx);
+    expect(deactRes.status).toBe(200);
+
+    const revokedCtx = createExecutionContext();
+    const revokedRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/support', {
+        headers: { Authorization: `Bearer ${staffAuth.token}` },
+      }),
+      testEnv,
+      revokedCtx
+    );
+    await waitOnExecutionContext(revokedCtx);
+    expect(revokedRes.status).toBe(403);
+
+    const staffRelogin = await loginByTg(750001, 'support_staff');
+    expect(staffRelogin.isAdmin).toBe(false);
+  });
 });
+

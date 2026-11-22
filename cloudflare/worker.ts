@@ -7,18 +7,20 @@ import {
   type ExecutionContextLike,
   type TelegramPreCheckoutQuery,
   type TelegramSuccessfulPayment,
+  DEFAULT_CF_AI_MODEL,
+  VALID_CF_MODELS,
   checkEdgeRateLimit,
   fulfillStarsPreCheckoutEdge,
   fulfillStarsSuccessfulPaymentEdge,
   getTelegramBotInfoEdge,
   hashSessionIdentifier,
   html,
-  isTelegramIdAdmin,
   json,
   methodNotAllowed,
   newId,
   parseJsonBody,
   requireEdgeUser,
+  resolveEdgeAdminContext,
   resolveEdgeUserSession,
   sanitizeSafeUrl,
   sanitizeText,
@@ -256,7 +258,8 @@ async function handleAuthRoutes(
       );
       const tgUser = verified.user;
       const tgId = String(tgUser.id);
-      const isAdmin = isTelegramIdAdmin(tgId, env.ADMIN_TELEGRAM_IDS);
+      const adminCtx = await resolveEdgeAdminContext(env, tgId);
+      const isAdmin = Boolean(adminCtx);
 
       const existing = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?')
         .bind(tgId)
@@ -498,7 +501,9 @@ export default {
           slogan: 'BUY SMARTER. SELL FASTER.',
           runtime: 'cloudflare-workers',
           aiProvider: 'cloudflare-workers-ai',
-          aiModel: env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct',
+          aiModel: VALID_CF_MODELS.has(env.CLOUDFLARE_AI_MODEL || '')
+            ? env.CLOUDFLARE_AI_MODEL
+            : DEFAULT_CF_AI_MODEL,
           telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
           dbBound: Boolean(env.DB),
           dbInitialized,

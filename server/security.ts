@@ -5,12 +5,42 @@ import { db, newId } from './db.ts';
 // Runtime-ephemeral secret fallback only for local non-production dev when JWT_SECRET is omitted.
 const EPHEMERAL_DEV_SECRET = crypto.randomBytes(32).toString('hex');
 
+export const DEFAULT_CF_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-fast';
+
 export const VALID_CF_MODELS = new Set([
-  '@cf/meta/llama-3.1-8b-instruct',
+  '@cf/meta/llama-3.1-8b-instruct-fast',
   '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/qwen/qwen2.5-7b-instruct',
-  '@cf/mistral/mistral-7b-instruct-v0.2',
+  '@cf/meta/llama-4-scout-17b-16e-instruct',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
+  '@cf/mistralai/mistral-small-3.1-24b-instruct',
 ]);
+
+export const ADMIN_PERMISSION_CATALOG = [
+  { key: '*', label: 'Full Platform Owner', description: 'Unrestricted access to every system capability and RBAC management' },
+  { key: 'overview.view', label: 'Dashboard Overview', description: 'View marketplace KPIs and operational counters' },
+  { key: 'analytics.view', label: 'Marketplace Analytics', description: 'View catalog, order, revenue, and AI telemetry breakdowns' },
+  { key: 'users.manage', label: 'Users & Per-User AI Access', description: 'Restrict or suspend users and override per-user AI quotas' },
+  { key: 'sellers.manage', label: 'Sellers & Verification', description: 'Approve shop verifications, feature shops, and manage seller profiles' },
+  { key: 'sellers.suspend', label: 'Seller Suspension', description: 'Suspend or reactivate seller profiles and storefronts' },
+  { key: 'shops.manage', label: 'Shops Governance', description: 'Manage public storefronts and featured status' },
+  { key: 'moderation.manage', label: 'Product Moderation & AI Scan', description: 'Approve, reject, feature, or AI-scan marketplace listings' },
+  { key: 'catalog.manage', label: 'Categories & Subcategories', description: 'Create, rename, and toggle marketplace categories' },
+  { key: 'orders.manage', label: 'Orders & Disputes', description: 'Inspect marketplace orders and disputed transactions' },
+  { key: 'reports.manage', label: 'Abuse Reports', description: 'Investigate and resolve user/listing reports' },
+  { key: 'reviews.manage', label: 'Reviews Moderation', description: 'Publish, hide, or remove marketplace product reviews' },
+  { key: 'messages.moderate', label: 'Message Investigation', description: 'Inspect flagged buyer-seller conversations' },
+  { key: 'monetization.manage', label: 'Subscriptions, Promos & Revenue', description: 'Edit plans, Stars pricing, promotions, and inspect ledgers' },
+  { key: 'ai.manage', label: 'AI Model & Feature Control', description: 'Configure active Cloudflare Workers AI models and daily limits' },
+  { key: 'countries.manage', label: 'Countries & Currencies', description: 'Toggle supported countries and edit shipping/verification notes' },
+  { key: 'support.manage', label: 'Support Tickets', description: 'Respond to and resolve user support requests' },
+  { key: 'notifications.manage', label: 'Global Notifications', description: 'Send announcements and inspect broadcast history' },
+  { key: 'settings.manage', label: 'Platform Settings', description: 'Edit platform switches, Stars conversion rate, promo pricing, and keywords' },
+  { key: 'rbac.manage', label: 'Admin Roles & Permissions', description: 'Manage admin roles, permissions, and Telegram ID assignments' },
+  { key: 'audit.view', label: 'Audit Logs', description: 'Inspect administrative audit trail' },
+] as const;
+
+export const VALID_PERMISSION_KEYS = new Set<string>(ADMIN_PERMISSION_CATALOG.map((p) => p.key));
+export const OWNER_ONLY_PERMISSIONS = new Set<string>(['*', 'rbac.manage', 'settings.manage', 'ai.manage']);
 
 export const PAID_ORDER_STATUSES = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'] as const;
 
@@ -250,9 +280,19 @@ export interface AuthUser {
   preferred_language: string;
   status: string;
   isAdmin: boolean;
+  adminRole?: string;
+  adminPermissions?: string[];
   roles: string[];
   sessionType: string;
   sessionId: string;
+}
+
+export interface AdminContext {
+  roleId: string;
+  roleCode: string;
+  roleName: string;
+  permissions: string[];
+  isOwner: boolean;
 }
 
 declare global {
@@ -265,6 +305,10 @@ declare global {
         telegramId: string;
         adminIdentifier: string;
         role: string;
+        roleId: string;
+        roleName: string;
+        permissions: string[];
+        isOwner: boolean;
       };
     }
   }
@@ -291,6 +335,61 @@ export function extractBearerOrCookie(req: Request, cookieName: string): string 
     }
   }
   return null;
+}
+
+export function resolveAdminContext(telegramId: string): AdminContext | null {
+  const tgId = String(telegramId || '').trim();
+  if (!/^\d+$/.test(tgId)) return null;
+
+  if (isTelegramIdAdmin(tgId)) {
+    return {
+      roleId: 'role_owner',
+      roleCode: 'OWNER',
+      roleName: 'Platform Owner',
+      permissions: ['*'],
+      isOwner: true,
+    };
+  }
+
+  try {
+    const assignment = db
+      .prepare(
+        `SELECT ara.role_id, ar.code as role_code, ar.name as role_name
+         FROM admin_role_assignments ara
+         JOIN admin_roles ar ON ar.id = ara.role_id
+         WHERE ara.telegram_id = ? AND ara.is_active = 1
+         LIMIT 1`
+      )
+      .get(tgId) as { role_id: string; role_code: string; role_name: string } | undefined;
+
+    if (!assignment) return null;
+
+    const permsRows = db
+      .prepare('SELECT permission_key FROM admin_permissions WHERE role_id = ?')
+      .all(assignment.role_id) as Array<{ permission_key: string }>;
+    const permissions = permsRows.map((p) => p.permission_key);
+    const isOwner = assignment.role_code === 'OWNER' || permissions.includes('*');
+
+    return {
+      roleId: assignment.role_id,
+      roleCode: assignment.role_code,
+      roleName: assignment.role_name,
+      permissions,
+      isOwner,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function hasAdminPermission(
+  admin: { isOwner: boolean; permissions: string[] },
+  required?: string | string[]
+): boolean {
+  if (!required) return true;
+  if (admin.isOwner || admin.permissions.includes('*')) return true;
+  const list = Array.isArray(required) ? required : [required];
+  return list.some((perm) => admin.permissions.includes(perm));
 }
 
 export function resolveUserSession(req: Request): AuthUser | null {
@@ -324,6 +423,7 @@ export function resolveUserSession(req: Request): AuthUser | null {
   const roleRows = db
     .prepare('SELECT role FROM user_roles WHERE user_id = ?')
     .all(row.id) as { role: string }[];
+  const adminCtx = resolveAdminContext(tgId);
 
   return {
     id: String(row.id),
@@ -339,7 +439,9 @@ export function resolveUserSession(req: Request): AuthUser | null {
     preferred_currency: String(row.preferred_currency || 'USD'),
     preferred_language: String(row.preferred_language || 'en'),
     status: String(row.status || 'active'),
-    isAdmin: isTelegramIdAdmin(tgId),
+    isAdmin: Boolean(adminCtx),
+    adminRole: adminCtx?.roleCode,
+    adminPermissions: adminCtx?.permissions,
     roles: roleRows.map((r) => r.role),
     sessionType: String(row.session_type || 'telegram'),
     sessionId: String(row.session_id),
@@ -376,25 +478,44 @@ export function requireSeller(req: Request, res: Response, next: NextFunction) {
   });
 }
 
+export function requireAdminPermission(requiredPermission?: string | string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    requireAuth(req, res, () => {
+      const user = req.authUser!;
+      const adminCtx = resolveAdminContext(user.telegram_id);
+      if (!adminCtx) {
+        return res.status(403).json({
+          error:
+            'Administrator privileges required. Your Telegram ID is not authorized in ADMIN_TELEGRAM_IDS or active admin role assignments.',
+        });
+      }
+      const adminSession = {
+        sessionId: user.sessionId,
+        userId: user.id,
+        telegramId: user.telegram_id,
+        adminIdentifier: user.telegram_username
+          ? `@${user.telegram_username}`
+          : user.display_name || user.telegram_id,
+        role: adminCtx.roleCode,
+        roleId: adminCtx.roleId,
+        roleName: adminCtx.roleName,
+        permissions: adminCtx.permissions,
+        isOwner: adminCtx.isOwner,
+      };
+      if (requiredPermission && !hasAdminPermission(adminSession, requiredPermission)) {
+        return res.status(403).json({
+          error: 'Insufficient administrative permissions for this operation.',
+          requiredPermission,
+        });
+      }
+      req.adminSession = adminSession;
+      next();
+    });
+  };
+}
+
 export function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  requireAuth(req, res, () => {
-    const user = req.authUser!;
-    if (!isTelegramIdAdmin(user.telegram_id)) {
-      return res.status(403).json({
-        error: 'Administrator privileges required. Your Telegram ID is not authorized in ADMIN_TELEGRAM_IDS.',
-      });
-    }
-    req.adminSession = {
-      sessionId: user.sessionId,
-      userId: user.id,
-      telegramId: user.telegram_id,
-      adminIdentifier: user.telegram_username
-        ? `@${user.telegram_username}`
-        : user.display_name || user.telegram_id,
-      role: 'super_admin',
-    };
-    next();
-  });
+  return requireAdminPermission()(req, res, next);
 }
 
 // Simple sliding-window in-memory rate limiter for API protection
