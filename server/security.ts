@@ -30,11 +30,35 @@ export const ADMIN_PERMISSION_CATALOG = [
   { key: 'notifications.manage', label: 'Global Notifications', description: 'Send announcements and inspect broadcast history' },
   { key: 'settings.manage', label: 'Platform Settings', description: 'Edit platform switches, Stars conversion rate, promo pricing, and keywords' },
   { key: 'rbac.manage', label: 'Admin Roles & Permissions', description: 'Manage admin roles, permissions, and Telegram ID assignments' },
-  { key: 'audit.view', label: 'Audit Logs', description: 'Inspect administrative audit trail' },
+  { key: 'audit.view', label: 'Audit Logs (View)', description: 'Inspect administrative audit trail' },
+  { key: 'audit.manage', label: 'Audit Logs Lifecycle', description: 'Configure retention, archive older logs, and delete eligible non-critical audit logs' },
 ] as const;
 
 export const VALID_PERMISSION_KEYS = new Set<string>(ADMIN_PERMISSION_CATALOG.map((p) => p.key));
-export const OWNER_ONLY_PERMISSIONS = new Set<string>(['*', 'rbac.manage', 'settings.manage', 'ai.manage']);
+export const OWNER_ONLY_PERMISSIONS = new Set<string>(['*', 'rbac.manage', 'settings.manage', 'ai.manage', 'audit.manage']);
+
+export function isAuditActionProtected(action: string): boolean {
+  const act = String(action || '').toLowerCase();
+  if (!act) return false;
+  if (
+    act.startsWith('audit.') ||
+    act.startsWith('rbac.') ||
+    act.startsWith('setting') ||
+    act.startsWith('plan.') ||
+    act.startsWith('ai.') ||
+    act.startsWith('shop.deleted')
+  ) {
+    return true;
+  }
+  return [
+    'user.status_updated',
+    'seller.updated',
+    'promotion.updated',
+    'notification.broadcast',
+    'notification.deleted',
+    'order.status_updated',
+  ].includes(act);
+}
 
 export const PAID_ORDER_STATUSES = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'] as const;
 
@@ -468,6 +492,12 @@ export function requireSeller(req: Request, res: Response, next: NextFunction) {
     if (seller.status === 'suspended') {
       return res.status(403).json({ error: 'Seller account is suspended.' });
     }
+    const activeShop = db
+      .prepare("SELECT id FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+      .get(seller.id);
+    if (!activeShop) {
+      return res.status(403).json({ error: 'Active shop required. Register a new storefront to manage seller tools.' });
+    }
     next();
   });
 }
@@ -669,11 +699,13 @@ export function recordAdminAudit(
   targetType: string,
   targetId: string,
   details: Record<string, unknown>,
-  ipAddress = ''
+  ipAddress = '',
+  forceProtected = false
 ) {
+  const isProtected = forceProtected || isAuditActionProtected(action) ? 1 : 0;
   db.prepare(
-    `INSERT INTO admin_audit_logs (id, admin_identifier, action, target_type, target_id, details_json, ip_address)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO admin_audit_logs (id, admin_identifier, action, target_type, target_id, details_json, ip_address, is_protected)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     newId('audit'),
     adminIdentifier,
@@ -681,6 +713,7 @@ export function recordAdminAudit(
     targetType,
     targetId,
     JSON.stringify(details),
-    ipAddress
+    ipAddress,
+    isProtected
   );
 }

@@ -1,5 +1,7 @@
 import {
+  type D1Database,
   type Env,
+  PAID_ORDER_STATUSES,
   checkEdgeRateLimit,
   checkProhibitedKeywordsEdge,
   computeStarsFromUsd,
@@ -12,6 +14,7 @@ import {
   newId,
   notifyUserAndTelegramEdge,
   parseJsonBody,
+  recordEdgeAdminAudit,
   requireEdgeSeller,
   requireEdgeUser,
   sanitizeSafeUrl,
@@ -24,6 +27,7 @@ import {
   ALLOWED_IMAGE_EXTENSIONS,
   ALLOWED_VIDEO_EXTENSIONS,
   MAX_PRODUCT_PHOTOS,
+  destroyExclusiveShopCloudinaryAssets,
   destroyUnreferencedCloudinaryAssets,
   generateCloudinarySignature,
   getCloudinaryConfigState,
@@ -32,6 +36,181 @@ import {
   validateSignRequestPayload,
   verifyUploadedCloudinaryAsset,
 } from './cloudinary.ts';
+
+export async function executeEdgeShopSoftDelete(
+  db: D1Database,
+  env: Env,
+  shop: Record<string, unknown>,
+  actorIdentifier: string,
+  reason = ''
+): Promise<
+  | { ok: true; shopId: string; archivedProductsCount: number; deletedProductsCount: number }
+  | { ok: false; status: number; error: string }
+> {
+  if (String(shop.status || '') === 'closed') {
+    return { ok: false, status: 409, error: 'Shop is already closed.' };
+  }
+
+  const shopId = String(shop.id);
+  const sellerId = String(shop.seller_id);
+  const sellerUserId = String(shop.user_id);
+  const oldLogoUrl = String(shop.logo_url || '');
+  const oldBannerUrl = String(shop.banner_url || '');
+  const cleanReason = sanitizeText(reason || '', 300);
+  const nextSlug = `${String(shop.slug || 'shop').slice(0, 60)}__del_${shopId.slice(-6)}`;
+
+  await db
+    .prepare(
+      `UPDATE shops
+       SET status = 'closed',
+           is_featured = 0,
+           verification_status = CASE WHEN verification_status = 'pending' THEN 'rejected' ELSE verification_status END,
+           logo_url = '',
+           banner_url = '',
+           slug = ?,
+           deleted_at = datetime('now'),
+           deleted_by = ?,
+           deletion_reason = ?,
+           updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .bind(nextSlug, actorIdentifier, cleanReason, shopId)
+    .run();
+
+  await db
+    .prepare(
+      `UPDATE shop_verifications
+       SET status = 'rejected', review_notes = 'Closed upon shop deletion', reviewed_at = datetime('now')
+       WHERE shop_id = ? AND status = 'pending'`
+    )
+    .bind(shopId)
+    .run();
+
+  const shopProducts = await db
+    .prepare('SELECT id FROM products WHERE shop_id = ?')
+    .bind(shopId)
+    .all<{ id: string }>();
+
+  let archivedProductsCount = 0;
+  let deletedProductsCount = 0;
+  const mediaToDestroy: Array<Record<string, unknown>> = [];
+
+  for (const prod of shopProducts.results) {
+    const productId = prod.id;
+    const [hasOrderItem, hasReview] = await Promise.all([
+      db.prepare('SELECT id FROM order_items WHERE product_id = ? LIMIT 1').bind(productId).first(),
+      db.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').bind(productId).first(),
+    ]);
+
+    if (hasOrderItem || hasReview) {
+      await db.batch([
+        db.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(productId),
+        db
+          .prepare(
+            "UPDATE products SET status = 'archived', is_featured = 0, is_sponsored = 0, updated_at = datetime('now') WHERE id = ?"
+          )
+          .bind(productId),
+      ]);
+      archivedProductsCount++;
+    } else {
+      const [prodMedia, digitalAsset] = await Promise.all([
+        db
+          .prepare('SELECT public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+          .bind(productId)
+          .all<Record<string, unknown>>(),
+        db
+          .prepare('SELECT storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?')
+          .bind(productId)
+          .first<{ storage_provider: string; storage_key: string }>(),
+      ]);
+
+      mediaToDestroy.push(...prodMedia.results);
+      if (digitalAsset?.storage_provider === 'r2' && digitalAsset.storage_key && env.MEDIA_BUCKET?.delete) {
+        try {
+          await env.MEDIA_BUCKET.delete(digitalAsset.storage_key);
+        } catch {
+          // Non-fatal R2 cleanup failure
+        }
+      }
+
+      await db.batch([
+        db.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').bind(productId),
+        db.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM inquiries WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_variants WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_media WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_images WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM product_inventory WHERE product_id = ?').bind(productId),
+        db.prepare('DELETE FROM products WHERE id = ?').bind(productId),
+      ]);
+      deletedProductsCount++;
+    }
+  }
+
+  await db
+    .prepare(
+      `UPDATE telegram_stars_payments
+       SET status = 'cancelled', updated_at = datetime('now')
+       WHERE target_type = 'promotion'
+         AND status = 'pending'
+         AND target_id IN (SELECT id FROM promotions WHERE shop_id = ? AND status = 'pending')`
+    )
+    .bind(shopId)
+    .run();
+
+  await db
+    .prepare(
+      `UPDATE promotions
+       SET status = CASE WHEN status = 'pending' THEN 'rejected' ELSE 'paused' END
+       WHERE shop_id = ? AND status IN ('pending', 'active')`
+    )
+    .bind(shopId)
+    .run();
+
+  const remainingShop = await db
+    .prepare("SELECT COUNT(*) as cnt FROM shops WHERE seller_id = ? AND status != 'closed'")
+    .bind(sellerId)
+    .first<{ cnt: number }>();
+
+  if ((remainingShop?.cnt ?? 0) === 0) {
+    await db
+      .prepare("UPDATE subscriptions SET status = 'cancelled' WHERE seller_id = ? AND status IN ('active', 'pending_payment')")
+      .bind(sellerId)
+      .run();
+    await db
+      .prepare(
+        "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE user_id = ? AND target_type = 'subscription' AND status = 'pending'"
+      )
+      .bind(sellerUserId)
+      .run();
+    await db
+      .prepare(
+        `UPDATE seller_profiles
+         SET verification_status = CASE WHEN verification_status = 'pending' THEN 'unverified' ELSE verification_status END,
+             updated_at = datetime('now')
+         WHERE id = ?`
+      )
+      .bind(sellerId)
+      .run();
+  }
+
+  if (mediaToDestroy.length > 0) {
+    await destroyUnreferencedCloudinaryAssets(db, env, mediaToDestroy);
+  }
+  await destroyExclusiveShopCloudinaryAssets(db, env, [oldLogoUrl, oldBannerUrl]);
+
+  return {
+    ok: true,
+    shopId,
+    archivedProductsCount,
+    deletedProductsCount,
+  };
+}
 
 async function resolveSubmittedProductMedia(options: {
   env: Env;
@@ -361,11 +540,21 @@ export async function handleSellerRoutes(
     }
 
     const user = auth.user;
-    const existing = await env.DB.prepare('SELECT id FROM seller_profiles WHERE user_id = ?')
+    const existingSeller = await env.DB.prepare('SELECT id, status FROM seller_profiles WHERE user_id = ?')
       .bind(user.id)
-      .first();
-    if (existing) {
-      return json({ error: 'You already have a registered seller profile.' }, 409);
+      .first<{ id: string; status: string }>();
+    if (existingSeller) {
+      if (existingSeller.status === 'suspended') {
+        return json({ error: 'Seller account is suspended.' }, 403);
+      }
+      const existingActiveShop = await env.DB.prepare(
+        "SELECT id FROM shops WHERE seller_id = ? AND status != 'closed' LIMIT 1"
+      )
+        .bind(existingSeller.id)
+        .first();
+      if (existingActiveShop) {
+        return json({ error: 'You already have a registered seller profile and shop.' }, 409);
+      }
     }
 
     const sellerType = body.data.sellerType === 'business' ? 'business' : 'individual';
@@ -399,18 +588,30 @@ export async function handleSellerRoutes(
     }
     const resolvedCurrency = validCurrency?.code || validCountry.default_currency || 'USD';
 
-    const sellerId = newId('sel');
+    const sellerId = existingSeller ? existingSeller.id : newId('sel');
     const shopId = newId('shop');
     const baseSlug = slugify(shopName);
     const slugConflict = await env.DB.prepare('SELECT id FROM shops WHERE slug = ?').bind(baseSlug).first();
     const shopSlug = slugConflict ? `${baseSlug}-${shopId.slice(-5)}` : baseSlug;
 
-    await env.DB.prepare(
-      `INSERT INTO seller_profiles (id, user_id, seller_type, legal_name, business_registration_no, country_code, contact_email, contact_phone, contact_telegram)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(sellerId, user.id, sellerType, legalName, businessRegistrationNo, countryCode, contactEmail, contactPhone, contactTelegram)
-      .run();
+    if (existingSeller) {
+      await env.DB.prepare(
+        `UPDATE seller_profiles
+         SET seller_type = ?, legal_name = ?, business_registration_no = ?, country_code = ?,
+             contact_email = ?, contact_phone = ?, contact_telegram = ?, verification_status = 'unverified',
+             updated_at = datetime('now')
+         WHERE id = ?`
+      )
+        .bind(sellerType, legalName, businessRegistrationNo, countryCode, contactEmail, contactPhone, contactTelegram, sellerId)
+        .run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO seller_profiles (id, user_id, seller_type, legal_name, business_registration_no, country_code, contact_email, contact_phone, contact_telegram)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(sellerId, user.id, sellerType, legalName, businessRegistrationNo, countryCode, contactEmail, contactPhone, contactTelegram)
+        .run();
+    }
 
     await env.DB.prepare(
       `INSERT INTO shops (id, seller_id, user_id, slug, name, description, country_code, logo_url, banner_url, default_currency)
@@ -445,10 +646,7 @@ export async function handleSellerRoutes(
     const auth = await requireEdgeSeller(request, env);
     if ('error' in auth) return auth.error;
     const sellerProfile = auth.seller;
-    const shop = await env.DB.prepare('SELECT * FROM shops WHERE seller_id = ?')
-      .bind(sellerProfile.id)
-      .first<Record<string, unknown>>();
-    if (!shop) return json({ error: 'Shop not found.' }, 404);
+    const shop = auth.shop;
 
     const [subscription, stats, promotions, verifications, starsPayments] = await Promise.all([
       getActiveSubscriptionEdge(env.DB, { sellerId: String(sellerProfile.id) }),
@@ -495,16 +693,72 @@ export async function handleSellerRoutes(
   }
 
   if (sub === '/shop') {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeSeller(request, env);
+      if ('error' in auth) return auth.error;
+      const shop = auth.shop;
+
+      const rawText = await request.text();
+      let bodyData: Record<string, unknown> = {};
+      if (rawText.trim()) {
+        try {
+          bodyData = JSON.parse(rawText) as Record<string, unknown>;
+        } catch {
+          return json({ error: 'Invalid JSON request body.' }, 400);
+        }
+      }
+
+      const confirmShopName = sanitizeText(bodyData.confirmShopName ?? '', 100);
+      const explicitConfirm = bodyData.confirm === true;
+      const reason = sanitizeText(bodyData.reason ?? '', 300);
+
+      if (confirmShopName) {
+        if (confirmShopName.toLowerCase() !== String(shop.name || '').trim().toLowerCase()) {
+          return json({ error: `Confirmation failed. Type "${String(shop.name)}" to delete your shop.` }, 400);
+        }
+      } else if (!explicitConfirm) {
+        return json({ error: `Type "${String(shop.name)}" to confirm shop deletion.` }, 400);
+      }
+
+      const actorIdentifier = auth.user.telegram_username
+        ? `@${auth.user.telegram_username}`
+        : auth.user.display_name || auth.user.id;
+      const result = await executeEdgeShopSoftDelete(env.DB, env, shop, actorIdentifier, reason);
+      if (result.ok === false) {
+        return json({ error: result.error }, result.status);
+      }
+
+      await recordEdgeAdminAudit(
+        env,
+        actorIdentifier,
+        'shop.deleted_by_owner',
+        'shop',
+        result.shopId,
+        {
+          shopName: shop.name,
+          reason,
+          archivedProductsCount: result.archivedProductsCount,
+          deletedProductsCount: result.deletedProductsCount,
+        },
+        request.headers.get('CF-Connecting-IP') || '',
+        true
+      );
+
+      return json({
+        deleted: true,
+        shopId: result.shopId,
+        archivedProductsCount: result.archivedProductsCount,
+        deletedProductsCount: result.deletedProductsCount,
+      });
+    }
+
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH', 'DELETE']);
     const auth = await requireEdgeSeller(request, env);
     if ('error' in auth) return auth.error;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
-    const shop = await env.DB.prepare('SELECT * FROM shops WHERE user_id = ?')
-      .bind(auth.user.id)
-      .first<Record<string, unknown>>();
-    if (!shop) return json({ error: 'Shop not found.' }, 404);
+    const shop = auth.shop;
 
     if (
       (body.data.logoUrl !== undefined && !isSafeUrlOrEmpty(body.data.logoUrl, 300)) ||
@@ -548,10 +802,7 @@ export async function handleSellerRoutes(
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
-    const shop = await env.DB.prepare('SELECT * FROM shops WHERE seller_id = ?')
-      .bind(auth.seller.id)
-      .first<Record<string, unknown>>();
-    if (!shop) return json({ error: 'Shop not found.' }, 404);
+    const shop = auth.shop;
 
     const documentType = sanitizeText(body.data.documentType || '', 60);
     const documentReference = sanitizeText(body.data.documentReference || '', 200);
@@ -591,9 +842,9 @@ export async function handleSellerRoutes(
                 EXISTS(SELECT 1 FROM product_digital_assets da WHERE da.product_id = p.id) as has_digital_package
          FROM products p JOIN categories c ON c.id = p.category_id
          LEFT JOIN product_inventory inv ON inv.product_id = p.id
-         WHERE p.seller_user_id = ? ORDER BY p.updated_at DESC`
+         WHERE p.seller_user_id = ? AND p.shop_id = ? ORDER BY p.updated_at DESC`
       )
-        .bind(auth.user.id)
+        .bind(auth.user.id, auth.shop.id)
         .all();
       return json({ products: products.results });
     }
@@ -612,9 +863,7 @@ export async function handleSellerRoutes(
       }
 
       const userId = auth.user.id;
-      const shop = await env.DB.prepare('SELECT * FROM shops WHERE user_id = ?')
-        .bind(userId)
-        .first<Record<string, unknown>>();
+      const shop = auth.shop;
       if (!shop || shop.status !== 'active') {
         return json({ error: 'Active shop required to publish products.' }, 403);
       }
@@ -961,7 +1210,48 @@ export async function handleSellerRoutes(
       return json({ asset: saved }, 201);
     }
 
-    return methodNotAllowed(['GET', 'POST']);
+    if (request.method === 'DELETE') {
+      const existingAsset = await env.DB.prepare(
+        'SELECT id, storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?'
+      )
+        .bind(productId)
+        .first<{ id: string; storage_provider: string; storage_key: string }>();
+      if (!existingAsset) {
+        return json({ error: 'No digital delivery package is configured for this product.' }, 404);
+      }
+
+      const paidStatusesSql = PAID_ORDER_STATUSES.map(() => '?').join(', ');
+      const paidOrder = await env.DB.prepare(
+        `SELECT o.id FROM orders o
+         JOIN order_items oi ON oi.order_id = o.id
+         WHERE oi.product_id = ? AND o.status IN (${paidStatusesSql})
+         LIMIT 1`
+      )
+        .bind(productId, ...PAID_ORDER_STATUSES)
+        .first();
+      if (paidOrder) {
+        return json(
+          { error: 'Cannot delete the digital delivery package after confirmed/paid orders exist for this listing.' },
+          409
+        );
+      }
+
+      if (existingAsset.storage_provider === 'r2' && existingAsset.storage_key && env.MEDIA_BUCKET?.delete) {
+        try {
+          await env.MEDIA_BUCKET.delete(existingAsset.storage_key);
+        } catch {
+          // Non-fatal R2 cleanup failure
+        }
+      }
+
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').bind(productId),
+        env.DB.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').bind(productId),
+      ]);
+      return json({ deleted: true });
+    }
+
+    return methodNotAllowed(['GET', 'POST', 'DELETE']);
   }
 
   if (sub.startsWith('/products/') && sub.endsWith('/media/reorder')) {
@@ -1793,10 +2083,7 @@ export async function handleSellerRoutes(
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
-    const shop = await env.DB.prepare('SELECT * FROM shops WHERE user_id = ?')
-      .bind(auth.user.id)
-      .first<Record<string, unknown>>();
-    if (!shop) return json({ error: 'Shop not found.' }, 404);
+    const shop = auth.shop;
 
     const promoType = String(body.data.promoType || 'featured_product');
     const productId = sanitizeText(body.data.productId || '', 64) || null;
@@ -1857,10 +2144,7 @@ export async function handleSellerRoutes(
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
 
-    const shop = await env.DB.prepare('SELECT * FROM shops WHERE user_id = ?')
-      .bind(auth.user.id)
-      .first<Record<string, unknown>>();
-    if (!shop) return json({ error: 'Shop not found.' }, 404);
+    const shop = auth.shop;
 
     const promoType = String(body.data.promoType || 'featured_product');
     const productId = sanitizeText(body.data.productId || '', 64) || null;
@@ -1964,6 +2248,28 @@ export async function handleSellerRoutes(
       },
       201
     );
+  }
+
+  if (sub.startsWith('/promotions/') && sub !== '/promotions/invoice') {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeSeller(request, env);
+    if ('error' in auth) return auth.error;
+    const promoId = decodeURIComponent(sub.slice('/promotions/'.length));
+    const promo = await env.DB.prepare('SELECT * FROM promotions WHERE id = ? AND user_id = ?')
+      .bind(promoId, auth.user.id)
+      .first<Record<string, unknown>>();
+    if (!promo) return json({ error: 'Promotion not found or unauthorized.' }, 404);
+    if (promo.status !== 'pending') {
+      return json({ error: 'Only pending promotions can be cancelled and removed.' }, 409);
+    }
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE target_type = 'promotion' AND target_id = ? AND status = 'pending'"
+      ).bind(promoId),
+      env.DB.prepare('DELETE FROM promotion_transactions WHERE promotion_id = ?').bind(promoId),
+      env.DB.prepare('DELETE FROM promotions WHERE id = ? AND user_id = ?').bind(promoId, auth.user.id),
+    ]);
+    return json({ deleted: true, promotionId: promoId });
   }
 
   if (sub === '/payments') {

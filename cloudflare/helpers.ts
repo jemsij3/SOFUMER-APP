@@ -88,11 +88,35 @@ export const ADMIN_PERMISSION_CATALOG = [
   { key: 'notifications.manage', label: 'Global Notifications', description: 'Send announcements and inspect broadcast history' },
   { key: 'settings.manage', label: 'Platform Settings', description: 'Edit platform switches, Stars conversion rate, promo pricing, and keywords' },
   { key: 'rbac.manage', label: 'Admin Roles & Permissions', description: 'Manage admin roles, permissions, and Telegram ID assignments' },
-  { key: 'audit.view', label: 'Audit Logs', description: 'Inspect administrative audit trail' },
+  { key: 'audit.view', label: 'Audit Logs (View)', description: 'Inspect administrative audit trail' },
+  { key: 'audit.manage', label: 'Audit Logs Lifecycle', description: 'Configure retention, archive older logs, and delete eligible non-critical audit logs' },
 ] as const;
 
 export const VALID_PERMISSION_KEYS = new Set<string>(ADMIN_PERMISSION_CATALOG.map((p) => p.key));
-export const OWNER_ONLY_PERMISSIONS = new Set<string>(['*', 'rbac.manage', 'settings.manage', 'ai.manage']);
+export const OWNER_ONLY_PERMISSIONS = new Set<string>(['*', 'rbac.manage', 'settings.manage', 'ai.manage', 'audit.manage']);
+
+export function isAuditActionProtected(action: string): boolean {
+  const act = String(action || '').toLowerCase();
+  if (!act) return false;
+  if (
+    act.startsWith('audit.') ||
+    act.startsWith('rbac.') ||
+    act.startsWith('setting') ||
+    act.startsWith('plan.') ||
+    act.startsWith('ai.') ||
+    act.startsWith('shop.deleted')
+  ) {
+    return true;
+  }
+  return [
+    'user.status_updated',
+    'seller.updated',
+    'promotion.updated',
+    'notification.broadcast',
+    'notification.deleted',
+    'order.status_updated',
+  ].includes(act);
+}
 
 export const PAID_ORDER_STATUSES = ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed'] as const;
 
@@ -753,7 +777,7 @@ export async function requireEdgeSeller(
   request: Request,
   env: Env
 ): Promise<
-  | { user: EdgeAuthUser; seller: Record<string, unknown> }
+  | { user: EdgeAuthUser; seller: Record<string, unknown>; shop: Record<string, unknown> }
   | { error: Response }
 > {
   const auth = await requireEdgeUser(request, env);
@@ -767,7 +791,15 @@ export async function requireEdgeSeller(
   if (seller.status === 'suspended') {
     return { error: json({ error: 'Seller account is suspended.' }, 403) };
   }
-  return { user: auth.user, seller };
+  const shop = await env.DB!.prepare(
+    "SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1"
+  )
+    .bind(seller.id)
+    .first<Record<string, unknown>>();
+  if (!shop) {
+    return { error: json({ error: 'Active shop required. Register a new storefront to manage seller tools.' }, 403) };
+  }
+  return { user: auth.user, seller, shop };
 }
 
 export async function requireEdgeAdmin(
@@ -827,12 +859,14 @@ export async function recordEdgeAdminAudit(
   targetType: string,
   targetId: string,
   details: Record<string, unknown>,
-  ipAddress = ''
+  ipAddress = '',
+  forceProtected = false
 ) {
   if (!env.DB) return;
+  const isProtected = forceProtected || isAuditActionProtected(action) ? 1 : 0;
   await env.DB.prepare(
-    `INSERT INTO admin_audit_logs (id, admin_identifier, action, target_type, target_id, details_json, ip_address)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO admin_audit_logs (id, admin_identifier, action, target_type, target_id, details_json, ip_address, is_protected)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       newId('audit'),
@@ -841,7 +875,8 @@ export async function recordEdgeAdminAudit(
       targetType,
       targetId,
       JSON.stringify(details),
-      ipAddress
+      ipAddress,
+      isProtected
     )
     .run();
 }

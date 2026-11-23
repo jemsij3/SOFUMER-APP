@@ -163,11 +163,13 @@ authRouter.get('/me', (req, res) => {
     .get(user.id) as Record<string, unknown> | undefined;
 
   const shop = sellerProfile
-    ? (db.prepare('SELECT * FROM shops WHERE seller_id = ?').get(sellerProfile.id) as Record<string, unknown> | undefined)
+    ? (db
+        .prepare("SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+        .get(sellerProfile.id) as Record<string, unknown> | undefined)
     : undefined;
 
   const unreadMessagesRow = db
-    .prepare('SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ?')
+    .prepare('SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ? AND is_hidden = 0')
     .get(user.id) as { cnt: number };
 
   const unreadNotifsRow = db

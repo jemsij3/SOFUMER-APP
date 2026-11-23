@@ -111,7 +111,7 @@ export async function handleMarketplaceRoutes(
           `SELECT pr.*, s.name as shop_name, s.slug as shop_slug, p.title as product_title
            FROM promotions pr JOIN shops s ON s.id = pr.shop_id
            LEFT JOIN products p ON p.id = pr.product_id
-           WHERE pr.status = 'active' ORDER BY pr.created_at DESC LIMIT 5`
+           WHERE pr.status = 'active' AND s.status = 'active' ORDER BY pr.created_at DESC LIMIT 5`
         ).all(),
         env.DB.prepare(
           "SELECT COUNT(*) as cnt FROM products p JOIN shops s ON s.id = p.shop_id WHERE p.status = 'published' AND s.status = 'active'"
@@ -238,7 +238,7 @@ export async function handleMarketplaceRoutes(
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const id = decodeURIComponent(sub.slice('/products/'.length));
     const product = await env.DB.prepare(
-      `${PRODUCT_SELECT} WHERE p.id = ? AND ((p.status = 'published' AND s.status = 'active') OR p.seller_user_id = ?)`
+      `${PRODUCT_SELECT} WHERE p.id = ? AND ((p.status = 'published' AND s.status = 'active') OR (p.seller_user_id = ? AND s.status != 'closed'))`
     )
       .bind(id, authUser.id)
       .first<Record<string, unknown>>();
@@ -361,10 +361,26 @@ export async function handleMarketplaceRoutes(
   }
 
   if (sub.startsWith('/favorites/')) {
-    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const productId = decodeURIComponent(sub.slice('/favorites/'.length));
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeUser(request, env);
+      if ('error' in auth) return auth.error;
+      const existing = await env.DB.prepare(
+        'SELECT id FROM product_favorites WHERE user_id = ? AND product_id = ?'
+      )
+        .bind(auth.user.id, productId)
+        .first<{ id: string }>();
+      if (existing) {
+        await env.DB.prepare('DELETE FROM product_favorites WHERE id = ?').bind(existing.id).run();
+        await env.DB.prepare('UPDATE products SET favorite_count = MAX(0, favorite_count - 1) WHERE id = ?')
+          .bind(productId)
+          .run();
+      }
+      return json({ favorited: false, removed: true });
+    }
+    if (request.method !== 'POST') return methodNotAllowed(['POST', 'DELETE']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
-    const productId = decodeURIComponent(sub.slice('/favorites/'.length));
     const prod = await env.DB.prepare(
       "SELECT p.id FROM products p JOIN shops s ON s.id = p.shop_id WHERE p.id = ? AND p.status = 'published' AND s.status = 'active'"
     )
@@ -396,7 +412,15 @@ export async function handleMarketplaceRoutes(
   }
 
   if (sub === '/recently-viewed') {
-    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeUser(request, env);
+      if ('error' in auth) return auth.error;
+      const res = await env.DB.prepare('DELETE FROM recently_viewed WHERE user_id = ?')
+        .bind(auth.user.id)
+        .run();
+      return json({ cleared: true, deletedCount: res.meta?.changes ?? 0 });
+    }
+    if (request.method !== 'GET') return methodNotAllowed(['GET', 'DELETE']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
     const items = await env.DB.prepare(
@@ -406,6 +430,17 @@ export async function handleMarketplaceRoutes(
       .bind(auth.user.id)
       .all();
     return json({ items: items.results });
+  }
+
+  if (sub.startsWith('/recently-viewed/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const productId = decodeURIComponent(sub.slice('/recently-viewed/'.length));
+    await env.DB.prepare('DELETE FROM recently_viewed WHERE user_id = ? AND product_id = ?')
+      .bind(auth.user.id, productId)
+      .run();
+    return json({ removed: true });
   }
 
   if (sub === '/reports') {

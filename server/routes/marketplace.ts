@@ -117,7 +117,7 @@ marketplaceRouter.get('/home', (req, res) => {
        FROM promotions pr
        JOIN shops s ON s.id = pr.shop_id
        LEFT JOIN products p ON p.id = pr.product_id
-       WHERE pr.status = 'active'
+       WHERE pr.status = 'active' AND s.status = 'active'
        ORDER BY pr.created_at DESC
        LIMIT 5`
     )
@@ -262,7 +262,7 @@ marketplaceRouter.get('/products/:id', (req, res) => {
   const product = db
     .prepare(
       `${PRODUCT_SELECT}
-       WHERE p.id = ? AND ((p.status = 'published' AND s.status = 'active') OR p.seller_user_id = ?)`
+       WHERE p.id = ? AND ((p.status = 'published' AND s.status = 'active') OR (p.seller_user_id = ? AND s.status != 'closed'))`
     )
     .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
 
@@ -415,6 +415,19 @@ marketplaceRouter.post('/favorites/:productId', requireAuth, (req, res) => {
   }
 });
 
+marketplaceRouter.delete('/favorites/:productId', requireAuth, (req, res) => {
+  const userId = req.authUser!.id;
+  const productId = req.params.productId;
+  const existing = db
+    .prepare('SELECT id FROM product_favorites WHERE user_id = ? AND product_id = ?')
+    .get(userId, productId) as { id: string } | undefined;
+  if (existing) {
+    db.prepare('DELETE FROM product_favorites WHERE id = ?').run(existing.id);
+    db.prepare('UPDATE products SET favorite_count = MAX(0, favorite_count - 1) WHERE id = ?').run(productId);
+  }
+  res.json({ favorited: false, removed: true });
+});
+
 marketplaceRouter.get('/favorites', requireAuth, (req, res) => {
   const items = db
     .prepare(
@@ -438,6 +451,19 @@ marketplaceRouter.get('/recently-viewed', requireAuth, (req, res) => {
     )
     .all(req.authUser!.id);
   res.json({ items });
+});
+
+marketplaceRouter.delete('/recently-viewed', requireAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM recently_viewed WHERE user_id = ?').run(req.authUser!.id);
+  res.json({ cleared: true, deletedCount: info.changes });
+});
+
+marketplaceRouter.delete('/recently-viewed/:productId', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM recently_viewed WHERE user_id = ? AND product_id = ?').run(
+    req.authUser!.id,
+    req.params.productId
+  );
+  res.json({ removed: true });
 });
 
 marketplaceRouter.post('/reports', requireAuth, (req, res) => {

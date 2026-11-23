@@ -491,6 +491,27 @@ export async function verifyUploadedCloudinaryAsset(options: {
   };
 }
 
+export function extractCloudinaryPublicIdFromUrl(rawUrl: unknown, cloudName: string): string {
+  if (typeof rawUrl !== 'string' || !cloudName) return '';
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'res.cloudinary.com') {
+      return '';
+    }
+    const prefix = `/${cloudName}/`;
+    if (!parsed.pathname.startsWith(prefix)) return '';
+    const uploadIdx = parsed.pathname.indexOf('/upload/');
+    if (uploadIdx === -1) return '';
+    let remainder = decodeURIComponent(parsed.pathname.slice(uploadIdx + '/upload/'.length));
+    remainder = remainder.replace(/^v\d+\//, '');
+    const dotIdx = remainder.lastIndexOf('.');
+    const publicId = dotIdx > 0 ? remainder.slice(0, dotIdx) : remainder;
+    return /^[a-zA-Z0-9_/-]+$/.test(publicId) ? publicId : '';
+  } catch {
+    return '';
+  }
+}
+
 export async function destroyUnreferencedCloudinaryAssetsLocal(
   assets: Array<{ public_id?: string | null; resource_type?: string | null; storage_provider?: string | null }>
 ): Promise<void> {
@@ -502,9 +523,35 @@ export async function destroyUnreferencedCloudinaryAssetsLocal(
     const row = db
       .prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?')
       .get(publicId) as { cnt: number };
-    if ((row?.cnt ?? 0) === 0) {
+    const shopRow = db
+      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
+      .get(`%/${publicId}%`, `%/${publicId}%`) as { cnt: number };
+    if ((row?.cnt ?? 0) === 0 && (shopRow?.cnt ?? 0) === 0) {
       const rType = asset.resource_type === 'video' ? 'video' : 'image';
       await destroyCloudinaryAsset(config, rType, publicId);
+    }
+  }
+}
+
+export async function destroyExclusiveShopCloudinaryAssetsLocal(
+  urls: Array<string | null | undefined>
+): Promise<void> {
+  const config = getCloudinaryConfigState();
+  if (!config.configured) return;
+
+  const seen = new Set<string>();
+  for (const rawUrl of urls) {
+    const publicId = extractCloudinaryPublicIdFromUrl(rawUrl, config.cloudName);
+    if (!publicId || !publicId.startsWith('sofumer/shops/') || seen.has(publicId)) continue;
+    seen.add(publicId);
+    const shopRef = db
+      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
+      .get(`%/${publicId}%`, `%/${publicId}%`) as { cnt: number };
+    const mediaRef = db
+      .prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?')
+      .get(publicId) as { cnt: number };
+    if ((shopRef?.cnt ?? 0) === 0 && (mediaRef?.cnt ?? 0) === 0) {
+      await destroyCloudinaryAsset(config, 'image', publicId);
     }
   }
 }

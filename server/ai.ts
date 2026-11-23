@@ -376,7 +376,7 @@ export async function runBuyerCompareAi(userId: string, productIds: string[], fo
        FROM products p
        JOIN categories c ON c.id = p.category_id
        JOIN shops s ON s.id = p.shop_id
-       WHERE p.id IN (${placeholders}) AND p.status = 'published'`
+       WHERE p.id IN (${placeholders}) AND p.status = 'published' AND s.status = 'active'`
     )
     .all(...productIds) as Record<string, unknown>[];
 
@@ -469,7 +469,7 @@ export async function runSellerListingAi(
                   (SELECT COALESCE(SUM(favorite_count), 0) FROM products p WHERE p.shop_id = s.id) as total_favorites,
                   (SELECT COUNT(*) FROM orders o WHERE o.shop_id = s.id) as total_orders,
                   (SELECT COUNT(*) FROM inquiries i WHERE i.shop_id = s.id) as total_inquiries
-           FROM shops s WHERE s.user_id = ? LIMIT 1`
+           FROM shops s WHERE s.user_id = ? AND s.status != 'closed' ORDER BY s.created_at DESC LIMIT 1`
         )
         .get(userId);
 

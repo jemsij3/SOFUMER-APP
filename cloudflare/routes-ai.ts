@@ -315,7 +315,7 @@ export async function handleAiRoutes(
     const productsRes = await env.DB!.prepare(
       `SELECT p.*, c.name as category_name, s.name as shop_name FROM products p
        JOIN categories c ON c.id = p.category_id JOIN shops s ON s.id = p.shop_id
-       WHERE p.id IN (${placeholders}) AND p.status = 'published'`
+       WHERE p.id IN (${placeholders}) AND p.status = 'published' AND s.status = 'active'`
     )
       .bind(...productIds)
       .all<Record<string, unknown>>();
@@ -405,20 +405,22 @@ export async function handleAiRoutes(
       }
 
       if (body.action === 'analytics') {
-        const sellerProfile = await env.DB!.prepare('SELECT id FROM seller_profiles WHERE user_id = ?')
+        const activeShop = await env.DB!.prepare(
+          "SELECT id FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1"
+        )
           .bind(userId)
           .first<{ id: string }>();
-        if (!sellerProfile) {
-          return json({ error: 'Seller profile required to view AI shop analytics.' }, 403);
+        if (!activeShop) {
+          return json({ error: 'Active shop required to view AI shop analytics.' }, 403);
         }
         const stats = await env.DB!.prepare(
           `SELECT s.name,
                   (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status = 'published') as published_products,
                   (SELECT COALESCE(SUM(view_count), 0) FROM products p WHERE p.shop_id = s.id) as total_views,
                   (SELECT COUNT(*) FROM orders o WHERE o.shop_id = s.id) as total_orders
-           FROM shops s WHERE s.user_id = ? LIMIT 1`
+           FROM shops s WHERE s.id = ? LIMIT 1`
         )
-          .bind(userId)
+          .bind(activeShop.id)
           .first();
         const { text: insights, estimatedTokens } = await runEdgeAiText(env, perm.modelName, [
           { role: 'system', content: 'Interpret real SOFUMER shop metrics without inventing numbers.' },

@@ -3,13 +3,15 @@ import path from 'path';
 import crypto from 'crypto';
 import multer from 'multer';
 import { Router } from 'express';
-import { db, getDigitalDir, newId, slugify } from '../db.ts';
+import { db, getDigitalDir, newId, resolveConfinedDigitalPath, slugify } from '../db.ts';
 import {
+  PAID_ORDER_STATUSES,
   checkProhibitedKeywords,
   computeStarsFromUsd,
   getActiveSubscriptionLocal,
   getStarsPerUsdLocal,
   isSafeUrlOrEmpty,
+  recordAdminAudit,
   requireAuth,
   requireSeller,
   sanitizeSafeUrl,
@@ -22,6 +24,7 @@ import {
   ALLOWED_IMAGE_EXTENSIONS,
   ALLOWED_VIDEO_EXTENSIONS,
   MAX_PRODUCT_PHOTOS,
+  destroyExclusiveShopCloudinaryAssetsLocal,
   destroyUnreferencedCloudinaryAssetsLocal,
   generateCloudinarySignature,
   getCloudinaryConfigState,
@@ -32,6 +35,155 @@ import {
 } from '../cloudinary.ts';
 
 export const sellerRouter = Router();
+
+export async function executeLocalShopSoftDelete(
+  shop: Record<string, unknown>,
+  actorIdentifier: string,
+  reason = ''
+): Promise<
+  | { ok: true; shopId: string; archivedProductsCount: number; deletedProductsCount: number }
+  | { ok: false; status: number; error: string }
+> {
+  if (String(shop.status || '') === 'closed') {
+    return { ok: false, status: 409, error: 'Shop is already closed.' };
+  }
+
+  const shopId = String(shop.id);
+  const sellerId = String(shop.seller_id);
+  const sellerUserId = String(shop.user_id);
+  const oldLogoUrl = String(shop.logo_url || '');
+  const oldBannerUrl = String(shop.banner_url || '');
+  const cleanReason = sanitizeText(reason || '', 300);
+  const nextSlug = `${String(shop.slug || 'shop').slice(0, 60)}__del_${shopId.slice(-6)}`;
+
+  let archivedProductsCount = 0;
+  let deletedProductsCount = 0;
+  const mediaToDestroy: Array<Record<string, unknown>> = [];
+  const digitalFilesToUnlink: string[] = [];
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `UPDATE shops
+       SET status = 'closed',
+           is_featured = 0,
+           verification_status = CASE WHEN verification_status = 'pending' THEN 'rejected' ELSE verification_status END,
+           logo_url = '',
+           banner_url = '',
+           slug = ?,
+           deleted_at = datetime('now'),
+           deleted_by = ?,
+           deletion_reason = ?,
+           updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(nextSlug, actorIdentifier, cleanReason, shopId);
+
+    db.prepare(
+      `UPDATE shop_verifications
+       SET status = 'rejected', review_notes = 'Closed upon shop deletion', reviewed_at = datetime('now')
+       WHERE shop_id = ? AND status = 'pending'`
+    ).run(shopId);
+
+    const shopProducts = db.prepare('SELECT id FROM products WHERE shop_id = ?').all(shopId) as Array<{ id: string }>;
+
+    for (const prod of shopProducts) {
+      const productId = prod.id;
+      const hasOrderItem = db.prepare('SELECT id FROM order_items WHERE product_id = ? LIMIT 1').get(productId);
+      const hasReview = db.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').get(productId);
+
+      if (hasOrderItem || hasReview) {
+        db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(productId);
+        db.prepare(
+          "UPDATE products SET status = 'archived', is_featured = 0, is_sponsored = 0, updated_at = datetime('now') WHERE id = ?"
+        ).run(productId);
+        archivedProductsCount++;
+      } else {
+        const prodMedia = db
+          .prepare('SELECT public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+          .all(productId) as Array<Record<string, unknown>>;
+        mediaToDestroy.push(...prodMedia);
+
+        const digitalAsset = db
+          .prepare('SELECT storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?')
+          .get(productId) as { storage_provider: string; storage_key: string } | undefined;
+        if (digitalAsset?.storage_provider === 'local' && digitalAsset.storage_key) {
+          digitalFilesToUnlink.push(digitalAsset.storage_key);
+        }
+
+        db.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').run(productId);
+        db.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM inquiries WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_media WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_images WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM product_inventory WHERE product_id = ?').run(productId);
+        db.prepare('DELETE FROM products WHERE id = ?').run(productId);
+        deletedProductsCount++;
+      }
+    }
+
+    db.prepare(
+      `UPDATE telegram_stars_payments
+       SET status = 'cancelled', updated_at = datetime('now')
+       WHERE target_type = 'promotion'
+         AND status = 'pending'
+         AND target_id IN (SELECT id FROM promotions WHERE shop_id = ? AND status = 'pending')`
+    ).run(shopId);
+
+    db.prepare(
+      `UPDATE promotions
+       SET status = CASE WHEN status = 'pending' THEN 'rejected' ELSE 'paused' END
+       WHERE shop_id = ? AND status IN ('pending', 'active')`
+    ).run(shopId);
+
+    const remaining = db
+      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE seller_id = ? AND status != 'closed'")
+      .get(sellerId) as { cnt: number };
+
+    if ((remaining?.cnt ?? 0) === 0) {
+      db.prepare("UPDATE subscriptions SET status = 'cancelled' WHERE seller_id = ? AND status IN ('active', 'pending_payment')").run(
+        sellerId
+      );
+      db.prepare(
+        "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE user_id = ? AND target_type = 'subscription' AND status = 'pending'"
+      ).run(sellerUserId);
+      db.prepare(
+        `UPDATE seller_profiles
+         SET verification_status = CASE WHEN verification_status = 'pending' THEN 'unverified' ELSE verification_status END,
+             updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(sellerId);
+    }
+  });
+
+  tx();
+
+  for (const key of digitalFilesToUnlink) {
+    const filePath = resolveConfinedDigitalPath(key);
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Non-fatal local cleanup error
+      }
+    }
+  }
+  if (mediaToDestroy.length > 0) {
+    await destroyUnreferencedCloudinaryAssetsLocal(mediaToDestroy);
+  }
+  await destroyExclusiveShopCloudinaryAssetsLocal([oldLogoUrl, oldBannerUrl]);
+
+  return {
+    ok: true,
+    shopId,
+    archivedProductsCount,
+    deletedProductsCount,
+  };
+}
 
 async function resolveSubmittedProductMediaLocal(options: {
   sellerUserId: string;
@@ -291,11 +443,19 @@ sellerRouter.post('/register', requireAuth, (req, res) => {
   }
 
   const user = req.authUser!;
-  const existing = db
-    .prepare('SELECT id FROM seller_profiles WHERE user_id = ?')
-    .get(user.id);
-  if (existing) {
-    return res.status(409).json({ error: 'You already have a registered seller profile.' });
+  const existingSeller = db
+    .prepare('SELECT id, status FROM seller_profiles WHERE user_id = ?')
+    .get(user.id) as { id: string; status: string } | undefined;
+  if (existingSeller) {
+    if (existingSeller.status === 'suspended') {
+      return res.status(403).json({ error: 'Seller account is suspended.' });
+    }
+    const activeShop = db
+      .prepare("SELECT id FROM shops WHERE seller_id = ? AND status != 'closed' LIMIT 1")
+      .get(existingSeller.id);
+    if (activeShop) {
+      return res.status(409).json({ error: 'You already have a registered seller profile and shop.' });
+    }
   }
 
   const sellerType = req.body?.sellerType === 'business' ? 'business' : 'individual';
@@ -329,27 +489,46 @@ sellerRouter.post('/register', requireAuth, (req, res) => {
   }
   const resolvedCurrency = validCurrency?.code || validCountry.default_currency || 'USD';
 
-  const sellerId = newId('sel');
+  const sellerId = existingSeller ? existingSeller.id : newId('sel');
   const shopId = newId('shop');
   const baseSlug = slugify(shopName);
   const slugConflict = db.prepare('SELECT id FROM shops WHERE slug = ?').get(baseSlug);
   const shopSlug = slugConflict ? `${baseSlug}-${shopId.slice(-5)}` : baseSlug;
 
   const tx = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO seller_profiles (id, user_id, seller_type, legal_name, business_registration_no, country_code, contact_email, contact_phone, contact_telegram)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      sellerId,
-      user.id,
-      sellerType,
-      legalName,
-      businessRegistrationNo,
-      countryCode,
-      contactEmail,
-      contactPhone,
-      contactTelegram
-    );
+    if (existingSeller) {
+      db.prepare(
+        `UPDATE seller_profiles
+         SET seller_type = ?, legal_name = ?, business_registration_no = ?, country_code = ?,
+             contact_email = ?, contact_phone = ?, contact_telegram = ?, verification_status = 'unverified',
+             updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        sellerType,
+        legalName,
+        businessRegistrationNo,
+        countryCode,
+        contactEmail,
+        contactPhone,
+        contactTelegram,
+        sellerId
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO seller_profiles (id, user_id, seller_type, legal_name, business_registration_no, country_code, contact_email, contact_phone, contact_telegram)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sellerId,
+        user.id,
+        sellerType,
+        legalName,
+        businessRegistrationNo,
+        countryCode,
+        contactEmail,
+        contactPhone,
+        contactTelegram
+      );
+    }
 
     db.prepare(
       `INSERT INTO shops (id, seller_id, user_id, slug, name, description, country_code, logo_url, banner_url, default_currency)
@@ -392,7 +571,7 @@ sellerRouter.get('/dashboard', requireSeller, (req, res) => {
     .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
     .get(userId) as Record<string, unknown>;
   const shop = db
-    .prepare('SELECT * FROM shops WHERE seller_id = ?')
+    .prepare("SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
     .get(sellerProfile.id) as Record<string, unknown>;
 
   const subscription = getActiveSubscriptionLocal({ sellerId: String(sellerProfile.id) }) || null;
@@ -437,7 +616,9 @@ sellerRouter.get('/dashboard', requireSeller, (req, res) => {
 
 sellerRouter.patch('/shop', requireSeller, (req, res) => {
   const userId = req.authUser!.id;
-  const shop = db.prepare('SELECT * FROM shops WHERE user_id = ?').get(userId) as Record<string, unknown>;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(userId) as Record<string, unknown>;
   if (!shop) return res.status(404).json({ error: 'Shop not found.' });
 
   if (
@@ -471,10 +652,62 @@ sellerRouter.patch('/shop', requireSeller, (req, res) => {
   res.json({ shop: updated });
 });
 
+sellerRouter.delete('/shop', requireSeller, async (req, res) => {
+  const user = req.authUser!;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(user.id) as Record<string, unknown> | undefined;
+  if (!shop) return res.status(404).json({ error: 'Active shop not found.' });
+
+  const confirmShopName = sanitizeText(req.body?.confirmShopName ?? '', 100);
+  const explicitConfirm = req.body?.confirm === true;
+  const reason = sanitizeText(req.body?.reason ?? '', 300);
+
+  if (confirmShopName) {
+    if (confirmShopName.toLowerCase() !== String(shop.name || '').trim().toLowerCase()) {
+      return res.status(400).json({ error: `Confirmation failed. Type "${String(shop.name)}" to delete your shop.` });
+    }
+  } else if (!explicitConfirm) {
+    return res.status(400).json({ error: `Type "${String(shop.name)}" to confirm shop deletion.` });
+  }
+
+  const actorIdentifier = user.telegram_username
+    ? `@${user.telegram_username}`
+    : user.display_name || user.id;
+  const result = await executeLocalShopSoftDelete(shop, actorIdentifier, reason);
+  if (result.ok === false) {
+    return res.status(result.status).json({ error: result.error });
+  }
+
+  recordAdminAudit(
+    actorIdentifier,
+    'shop.deleted_by_owner',
+    'shop',
+    result.shopId,
+    {
+      shopName: shop.name,
+      reason,
+      archivedProductsCount: result.archivedProductsCount,
+      deletedProductsCount: result.deletedProductsCount,
+    },
+    req.ip || '',
+    true
+  );
+
+  res.json({
+    deleted: true,
+    shopId: result.shopId,
+    archivedProductsCount: result.archivedProductsCount,
+    deletedProductsCount: result.deletedProductsCount,
+  });
+});
+
 sellerRouter.post('/verification', requireSeller, (req, res) => {
   const userId = req.authUser!.id;
   const seller = db.prepare('SELECT * FROM seller_profiles WHERE user_id = ?').get(userId) as Record<string, unknown>;
-  const shop = db.prepare('SELECT * FROM shops WHERE seller_id = ?').get(seller.id) as Record<string, unknown>;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(seller.id) as Record<string, unknown>;
 
   const documentType = sanitizeText(req.body?.documentType || '', 60);
   const documentReference = sanitizeText(req.body?.documentReference || '', 200);
@@ -497,6 +730,11 @@ sellerRouter.post('/verification', requireSeller, (req, res) => {
 });
 
 sellerRouter.get('/products', requireSeller, (req, res) => {
+  const activeShop = db
+    .prepare("SELECT id FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(req.authUser!.id) as { id: string } | undefined;
+  if (!activeShop) return res.json({ products: [] });
+
   const products = db
     .prepare(
       `SELECT p.*, c.name as category_name,
@@ -512,10 +750,10 @@ sellerRouter.get('/products', requireSeller, (req, res) => {
        FROM products p
        JOIN categories c ON c.id = p.category_id
        LEFT JOIN product_inventory inv ON inv.product_id = p.id
-       WHERE p.seller_user_id = ?
+       WHERE p.seller_user_id = ? AND p.shop_id = ?
        ORDER BY p.updated_at DESC`
     )
-    .all(req.authUser!.id);
+    .all(req.authUser!.id, activeShop.id);
   res.json({ products });
 });
 
@@ -528,7 +766,9 @@ sellerRouter.post('/products', requireSeller, async (req, res) => {
   }
 
   const userId = req.authUser!.id;
-  const shop = db.prepare('SELECT * FROM shops WHERE user_id = ?').get(userId) as Record<string, unknown>;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(userId) as Record<string, unknown>;
   if (!shop || shop.status !== 'active') {
     return res.status(403).json({ error: 'Active shop required to publish products.' });
   }
@@ -843,6 +1083,56 @@ sellerRouter.post('/products/:id/digital-asset', requireSeller, (req, res) => {
     });
   }
   return handleSave();
+});
+
+sellerRouter.delete('/products/:id/digital-asset', requireSeller, (req, res) => {
+  const product = db
+    .prepare('SELECT id, listing_type FROM products WHERE id = ? AND seller_user_id = ?')
+    .get(req.params.id, req.authUser!.id) as { id: string; listing_type: string } | undefined;
+  if (!product) return res.status(404).json({ error: 'Listing not found or unauthorized.' });
+  if (product.listing_type !== 'digital') {
+    return res.status(400).json({ error: 'Protected digital delivery assets are only supported for digital listings.' });
+  }
+
+  const existingAsset = db
+    .prepare('SELECT id, storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?')
+    .get(product.id) as { id: string; storage_provider: string; storage_key: string } | undefined;
+  if (!existingAsset) {
+    return res.status(404).json({ error: 'No digital delivery package is configured for this product.' });
+  }
+
+  const placeholders = PAID_ORDER_STATUSES.map(() => '?').join(', ');
+  const paidOrder = db
+    .prepare(
+      `SELECT o.id FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       WHERE oi.product_id = ? AND o.status IN (${placeholders})
+       LIMIT 1`
+    )
+    .get(product.id, ...PAID_ORDER_STATUSES);
+  if (paidOrder) {
+    return res.status(409).json({
+      error: 'Cannot delete the digital delivery package after confirmed/paid orders exist for this listing.',
+    });
+  }
+
+  if (existingAsset.storage_provider === 'local' && existingAsset.storage_key) {
+    const filePath = resolveConfinedDigitalPath(existingAsset.storage_key);
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Non-fatal local cleanup
+      }
+    }
+  }
+
+  db.transaction(() => {
+    db.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').run(product.id);
+    db.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').run(product.id);
+  })();
+
+  res.json({ deleted: true });
 });
 
 sellerRouter.get('/products/:id', requireSeller, (req, res) => {
@@ -1306,7 +1596,9 @@ sellerRouter.post('/subscriptions/invoice', requireSeller, async (req, res) => {
 
 sellerRouter.post('/promotions', requireSeller, (req, res) => {
   const userId = req.authUser!.id;
-  const shop = db.prepare('SELECT * FROM shops WHERE user_id = ?').get(userId) as Record<string, unknown>;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(userId) as Record<string, unknown>;
   const promoType = String(req.body?.promoType || 'featured_product');
   const productId = sanitizeText(req.body?.productId || '', 64) || null;
   const durationDays = Math.min(30, Math.max(1, Number(req.body?.durationDays || 7)));
@@ -1359,7 +1651,9 @@ sellerRouter.post('/promotions', requireSeller, (req, res) => {
 
 sellerRouter.post('/promotions/invoice', requireSeller, async (req, res) => {
   const user = req.authUser!;
-  const shop = db.prepare('SELECT * FROM shops WHERE user_id = ?').get(user.id) as Record<string, unknown>;
+  const shop = db
+    .prepare("SELECT * FROM shops WHERE user_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1")
+    .get(user.id) as Record<string, unknown>;
   const promoType = String(req.body?.promoType || 'featured_product');
   const productId = sanitizeText(req.body?.productId || '', 64) || null;
   const durationDays = Math.min(30, Math.max(1, Math.floor(Number(req.body?.durationDays || 7))));
@@ -1454,6 +1748,25 @@ sellerRouter.post('/promotions/invoice', requireSeller, async (req, res) => {
     currency: 'XTR',
     expiresAt,
   });
+});
+
+sellerRouter.delete('/promotions/:id', requireSeller, (req, res) => {
+  const promoId = req.params.id;
+  const promo = db
+    .prepare('SELECT * FROM promotions WHERE id = ? AND user_id = ?')
+    .get(promoId, req.authUser!.id) as Record<string, unknown> | undefined;
+  if (!promo) return res.status(404).json({ error: 'Promotion not found or unauthorized.' });
+  if (promo.status !== 'pending') {
+    return res.status(409).json({ error: 'Only pending promotions can be cancelled and removed.' });
+  }
+  db.transaction(() => {
+    db.prepare(
+      "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE target_type = 'promotion' AND target_id = ? AND status = 'pending'"
+    ).run(promoId);
+    db.prepare('DELETE FROM promotion_transactions WHERE promotion_id = ?').run(promoId);
+    db.prepare('DELETE FROM promotions WHERE id = ? AND user_id = ?').run(promoId, req.authUser!.id);
+  })();
+  res.json({ deleted: true, promotionId: promoId });
 });
 
 sellerRouter.get('/payments', requireSeller, (req, res) => {

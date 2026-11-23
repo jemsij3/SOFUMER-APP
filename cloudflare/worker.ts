@@ -371,12 +371,16 @@ async function handleAuthRoutes(
       .bind(user.id)
       .first<Record<string, unknown>>();
     const shop = sellerProfile
-      ? await env.DB.prepare('SELECT * FROM shops WHERE seller_id = ?').bind(sellerProfile.id).first()
+      ? await env.DB.prepare(
+          "SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1"
+        )
+          .bind(sellerProfile.id)
+          .first()
       : null;
 
     const [unreadMsgs, unreadNotifs, favorites, aiPerm] = await Promise.all([
       env.DB.prepare(
-        'SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ?'
+        'SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ? AND is_hidden = 0'
       )
         .bind(user.id)
         .first<{ cnt: number }>(),

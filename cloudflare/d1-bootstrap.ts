@@ -122,6 +122,9 @@ const SCHEMA_STATEMENTS: string[] = [
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'closed')),
     rating_avg REAL NOT NULL DEFAULT 0,
     review_count INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT,
+    deleted_by TEXT DEFAULT '',
+    deletion_reason TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
@@ -131,6 +134,7 @@ const SCHEMA_STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_shops_country_code ON shops(country_code)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_status ON shops(status)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_is_featured ON shops(is_featured)`,
+  `CREATE INDEX IF NOT EXISTS idx_shops_deleted_at ON shops(deleted_at)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_created_at ON shops(created_at)`,
 
   `CREATE TABLE IF NOT EXISTS shop_verifications (
@@ -311,11 +315,13 @@ const SCHEMA_STATEMENTS: string[] = [
     role TEXT NOT NULL DEFAULT 'buyer' CHECK (role IN ('buyer', 'seller')),
     unread_count INTEGER NOT NULL DEFAULT 0,
     last_read_at TEXT,
+    is_hidden INTEGER NOT NULL DEFAULT 0,
     joined_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(conversation_id, user_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_conversation_participants_conversation_id ON conversation_participants(conversation_id)`,
   `CREATE INDEX IF NOT EXISTS idx_conversation_participants_user_id ON conversation_participants(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_conversation_participants_hidden ON conversation_participants(user_id, is_hidden)`,
 
   `CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -625,9 +631,15 @@ const SCHEMA_STATEMENTS: string[] = [
     target_id TEXT DEFAULT '',
     details_json TEXT DEFAULT '{}',
     ip_address TEXT DEFAULT '',
+    is_protected INTEGER NOT NULL DEFAULT 0,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT,
+    archived_by TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at ON admin_audit_logs(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_archived ON admin_audit_logs(is_archived)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_protected ON admin_audit_logs(is_protected)`,
 
   // 12. Support, Notifications & Telegram Bot Idempotency
   `CREATE TABLE IF NOT EXISTS notifications (
@@ -775,7 +787,8 @@ const SCHEMA_STATEMENTS: string[] = [
     ('sponsored_placement_price_7d', '35', 'number', 'Base price in USD for 7-day sponsored top search placement'),
     ('banner_ad_price_7d', '75', 'number', 'Base price in USD for 7-day homepage promotional banner'),
     ('prohibited_keywords', 'counterfeit,stolen,illegal weapon,narcotic,scam', 'string', 'Comma-separated moderation keywords flagged on submission'),
-    ('marketplace_announcement', '', 'string', 'Optional global announcement displayed to users')`,
+    ('marketplace_announcement', '', 'string', 'Optional global announcement displayed to users'),
+    ('audit_retention_days', '90', 'number', 'Retention period (days) before non-critical audit logs are eligible for archiving or cleanup')`,
 
   `INSERT OR IGNORE INTO admin_roles (id, code, name, description) VALUES
     ('role_owner', 'OWNER', 'Platform Owner', 'Full system, security, AI, monetization, and role governance'),
@@ -985,11 +998,28 @@ const UPGRADE_STATEMENTS: string[] = [
   `INSERT OR IGNORE INTO platform_settings (key, value, value_type, description) VALUES
     ('max_product_videos', '2', 'number', 'Maximum number of short videos allowed per product (independent of the 6-photo limit)'),
     ('max_product_image_mb', '10', 'number', 'Maximum file size in MB per product photo (JPG, JPEG, PNG, WebP)'),
-    ('max_product_video_mb', '30', 'number', 'Maximum file size in MB per product short video (MP4, MOV, max 10 seconds)')`,
+    ('max_product_video_mb', '30', 'number', 'Maximum file size in MB per product short video (MP4, MOV, max 10 seconds)'),
+    ('audit_retention_days', '90', 'number', 'Retention period (days) before non-critical audit logs are eligible for archiving or cleanup')`,
 ];
 
 let schemaVerified = false;
 let inFlightBootstrap: Promise<boolean> | null = null;
+
+async function hasColumn(db: D1Database, table: string, column: string): Promise<boolean> {
+  try {
+    const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+    return info.results.some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+async function ensureColumn(db: D1Database, table: string, column: string, definition: string): Promise<void> {
+  const exists = await hasColumn(db, table, column);
+  if (!exists) {
+    await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+}
 
 export async function isD1Initialized(db?: D1Database): Promise<boolean> {
   if (!db) return false;
@@ -1007,7 +1037,15 @@ export async function isD1Initialized(db?: D1Database): Promise<boolean> {
         "SELECT COUNT(*) as cnt FROM ai_feature_settings WHERE model_name IN ('@cf/meta/llama-3.1-8b-instruct', '@cf/meta/infire-llama-3.1-8b-instruct', '@cf/mistral/mistral-7b-instruct-v0.1', '@cf/mistral/mistral-7b-instruct-v0.2', '@cf/qwen/qwen2.5-7b-instruct', '@cf/qwen/qwen3-30b-a3b-fp8') OR model_name NOT LIKE '@cf/%'"
       )
       .first<{ cnt: number }>();
-    return (staleModel?.cnt ?? 0) === 0;
+    if ((staleModel?.cnt ?? 0) > 0) return false;
+
+    const [hasShopDel, hasAuditProt, hasPartHidden, retentionSetting] = await Promise.all([
+      hasColumn(db, 'shops', 'deleted_at'),
+      hasColumn(db, 'admin_audit_logs', 'is_protected'),
+      hasColumn(db, 'conversation_participants', 'is_hidden'),
+      db.prepare("SELECT key FROM platform_settings WHERE key = 'audit_retention_days'").first(),
+    ]);
+    return hasShopDel && hasAuditProt && hasPartHidden && Boolean(retentionSetting);
   } catch {
     return false;
   }
@@ -1033,6 +1071,35 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
       }
 
       await db.batch(UPGRADE_STATEMENTS.map((sql) => db.prepare(sql)));
+
+      await ensureColumn(db, 'shops', 'deleted_at', 'TEXT');
+      await ensureColumn(db, 'shops', 'deleted_by', "TEXT DEFAULT ''");
+      await ensureColumn(db, 'shops', 'deletion_reason', "TEXT DEFAULT ''");
+      await ensureColumn(db, 'admin_audit_logs', 'is_protected', 'INTEGER NOT NULL DEFAULT 0');
+      await ensureColumn(db, 'admin_audit_logs', 'is_archived', 'INTEGER NOT NULL DEFAULT 0');
+      await ensureColumn(db, 'admin_audit_logs', 'archived_at', 'TEXT');
+      await ensureColumn(db, 'admin_audit_logs', 'archived_by', "TEXT DEFAULT ''");
+      await ensureColumn(db, 'conversation_participants', 'is_hidden', 'INTEGER NOT NULL DEFAULT 0');
+
+      await db.batch([
+        db.prepare('CREATE INDEX IF NOT EXISTS idx_shops_deleted_at ON shops(deleted_at)'),
+        db.prepare('CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_archived ON admin_audit_logs(is_archived)'),
+        db.prepare('CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_protected ON admin_audit_logs(is_protected)'),
+        db.prepare('CREATE INDEX IF NOT EXISTS idx_conversation_participants_hidden ON conversation_participants(user_id, is_hidden)'),
+        db.prepare(
+          `UPDATE admin_audit_logs
+           SET is_protected = 1
+           WHERE is_protected = 0 AND (
+             action LIKE 'audit.%'
+             OR action LIKE 'rbac.%'
+             OR action LIKE 'setting%'
+             OR action LIKE 'plan.%'
+             OR action LIKE 'ai.%'
+             OR action LIKE 'shop.deleted%'
+             OR action IN ('user.status_updated', 'seller.updated', 'promotion.updated', 'notification.broadcast', 'notification.deleted', 'order.status_updated')
+           )`
+        ),
+      ]);
 
       schemaVerified = true;
       return true;
