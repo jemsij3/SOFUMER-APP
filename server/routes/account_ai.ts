@@ -129,13 +129,16 @@ accountAiRouter.post('/account/support', requireAuth, (req, res) => {
 // ============================================================================
 
 accountAiRouter.get('/ai/status', requireAuth, (req, res) => {
-  const features = db.prepare('SELECT feature_key, label, is_enabled, daily_limit_per_user FROM ai_feature_settings').all();
+  const features = db
+    .prepare('SELECT feature_key, label, is_enabled, daily_limit_per_user, model_name FROM ai_feature_settings')
+    .all();
   const check = checkAiPermission(req.authUser!.id, 'buyer_search');
   res.json({
     allowed: check.allowed,
     reason: check.reason || null,
     dailyLimit: check.dailyLimit,
     usedToday: check.usedToday,
+    modelName: check.modelName,
     features,
   });
 });

@@ -5,15 +5,9 @@ import { db, newId } from './db.ts';
 // Runtime-ephemeral secret fallback only for local non-production dev when JWT_SECRET is omitted.
 const EPHEMERAL_DEV_SECRET = crypto.randomBytes(32).toString('hex');
 
-export const DEFAULT_CF_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-fast';
+import { DEFAULT_CF_AI_MODEL, VALID_CF_MODELS } from '../cloudflare/ai-normalizer.ts';
 
-export const VALID_CF_MODELS = new Set([
-  '@cf/meta/llama-3.1-8b-instruct-fast',
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/meta/llama-4-scout-17b-16e-instruct',
-  '@cf/qwen/qwen3-30b-a3b-fp8',
-  '@cf/mistralai/mistral-small-3.1-24b-instruct',
-]);
+export { DEFAULT_CF_AI_MODEL, VALID_CF_MODELS };
 
 export const ADMIN_PERMISSION_CATALOG = [
   { key: '*', label: 'Full Platform Owner', description: 'Unrestricted access to every system capability and RBAC management' },

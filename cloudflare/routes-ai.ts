@@ -1,7 +1,5 @@
 import {
   type Env,
-  DEFAULT_CF_AI_MODEL,
-  VALID_CF_MODELS,
   checkEdgeRateLimit,
   getActiveSubscriptionEdge,
   json,
@@ -9,12 +7,22 @@ import {
   newId,
   parseJsonBody,
   requireEdgeUser,
+  sanitizeText,
 } from './helpers.ts';
+import {
+  coerceAiString,
+  coerceAiStringList,
+  estimateTokens,
+  normalizeAiJsonObject,
+  normalizeAiText,
+  resolveActiveCfAiModel,
+  runWorkersAiWithJsonFallback,
+  sanitizeAiErrorForUser,
+  type WorkersAiMessage,
+} from './ai-normalizer.ts';
 
 async function checkEdgeAiPermission(env: Env, userId: string, featureKey: string) {
-  const defaultModel = VALID_CF_MODELS.has(env.CLOUDFLARE_AI_MODEL || '')
-    ? String(env.CLOUDFLARE_AI_MODEL)
-    : DEFAULT_CF_AI_MODEL;
+  const defaultModel = resolveActiveCfAiModel(env.CLOUDFLARE_AI_MODEL);
 
   const globalSetting = await env.DB!.prepare(
     "SELECT is_enabled, model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'"
@@ -24,7 +32,7 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     return {
       allowed: false,
       reason: 'AI services are currently disabled globally by platform administrators.',
-      modelName: globalSetting?.model_name || defaultModel,
+      modelName: resolveActiveCfAiModel(globalSetting?.model_name, defaultModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -40,7 +48,7 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     return {
       allowed: false,
       reason: `The "${featureKey}" AI feature is currently disabled by administrators.`,
-      modelName: featureSetting.model_name || defaultModel,
+      modelName: resolveActiveCfAiModel(featureSetting.model_name, globalSetting.model_name, defaultModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -56,7 +64,7 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     return {
       allowed: false,
       reason: userPerm.reason || 'Your AI access has been restricted by an administrator.',
-      modelName: featureSetting?.model_name || defaultModel,
+      modelName: resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, defaultModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -83,14 +91,13 @@ async function checkEdgeAiPermission(env: Env, userId: string, featureKey: strin
     return {
       allowed: false,
       reason: `Daily AI usage limit reached (${usedToday}/${dailyLimit}).`,
-      modelName: featureSetting?.model_name || defaultModel,
+      modelName: resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, defaultModel),
       dailyLimit,
       usedToday,
     };
   }
 
-  const candidateModel = featureSetting?.model_name || globalSetting.model_name || defaultModel;
-  const modelName = VALID_CF_MODELS.has(candidateModel) ? candidateModel : defaultModel;
+  const modelName = resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, defaultModel);
 
   return {
     allowed: true,
@@ -129,34 +136,51 @@ async function logEdgeAiUsage(
     .run();
 }
 
-function parseJsonFromAi(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fenced ? fenced[1] : trimmed).trim();
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    return JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>;
-  }
-  return JSON.parse(candidate) as Record<string, unknown>;
-}
-
-async function runEdgeAi(
+async function runEdgeAiText(
   env: Env,
   modelName: string,
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  expectJson = false
-): Promise<string> {
+  messages: WorkersAiMessage[],
+  maxTokens = 900
+): Promise<{ text: string; estimatedTokens: number }> {
   if (!env.AI) {
     throw new Error('Cloudflare Workers AI binding (env.AI) is not configured.');
   }
-  const out = await env.AI.run(modelName, {
-    messages,
-    max_tokens: 900,
-    temperature: 0.2,
-    ...(expectJson ? { response_format: { type: 'json_object' } } : {}),
-  });
-  return out?.response ?? out?.result?.response ?? '';
+  const rawOutput = await runWorkersAiWithJsonFallback(env.AI, modelName, messages, false, maxTokens, 0.2);
+  const text = await normalizeAiText(rawOutput);
+  return {
+    text,
+    estimatedTokens: estimateTokens(text),
+  };
+}
+
+async function runEdgeAiJson(
+  env: Env,
+  modelName: string,
+  messages: WorkersAiMessage[],
+  maxTokens = 900
+): Promise<{ data: Record<string, unknown>; estimatedTokens: number }> {
+  if (!env.AI) {
+    throw new Error('Cloudflare Workers AI binding (env.AI) is not configured.');
+  }
+  const rawOutput = await runWorkersAiWithJsonFallback(env.AI, modelName, messages, true, maxTokens, 0.2);
+  return await normalizeAiJsonObject(rawOutput);
+}
+
+function normalizeFaqs(value: unknown): Array<{ question: string; answer: string }> {
+  if (!Array.isArray(value)) return [];
+  const faqs: Array<{ question: string; answer: string }> = [];
+  for (const item of value) {
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      const question = coerceAiString(rec.question);
+      const answer = coerceAiString(rec.answer);
+      if (question && answer) {
+        faqs.push({ question, answer });
+      }
+    }
+    if (faqs.length >= 8) break;
+  }
+  return faqs;
 }
 
 export async function handleAiRoutes(
@@ -195,7 +219,7 @@ export async function handleAiRoutes(
     const start = Date.now();
     const parsedBody = await parseJsonBody<{ query?: string }>(request);
     if (!parsedBody.ok) return parsedBody.error;
-    const query = String(parsedBody.data.query || '').trim().slice(0, 600);
+    const query = sanitizeText(parsedBody.data.query || '', 600);
     if (!query) return json({ error: 'Search prompt is required.' }, 400);
 
     const perm = await checkEdgeAiPermission(env, userId, 'buyer_search');
@@ -215,43 +239,59 @@ export async function handleAiRoutes(
     ).all<Record<string, unknown>>();
     const catalog = catalogRes.results;
 
+    const catalogForPrompt = catalog.map((item) => ({
+      id: item.id,
+      title: item.title,
+      description: String(item.description || '').slice(0, 220),
+      price: item.price,
+      currency: item.currency,
+      listing_type: item.listing_type,
+      condition: item.condition,
+      country_code: item.country_code,
+      international_shipping: item.international_shipping,
+      category_name: item.category_name,
+      shop_name: item.shop_name,
+    }));
+
     try {
-      const raw = await runEdgeAi(
-        env,
-        perm.modelName,
-        [
-          {
-            role: 'system',
-            content:
-              'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, or sellers. Respond ONLY with valid JSON: {"answer": string, "matchedProductIds": string[], "suggestedFollowUps": string[]}.',
-          },
-          {
-            role: 'user',
-            content: `Buyer query: "${query}"\n\nCatalog JSON:\n${JSON.stringify(catalog)}`,
-          },
-        ],
-        true
-      );
-      const parsed = parseJsonFromAi(raw);
+      const { data: parsed, estimatedTokens } = await runEdgeAiJson(env, perm.modelName, [
+        {
+          role: 'system',
+          content:
+            'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, or sellers. Respond ONLY with valid JSON: {"answer": string, "matchedProductIds": string[], "suggestedFollowUps": string[]}.',
+        },
+        {
+          role: 'user',
+          content: `Buyer query: "${query}"\n\nCatalog JSON:\n${JSON.stringify(catalogForPrompt)}`,
+        },
+      ]);
+
       const validIds = new Set(catalog.map((c) => String(c.id)));
       const matchedIds = Array.isArray(parsed.matchedProductIds)
-        ? parsed.matchedProductIds.filter((id: unknown) => validIds.has(String(id)))
+        ? parsed.matchedProductIds.filter((id: unknown) => validIds.has(String(id))).map(String)
         : [];
-      const matchedProducts = catalog.filter((c) => matchedIds.includes(String(c.id)));
+      const matchedSet = new Set(matchedIds);
+      const matchedProducts = catalog.filter((c) => matchedSet.has(String(c.id)));
 
-      await logEdgeAiUsage(env, userId, 'buyer_search', perm.modelName, query, 'success', Date.now() - start, Math.ceil(raw.length / 4));
+      const answer =
+        coerceAiString(parsed.answer) ||
+        (matchedProducts.length > 0
+          ? `Found ${matchedProducts.length} matching published listing${matchedProducts.length === 1 ? '' : 's'} on SOFUMER.`
+          : 'No published listings in the current SOFUMER catalog matched your query.');
+
+      await logEdgeAiUsage(env, userId, 'buyer_search', perm.modelName, query, 'success', Date.now() - start, estimatedTokens);
       return json({
-        answer: String(parsed.answer || ''),
+        answer,
         matchedProducts,
-        suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps) ? parsed.suggestedFollowUps.slice(0, 3) : [],
+        suggestedFollowUps: coerceAiStringList(parsed.suggestedFollowUps, 3),
         catalogCount: catalog.length,
         provider: 'cloudflare-workers-ai',
         model: perm.modelName,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Workers AI error';
-      await logEdgeAiUsage(env, userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, msg);
-      return json({ error: msg }, 502);
+      const { internalMessage, userMessage } = sanitizeAiErrorForUser(err);
+      await logEdgeAiUsage(env, userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, internalMessage);
+      return json({ error: userMessage }, 502);
     }
   }
 
@@ -260,7 +300,9 @@ export async function handleAiRoutes(
     const start = Date.now();
     const parsedBody = await parseJsonBody<{ productIds?: string[]; focusQuestion?: string }>(request);
     if (!parsedBody.ok) return parsedBody.error;
-    const productIds = Array.isArray(parsedBody.data.productIds) ? parsedBody.data.productIds.slice(0, 4) : [];
+    const productIds = Array.isArray(parsedBody.data.productIds)
+      ? parsedBody.data.productIds.map((id) => sanitizeText(id, 64)).filter(Boolean).slice(0, 4)
+      : [];
     if (!productIds.length) return json({ error: 'Select 1 to 4 listings to compare.' }, 400);
 
     const perm = await checkEdgeAiPermission(env, userId, 'buyer_compare');
@@ -279,23 +321,25 @@ export async function handleAiRoutes(
       .all<Record<string, unknown>>();
     if (!productsRes.results.length) return json({ error: 'No published listings found.' }, 404);
 
+    const focusQuestion = sanitizeText(parsedBody.data.focusQuestion || '', 400);
+
     try {
-      const comparison = await runEdgeAi(env, perm.modelName, [
+      const { text: comparison, estimatedTokens } = await runEdgeAiText(env, perm.modelName, [
         {
           role: 'system',
           content: 'Compare real SOFUMER listings strictly using the provided JSON fields without inventing specs.',
         },
         {
           role: 'user',
-          content: `Compare these listings.${parsedBody.data.focusQuestion ? ` Focus: ${parsedBody.data.focusQuestion}` : ''}\n${JSON.stringify(productsRes.results)}`,
+          content: `Compare these listings.${focusQuestion ? ` Focus: ${focusQuestion}` : ''}\n${JSON.stringify(productsRes.results)}`,
         },
       ]);
-      await logEdgeAiUsage(env, userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, Math.ceil(comparison.length / 4));
+      await logEdgeAiUsage(env, userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, estimatedTokens);
       return json({ comparison, products: productsRes.results, provider: 'cloudflare-workers-ai', model: perm.modelName });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Workers AI comparison error';
-      await logEdgeAiUsage(env, userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, msg);
-      return json({ error: msg }, 502);
+      const { internalMessage, userMessage } = sanitizeAiErrorForUser(err);
+      await logEdgeAiUsage(env, userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, internalMessage);
+      return json({ error: userMessage }, 502);
     }
   }
 
@@ -315,6 +359,11 @@ export async function handleAiRoutes(
       return json({ error: 'Invalid seller AI action.' }, 400);
     }
 
+    const title = sanitizeText(body.title || '', 140);
+    const notes = sanitizeText(body.notes || '', 2500);
+    const listingType = sanitizeText(body.listingType || 'physical', 24) || 'physical';
+    const targetLanguage = sanitizeText(body.targetLanguage || 'French', 40) || 'French';
+
     const featureKey =
       body.action === 'translate'
         ? 'seller_translate'
@@ -330,23 +379,29 @@ export async function handleAiRoutes(
 
     try {
       if (body.action === 'translate') {
-        const raw = await runEdgeAi(
-          env,
-          perm.modelName,
-          [
-            {
-              role: 'system',
-              content: 'Translate listing accurately. Respond ONLY with JSON: {"translatedTitle": string, "translatedDescription": string}.',
-            },
-            {
-              role: 'user',
-              content: `Target: ${body.targetLanguage || 'French'}\nTitle: ${body.title || ''}\nDescription: ${body.notes || ''}`,
-            },
-          ],
-          true
-        );
-        await logEdgeAiUsage(env, userId, featureKey, perm.modelName, `translate:${body.targetLanguage}`, 'success', Date.now() - start, Math.ceil(raw.length / 4));
-        return json(parseJsonFromAi(raw));
+        if (!title && !notes) {
+          return json({ error: 'Enter a listing title or description to translate.' }, 400);
+        }
+        const { data: parsed, estimatedTokens } = await runEdgeAiJson(env, perm.modelName, [
+          {
+            role: 'system',
+            content: 'Translate listing accurately. Respond ONLY with JSON: {"translatedTitle": string, "translatedDescription": string}.',
+          },
+          {
+            role: 'user',
+            content: `Target: ${targetLanguage}\nTitle: ${title}\nDescription: ${notes}`,
+          },
+        ]);
+        const translatedTitle = coerceAiString(parsed.translatedTitle, title);
+        const translatedDescription = coerceAiString(parsed.translatedDescription, notes);
+        await logEdgeAiUsage(env, userId, featureKey, perm.modelName, `translate:${targetLanguage}`, 'success', Date.now() - start, estimatedTokens);
+        return json({
+          translatedTitle,
+          translatedDescription,
+          targetLanguage,
+          provider: 'cloudflare-workers-ai',
+          model: perm.modelName,
+        });
       }
 
       if (body.action === 'analytics') {
@@ -365,37 +420,47 @@ export async function handleAiRoutes(
         )
           .bind(userId)
           .first();
-        const insights = await runEdgeAi(env, perm.modelName, [
+        const { text: insights, estimatedTokens } = await runEdgeAiText(env, perm.modelName, [
           { role: 'system', content: 'Interpret real SOFUMER shop metrics without inventing numbers.' },
           { role: 'user', content: JSON.stringify(stats || {}) },
         ]);
-        await logEdgeAiUsage(env, userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, Math.ceil(insights.length / 4));
+        await logEdgeAiUsage(env, userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, estimatedTokens);
         return json({ insights, stats, provider: 'cloudflare-workers-ai', model: perm.modelName });
       }
 
-      const cats = await env.DB!.prepare('SELECT id, name FROM categories WHERE is_active = 1').all();
-      const raw = await runEdgeAi(
-        env,
-        perm.modelName,
-        [
-          {
-            role: 'system',
-            content:
-              'Generate a seller listing draft for review. Respond ONLY with valid JSON: {"suggestedTitle": string, "improvedDescription": string, "suggestedCategoryId": string, "keywords": string[], "faqs": [{"question": string, "answer": string}]}.',
-          },
-          {
-            role: 'user',
-            content: `Type: ${body.listingType || 'physical'}\nTitle: ${body.title || ''}\nNotes: ${body.notes || ''}\nCategories: ${JSON.stringify(cats.results)}`,
-          },
-        ],
-        true
-      );
-      await logEdgeAiUsage(env, userId, featureKey, perm.modelName, body.title || 'listing_draft', 'success', Date.now() - start, Math.ceil(raw.length / 4));
-      return json(parseJsonFromAi(raw));
+      if (!title && !notes) {
+        return json({ error: 'Enter a product title or notes so AI can draft a listing.' }, 400);
+      }
+      const cats = await env.DB!.prepare('SELECT id, name FROM categories WHERE is_active = 1').all<{ id: string; name: string }>();
+      const validCatIds = new Set(cats.results.map((c) => String(c.id)));
+      const { data: parsed, estimatedTokens } = await runEdgeAiJson(env, perm.modelName, [
+        {
+          role: 'system',
+          content:
+            'Generate a seller listing draft for review. Respond ONLY with valid JSON: {"suggestedTitle": string, "improvedDescription": string, "suggestedCategoryId": string, "keywords": string[], "faqs": [{"question": string, "answer": string}]}.',
+        },
+        {
+          role: 'user',
+          content: `Type: ${listingType}\nTitle: ${title}\nNotes: ${notes}\nCategories: ${JSON.stringify(cats.results)}`,
+        },
+      ]);
+      const rawCatId = coerceAiString(parsed.suggestedCategoryId);
+      const suggestedCategoryId = validCatIds.has(rawCatId) ? rawCatId : '';
+
+      await logEdgeAiUsage(env, userId, featureKey, perm.modelName, title || 'listing_draft', 'success', Date.now() - start, estimatedTokens);
+      return json({
+        suggestedTitle: coerceAiString(parsed.suggestedTitle, title),
+        improvedDescription: coerceAiString(parsed.improvedDescription, notes),
+        suggestedCategoryId,
+        keywords: coerceAiStringList(parsed.keywords, 12),
+        faqs: normalizeFaqs(parsed.faqs),
+        provider: 'cloudflare-workers-ai',
+        model: perm.modelName,
+      });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Workers AI seller assist failed';
-      await logEdgeAiUsage(env, userId, featureKey, perm.modelName, body.action, 'error', Date.now() - start, 0, msg);
-      return json({ error: msg }, 502);
+      const { internalMessage, userMessage } = sanitizeAiErrorForUser(err);
+      await logEdgeAiUsage(env, userId, featureKey, perm.modelName, body.action, 'error', Date.now() - start, 0, internalMessage);
+      return json({ error: userMessage }, 502);
     }
   }
 
@@ -404,7 +469,7 @@ export async function handleAiRoutes(
     const start = Date.now();
     const parsedBody = await parseJsonBody<{ question?: string }>(request);
     if (!parsedBody.ok) return parsedBody.error;
-    const question = String(parsedBody.data.question || '').trim().slice(0, 800);
+    const question = sanitizeText(parsedBody.data.question || '', 800);
     if (!question) return json({ error: 'Question is required.' }, 400);
 
     const perm = await checkEdgeAiPermission(env, userId, 'platform_support');
@@ -414,7 +479,7 @@ export async function handleAiRoutes(
     }
 
     try {
-      const reply = await runEdgeAi(env, perm.modelName, [
+      const { text: reply, estimatedTokens } = await runEdgeAiText(env, perm.modelName, [
         {
           role: 'system',
           content:
@@ -422,14 +487,15 @@ export async function handleAiRoutes(
         },
         { role: 'user', content: question },
       ]);
-      await logEdgeAiUsage(env, userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, Math.ceil(reply.length / 4));
+      await logEdgeAiUsage(env, userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, estimatedTokens);
       return json({ reply, provider: 'cloudflare-workers-ai', model: perm.modelName });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Workers AI support failed';
-      await logEdgeAiUsage(env, userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, msg);
-      return json({ error: msg }, 502);
+      const { internalMessage, userMessage } = sanitizeAiErrorForUser(err);
+      await logEdgeAiUsage(env, userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, internalMessage);
+      return json({ error: userMessage }, 502);
     }
   }
 
   return json({ error: 'AI API endpoint not found.' }, 404);
 }
+

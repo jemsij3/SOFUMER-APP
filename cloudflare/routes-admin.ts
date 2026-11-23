@@ -19,6 +19,13 @@ import {
   sanitizeText,
   slugify,
 } from './helpers.ts';
+import {
+  coerceAiString,
+  normalizeAiJsonObject,
+  resolveActiveCfAiModel,
+  runWorkersAiWithJsonFallback,
+  sanitizeAiErrorForUser,
+} from './ai-normalizer.ts';
 
 async function validateAndNormalizeSetting(
   db: D1Database,
@@ -463,8 +470,7 @@ export async function handleAdminRoutes(
     const settingRow = await env.DB.prepare(
       "SELECT model_name FROM ai_feature_settings WHERE feature_key = 'platform_support'"
     ).first<{ model_name: string }>();
-    const candidateModel = settingRow?.model_name || env.CLOUDFLARE_AI_MODEL || DEFAULT_CF_AI_MODEL;
-    const modelName = VALID_CF_MODELS.has(candidateModel) ? candidateModel : DEFAULT_CF_AI_MODEL;
+    const modelName = resolveActiveCfAiModel(settingRow?.model_name, env.CLOUDFLARE_AI_MODEL, DEFAULT_CF_AI_MODEL);
 
     let riskLevel: 'low' | 'medium' | 'high' = keywordMatches.length > 0 ? 'high' : 'low';
     let rationale = keywordMatches.length
@@ -474,10 +480,12 @@ export async function handleAdminRoutes(
     let aiEvaluated = false;
 
     if (env.AI) {
+      const start = Date.now();
       try {
-        const start = Date.now();
-        const aiOut = await env.AI.run(modelName, {
-          messages: [
+        const rawOut = await runWorkersAiWithJsonFallback(
+          env.AI,
+          modelName,
+          [
             {
               role: 'system',
               content:
@@ -487,7 +495,7 @@ export async function handleAdminRoutes(
               role: 'user',
               content: JSON.stringify({
                 title: product.title,
-                description: product.description,
+                description: String(product.description || '').slice(0, 800),
                 listingType: product.listing_type,
                 category: product.category_name,
                 price: product.price,
@@ -496,41 +504,43 @@ export async function handleAdminRoutes(
               }),
             },
           ],
-          max_tokens: 400,
-          temperature: 0.1,
-          response_format: { type: 'json_object' },
-        });
-        const rawText = aiOut?.response ?? aiOut?.result?.response ?? '';
-        const matchJson = rawText.match(/\{[\s\S]*\}/);
-        if (matchJson) {
-          const parsed = JSON.parse(matchJson[0]) as {
-            riskLevel?: string;
-            recommendedStatus?: string;
-            rationale?: string;
-          };
-          if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium' || parsed.riskLevel === 'high') {
-            riskLevel = keywordMatches.length > 0 ? 'high' : parsed.riskLevel;
-          }
-          if (
-            parsed.recommendedStatus === 'published' ||
-            parsed.recommendedStatus === 'pending_review' ||
-            parsed.recommendedStatus === 'rejected'
-          ) {
-            recommendedStatus = keywordMatches.length > 0 ? 'rejected' : parsed.recommendedStatus;
-          }
-          if (parsed.rationale) {
-            rationale = sanitizeText(parsed.rationale, 400);
-          }
-          aiEvaluated = true;
+          true,
+          400,
+          0.1
+        );
+        const { data: parsed, estimatedTokens } = await normalizeAiJsonObject(rawOut);
+        if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium' || parsed.riskLevel === 'high') {
+          riskLevel = keywordMatches.length > 0 ? 'high' : parsed.riskLevel;
         }
+        if (
+          parsed.recommendedStatus === 'published' ||
+          parsed.recommendedStatus === 'pending_review' ||
+          parsed.recommendedStatus === 'rejected'
+        ) {
+          recommendedStatus = keywordMatches.length > 0 ? 'rejected' : parsed.recommendedStatus;
+        }
+        const rationaleText = coerceAiString(parsed.rationale);
+        if (rationaleText) {
+          rationale = sanitizeText(rationaleText, 400);
+        }
+        aiEvaluated = true;
+
         await env.DB.prepare(
           `INSERT INTO ai_usage (id, user_id, feature_key, model_name, prompt_summary, tokens_estimated, status, latency_ms)
            VALUES (?, ?, 'platform_support', ?, ?, ?, 'success', ?)`
         )
-          .bind(newId('ai'), admin.userId, modelName, `admin_scan:${prodId}`, Math.ceil(rawText.length / 4), Date.now() - start)
+          .bind(newId('ai'), admin.userId, modelName, `admin_scan:${prodId}`, estimatedTokens, Date.now() - start)
           .run();
-      } catch {
-        // Fall back to deterministic keyword scan when AI model binding is offline
+      } catch (err) {
+        const { internalMessage } = sanitizeAiErrorForUser(err);
+        await env.DB.prepare(
+          `INSERT INTO ai_usage (id, user_id, feature_key, model_name, prompt_summary, tokens_estimated, status, error_message, latency_ms)
+           VALUES (?, ?, 'platform_support', ?, ?, 0, 'error', ?, ?)`
+        )
+          .bind(newId('ai'), admin.userId, modelName, `admin_scan:${prodId}`, internalMessage.slice(0, 400), Date.now() - start)
+          .run()
+          .catch(() => {});
+        // Fall back to deterministic keyword scan when AI model binding fails
       }
     }
 
@@ -1317,7 +1327,7 @@ export async function handleAdminRoutes(
     const currentRows = await env.DB.prepare('SELECT permission_key FROM admin_permissions WHERE role_id = ?')
       .bind(roleId)
       .all<{ permission_key: string }>();
-    const currentSet = new Set(currentRows.results.map((r) => r.permission_key));
+    const currentSet = new Set<string>(currentRows.results.map((r: { permission_key: string }) => r.permission_key));
 
     if (!admin.isOwner) {
       for (const perm of nextPerms) {

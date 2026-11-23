@@ -33,20 +33,16 @@ export interface R2BucketLike {
   delete?(key: string): Promise<void>;
 }
 
-export interface WorkersAiBinding {
-  run(
-    model: string,
-    inputs: {
-      messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
-      max_tokens?: number;
-      temperature?: number;
-      response_format?: { type: 'json_object' };
-    }
-  ): Promise<{ response?: string; result?: { response?: string } }>;
-}
+import {
+  DEFAULT_CF_AI_MODEL,
+  VALID_CF_MODELS,
+  type WorkersAiBinding,
+} from './ai-normalizer.ts';
 
-export interface Fetcher {
-  fetch(request: Request | string, init?: RequestInit): Promise<Response>;
+export { DEFAULT_CF_AI_MODEL, VALID_CF_MODELS, type WorkersAiBinding };
+
+export interface AssetsBinding {
+  fetch(request: Request): Promise<Response>;
 }
 
 export interface ExecutionContextLike {
@@ -57,29 +53,19 @@ export interface ExecutionContextLike {
 export interface Env {
   DB?: D1Database;
   AI?: WorkersAiBinding;
-  ASSETS?: Fetcher;
+  ASSETS?: AssetsBinding;
   MEDIA_BUCKET?: R2BucketLike;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   JWT_SECRET?: string;
   ADMIN_TELEGRAM_IDS?: string;
   ADMIN_TELEGRAM_ID?: string;
+  MINI_APP_URL?: string;
+  CLOUDFLARE_AI_MODEL?: string;
   CLOUDINARY_CLOUD_NAME?: string;
   CLOUDINARY_API_KEY?: string;
   CLOUDINARY_API_SECRET?: string;
-  MINI_APP_URL?: string;
-  CLOUDFLARE_AI_MODEL?: string;
 }
-
-export const DEFAULT_CF_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-fast';
-
-export const VALID_CF_MODELS = new Set([
-  '@cf/meta/llama-3.1-8b-instruct-fast',
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/meta/llama-4-scout-17b-16e-instruct',
-  '@cf/qwen/qwen3-30b-a3b-fp8',
-  '@cf/mistralai/mistral-small-3.1-24b-instruct',
-]);
 
 export const ADMIN_PERMISSION_CATALOG = [
   { key: '*', label: 'Full Platform Owner', description: 'Unrestricted access to every system capability and RBAC management' },
@@ -664,7 +650,7 @@ export async function resolveEdgeAdminContext(
       .bind(assignment.role_id)
       .all<{ permission_key: string }>();
 
-    const permissions = permsRes.results.map((r) => r.permission_key);
+    const permissions = permsRes.results.map((r: { permission_key: string }) => r.permission_key);
     const isOwner = assignment.role_code === 'OWNER' || permissions.includes('*');
 
     return {
@@ -943,8 +929,8 @@ export async function checkProhibitedKeywordsEdge(env: Env, text: string): Promi
   const lower = text.toLowerCase();
   return row.value
     .split(',')
-    .map((k) => k.trim().toLowerCase())
-    .filter((k) => k.length > 0 && lower.includes(k));
+    .map((k: string) => k.trim().toLowerCase())
+    .filter((k: string) => k.length > 0 && lower.includes(k));
 }
 
 export async function parseJsonBody<T = Record<string, unknown>>(

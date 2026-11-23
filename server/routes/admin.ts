@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db, newId, slugify } from '../db.ts';
-import { invokeCloudflareWorkersAi, logAiUsage } from '../ai.ts';
+import { invokeCloudflareWorkersAiJson, logAiUsage } from '../ai.ts';
+import { coerceAiString, resolveActiveCfAiModel, sanitizeAiErrorForUser } from '../../cloudflare/ai-normalizer.ts';
 import {
   ADMIN_PERMISSION_CATALOG,
   DEFAULT_CF_AI_MODEL,
@@ -414,8 +415,7 @@ adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('mod
   const settingRow = db
     .prepare("SELECT model_name FROM ai_feature_settings WHERE feature_key = 'platform_support'")
     .get() as { model_name: string } | undefined;
-  const candidateModel = settingRow?.model_name || process.env.CLOUDFLARE_AI_MODEL || DEFAULT_CF_AI_MODEL;
-  const modelName = VALID_CF_MODELS.has(candidateModel) ? candidateModel : DEFAULT_CF_AI_MODEL;
+  const modelName = resolveActiveCfAiModel(settingRow?.model_name, process.env.CLOUDFLARE_AI_MODEL, DEFAULT_CF_AI_MODEL);
 
   let riskLevel: 'low' | 'medium' | 'high' = keywordMatches.length > 0 ? 'high' : 'low';
   let rationale = keywordMatches.length
@@ -424,9 +424,9 @@ adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('mod
   let recommendedStatus: 'published' | 'pending_review' | 'rejected' = keywordMatches.length > 0 ? 'rejected' : 'published';
   let aiEvaluated = false;
 
+  const start = Date.now();
   try {
-    const start = Date.now();
-    const rawText = await invokeCloudflareWorkersAi(
+    const { data: parsed, estimatedTokens } = await invokeCloudflareWorkersAiJson(
       modelName,
       [
         {
@@ -438,7 +438,7 @@ adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('mod
           role: 'user',
           content: JSON.stringify({
             title: product.title,
-            description: product.description,
+            description: String(product.description || '').slice(0, 800),
             listingType: product.listing_type,
             category: product.category_name,
             price: product.price,
@@ -447,32 +447,28 @@ adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('mod
           }),
         },
       ],
-      true
+      400,
+      0.1
     );
-    const matchJson = rawText.match(/\{[\s\S]*\}/);
-    if (matchJson) {
-      const parsed = JSON.parse(matchJson[0]) as {
-        riskLevel?: string;
-        recommendedStatus?: string;
-        rationale?: string;
-      };
-      if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium' || parsed.riskLevel === 'high') {
-        riskLevel = keywordMatches.length > 0 ? 'high' : parsed.riskLevel;
-      }
-      if (
-        parsed.recommendedStatus === 'published' ||
-        parsed.recommendedStatus === 'pending_review' ||
-        parsed.recommendedStatus === 'rejected'
-      ) {
-        recommendedStatus = keywordMatches.length > 0 ? 'rejected' : parsed.recommendedStatus;
-      }
-      if (parsed.rationale) {
-        rationale = sanitizeText(parsed.rationale, 400);
-      }
-      aiEvaluated = true;
+    if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium' || parsed.riskLevel === 'high') {
+      riskLevel = keywordMatches.length > 0 ? 'high' : parsed.riskLevel;
     }
-    logAiUsage(req.adminSession!.userId, 'platform_support', modelName, `admin_scan:${req.params.id}`, 'success', Date.now() - start, Math.ceil(rawText.length / 4));
-  } catch {
+    if (
+      parsed.recommendedStatus === 'published' ||
+      parsed.recommendedStatus === 'pending_review' ||
+      parsed.recommendedStatus === 'rejected'
+    ) {
+      recommendedStatus = keywordMatches.length > 0 ? 'rejected' : parsed.recommendedStatus;
+    }
+    const rationaleText = coerceAiString(parsed.rationale);
+    if (rationaleText) {
+      rationale = sanitizeText(rationaleText, 400);
+    }
+    aiEvaluated = true;
+    logAiUsage(req.adminSession!.userId, 'platform_support', modelName, `admin_scan:${req.params.id}`, 'success', Date.now() - start, estimatedTokens);
+  } catch (err) {
+    const { internalMessage } = sanitizeAiErrorForUser(err);
+    logAiUsage(req.adminSession!.userId, 'platform_support', modelName, `admin_scan:${req.params.id}`, 'error', Date.now() - start, 0, internalMessage);
     // Fall back to deterministic keyword check if REST credentials are absent in local dev
   }
 

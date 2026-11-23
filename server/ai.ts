@@ -1,21 +1,21 @@
 import { db, newId } from './db.ts';
-import { DEFAULT_CF_AI_MODEL, VALID_CF_MODELS, getActiveSubscriptionLocal } from './security.ts';
+import { getActiveSubscriptionLocal } from './security.ts';
+import {
+  type WorkersAiBinding,
+  type WorkersAiMessage,
+  type WorkersAiRawOutput,
+  coerceAiString,
+  coerceAiStringList,
+  estimateTokens,
+  normalizeAiJsonObject,
+  normalizeAiText,
+  resolveActiveCfAiModel,
+  runWorkersAiWithJsonFallback,
+  sanitizeAiErrorForUser,
+} from '../cloudflare/ai-normalizer.ts';
 
-export const DEFAULT_CLOUDFLARE_AI_MODEL = VALID_CF_MODELS.has(process.env.CLOUDFLARE_AI_MODEL || '')
-  ? String(process.env.CLOUDFLARE_AI_MODEL)
-  : DEFAULT_CF_AI_MODEL;
-
-export interface WorkersAiBinding {
-  run(
-    model: string,
-    inputs: {
-      messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
-      max_tokens?: number;
-      temperature?: number;
-      response_format?: { type: 'json_object' };
-    }
-  ): Promise<{ response?: string; result?: { response?: string } }>;
-}
+export type { WorkersAiBinding };
+export const DEFAULT_CLOUDFLARE_AI_MODEL = resolveActiveCfAiModel(process.env.CLOUDFLARE_AI_MODEL);
 
 let registeredAiBinding: WorkersAiBinding | null = null;
 
@@ -23,33 +23,87 @@ export function setWorkersAiBinding(binding: WorkersAiBinding | null) {
   registeredAiBinding = binding;
 }
 
-function extractJsonObject(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fenced ? fenced[1] : trimmed).trim();
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    return JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>;
+async function runCloudflareWorkersAiRest(
+  accountId: string,
+  apiToken: string,
+  modelName: string,
+  messages: WorkersAiMessage[],
+  expectJson: boolean,
+  maxTokens: number,
+  temperature: number
+): Promise<WorkersAiRawOutput> {
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${modelName}`;
+
+  const postRun = async (withResponseFormat: boolean) => {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        ...(withResponseFormat ? { response_format: { type: 'json_object' } } : {}),
+      }),
+    });
+
+    const contentType = resp.headers.get('content-type') || '';
+    if (resp.ok && (contentType.includes('text/event-stream') || contentType.includes('text/plain'))) {
+      return resp.body as ReadableStream<Uint8Array>;
+    }
+
+    const payload = (await resp.json().catch(() => ({}))) as {
+      success?: boolean;
+      errors?: Array<{ message?: string; code?: number }>;
+      [key: string]: unknown;
+    };
+
+    if (!resp.ok || payload.success === false) {
+      const errMsg =
+        payload.errors?.[0]?.message || `Cloudflare Workers AI request failed (${resp.status})`;
+      throw Object.assign(new Error(errMsg), { status: resp.status });
+    }
+    return payload as WorkersAiRawOutput;
+  };
+
+  if (!expectJson) {
+    return await postRun(false);
   }
-  return JSON.parse(candidate) as Record<string, unknown>;
+
+  try {
+    return await postRun(true);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.toLowerCase() : '';
+    const isSchemaFlagRejected =
+      msg.includes('response_format') ||
+      msg.includes('json_object') ||
+      msg.includes('schema') ||
+      msg.includes('unsupported property');
+    if (isSchemaFlagRejected) {
+      return await postRun(false);
+    }
+    throw err;
+  }
 }
 
-export async function invokeCloudflareWorkersAi(
+async function invokeWorkersAiRaw(
   modelName: string,
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  expectJson = false
-): Promise<string> {
+  messages: WorkersAiMessage[],
+  expectJson = false,
+  maxTokens = 900,
+  temperature = 0.2
+): Promise<WorkersAiRawOutput> {
   if (registeredAiBinding) {
-    const out = await registeredAiBinding.run(modelName, {
+    return await runWorkersAiWithJsonFallback(
+      registeredAiBinding,
+      modelName,
       messages,
-      max_tokens: 900,
-      temperature: 0.2,
-      ...(expectJson ? { response_format: { type: 'json_object' } } : {}),
-    });
-    const text = out?.response ?? out?.result?.response ?? '';
-    if (!text) throw new Error('Empty response returned by Cloudflare Workers AI binding.');
-    return text;
+      expectJson,
+      maxTokens,
+      temperature
+    );
   }
 
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
@@ -60,39 +114,36 @@ export async function invokeCloudflareWorkersAi(
     );
   }
 
-  const resp = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${modelName}`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messages,
-        max_tokens: 900,
-        temperature: 0.2,
-        ...(expectJson ? { response_format: { type: 'json_object' } } : {}),
-      }),
-    }
+  return await runCloudflareWorkersAiRest(
+    accountId,
+    apiToken,
+    modelName,
+    messages,
+    expectJson,
+    maxTokens,
+    temperature
   );
+}
 
-  const payload = (await resp.json().catch(() => ({}))) as {
-    success?: boolean;
-    errors?: Array<{ message?: string }>;
-    result?: { response?: string };
-  };
+export async function invokeCloudflareWorkersAi(
+  modelName: string,
+  messages: WorkersAiMessage[],
+  expectJson = false,
+  maxTokens = 900,
+  temperature = 0.2
+): Promise<string> {
+  const raw = await invokeWorkersAiRaw(modelName, messages, expectJson, maxTokens, temperature);
+  return await normalizeAiText(raw);
+}
 
-  if (!resp.ok || payload.success === false) {
-    const errMsg = payload.errors?.[0]?.message || `Cloudflare Workers AI request failed (${resp.status})`;
-    throw new Error(errMsg);
-  }
-
-  const text = payload.result?.response || '';
-  if (!text) {
-    throw new Error('Empty response returned from Cloudflare Workers AI.');
-  }
-  return text;
+export async function invokeCloudflareWorkersAiJson(
+  modelName: string,
+  messages: WorkersAiMessage[],
+  maxTokens = 900,
+  temperature = 0.2
+): Promise<{ data: Record<string, unknown>; estimatedTokens: number }> {
+  const raw = await invokeWorkersAiRaw(modelName, messages, true, maxTokens, temperature);
+  return await normalizeAiJsonObject(raw);
 }
 
 export interface AiAccessCheck {
@@ -104,17 +155,17 @@ export interface AiAccessCheck {
 }
 
 export function checkAiPermission(userId: string, featureKey: string): AiAccessCheck {
+  const fallbackModel = resolveActiveCfAiModel(process.env.CLOUDFLARE_AI_MODEL);
+
   const globalSetting = db
     .prepare("SELECT is_enabled, model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'")
     .get() as { is_enabled: number; model_name: string } | undefined;
-
-  const fallbackModel = DEFAULT_CLOUDFLARE_AI_MODEL;
 
   if (!globalSetting || !globalSetting.is_enabled) {
     return {
       allowed: false,
       reason: 'AI services are currently disabled globally by platform administrators.',
-      modelName: globalSetting?.model_name || fallbackModel,
+      modelName: resolveActiveCfAiModel(globalSetting?.model_name, fallbackModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -128,7 +179,7 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: `The "${featureKey}" AI feature is currently disabled by administrators.`,
-      modelName: featureSetting.model_name || fallbackModel,
+      modelName: resolveActiveCfAiModel(featureSetting.model_name, globalSetting.model_name, fallbackModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -142,7 +193,7 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: userPerm.reason || 'Your AI access has been restricted by an administrator.',
-      modelName: featureSetting?.model_name || globalSetting.model_name || fallbackModel,
+      modelName: resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, fallbackModel),
       dailyLimit: 0,
       usedToday: 0,
     };
@@ -168,14 +219,13 @@ export function checkAiPermission(userId: string, featureKey: string): AiAccessC
     return {
       allowed: false,
       reason: `Daily AI usage limit reached (${usedRow.cnt}/${dailyLimit}). Upgrade your seller plan or wait until tomorrow.`,
-      modelName: featureSetting?.model_name || globalSetting.model_name || fallbackModel,
+      modelName: resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, fallbackModel),
       dailyLimit,
       usedToday: usedRow.cnt,
     };
   }
 
-  const rawModel = featureSetting?.model_name || globalSetting.model_name || fallbackModel;
-  const modelName = VALID_CF_MODELS.has(rawModel) ? rawModel : DEFAULT_CLOUDFLARE_AI_MODEL;
+  const modelName = resolveActiveCfAiModel(featureSetting?.model_name, globalSetting.model_name, fallbackModel);
 
   return {
     allowed: true,
@@ -211,6 +261,21 @@ export function logAiUsage(
   );
 }
 
+function normalizeFaqs(value: unknown): Array<{ question: string; answer: string }> {
+  if (!Array.isArray(value)) return [];
+  const faqs: Array<{ question: string; answer: string }> = [];
+  for (const item of value) {
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      const question = coerceAiString(rec.question);
+      const answer = coerceAiString(rec.answer);
+      if (question && answer) faqs.push({ question, answer });
+    }
+    if (faqs.length >= 8) break;
+  }
+  return faqs;
+}
+
 export async function runBuyerDiscoveryAi(userId: string, query: string) {
   const start = Date.now();
   const perm = checkAiPermission(userId, 'buyer_search');
@@ -234,47 +299,61 @@ export async function runBuyerDiscoveryAi(userId: string, query: string) {
     )
     .all() as Record<string, unknown>[];
 
-  try {
-    const raw = await invokeCloudflareWorkersAi(
-      perm.modelName,
-      [
-        {
-          role: 'system',
-          content:
-            'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, sellers, or availability. If the catalog is empty or no items match, say so honestly. Respond ONLY with a valid JSON object matching: {"answer": string, "matchedProductIds": string[], "suggestedFollowUps": string[]}.',
-        },
-        {
-          role: 'user',
-          content: `Buyer query: "${query}"\n\nPublished SOFUMER catalog JSON:\n${JSON.stringify(catalog)}`,
-        },
-      ],
-      true
-    );
+  const catalogForPrompt = catalog.map((item) => ({
+    id: item.id,
+    title: item.title,
+    description: String(item.description || '').slice(0, 220),
+    price: item.price,
+    currency: item.currency,
+    listing_type: item.listing_type,
+    condition: item.condition,
+    country_code: item.country_code,
+    international_shipping: item.international_shipping,
+    category_name: item.category_name,
+    shop_name: item.shop_name,
+  }));
 
-    const parsed = extractJsonObject(raw);
+  try {
+    const { data: parsed, estimatedTokens } = await invokeCloudflareWorkersAiJson(perm.modelName, [
+      {
+        role: 'system',
+        content:
+          'You are the SOFUMER Marketplace AI Shopping Assistant. STRICT RULE: Only reference products present in the provided SOFUMER catalog JSON. NEVER invent products, prices, ratings, sellers, or availability. If the catalog is empty or no items match, say so honestly. Respond ONLY with a valid JSON object matching: {"answer": string, "matchedProductIds": string[], "suggestedFollowUps": string[]}.',
+      },
+      {
+        role: 'user',
+        content: `Buyer query: "${query}"\n\nPublished SOFUMER catalog JSON:\n${JSON.stringify(catalogForPrompt)}`,
+      },
+    ]);
+
     const validIds = new Set(catalog.map((c) => String(c.id)));
     const matchedIds = Array.isArray(parsed.matchedProductIds)
-      ? parsed.matchedProductIds.filter((id: unknown) => validIds.has(String(id)))
+      ? parsed.matchedProductIds.filter((id: unknown) => validIds.has(String(id))).map(String)
       : [];
-    const matchedProducts = catalog.filter((c) => matchedIds.includes(String(c.id)));
+    const matchedSet = new Set(matchedIds);
+    const matchedProducts = catalog.filter((c) => matchedSet.has(String(c.id)));
+
+    const answer =
+      coerceAiString(parsed.answer) ||
+      (matchedProducts.length > 0
+        ? `Found ${matchedProducts.length} matching published listing${matchedProducts.length === 1 ? '' : 's'} on SOFUMER.`
+        : 'No published listings in the current SOFUMER catalog matched your query.');
 
     const latency = Date.now() - start;
-    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'success', latency, Math.ceil(raw.length / 4));
+    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'success', latency, estimatedTokens);
 
     return {
-      answer: String(parsed.answer || ''),
+      answer,
       matchedProducts,
-      suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps)
-        ? parsed.suggestedFollowUps.slice(0, 3).map(String)
-        : [],
+      suggestedFollowUps: coerceAiStringList(parsed.suggestedFollowUps, 3),
       catalogCount: catalog.length,
       provider: 'cloudflare-workers-ai',
       model: perm.modelName,
     };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI generation failed';
-    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 503 });
+    const { internalMessage, userMessage } = sanitizeAiErrorForUser(error);
+    logAiUsage(userId, 'buyer_search', perm.modelName, query, 'error', Date.now() - start, 0, internalMessage);
+    throw Object.assign(new Error(userMessage), { statusCode: 503 });
   }
 }
 
@@ -318,12 +397,12 @@ export async function runBuyerCompareAi(userId: string, productIds: string[], fo
       },
     ]);
 
-    logAiUsage(userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, Math.ceil(comparison.length / 4));
+    logAiUsage(userId, 'buyer_compare', perm.modelName, `compare:${productIds.join(',')}`, 'success', Date.now() - start, estimateTokens(comparison));
     return { comparison, products, provider: 'cloudflare-workers-ai', model: perm.modelName };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI comparison failed';
-    logAiUsage(userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 503 });
+    const { internalMessage, userMessage } = sanitizeAiErrorForUser(error);
+    logAiUsage(userId, 'buyer_compare', perm.modelName, 'compare', 'error', Date.now() - start, 0, internalMessage);
+    throw Object.assign(new Error(userMessage), { statusCode: 503 });
   }
 }
 
@@ -352,25 +431,33 @@ export async function runSellerListingAi(
     throw Object.assign(new Error(perm.reason || 'AI access denied'), { statusCode: 403 });
   }
 
+  const title = (payload.title || '').trim();
+  const notes = (payload.notes || '').trim();
+
   try {
     if (payload.action === 'translate') {
-      const raw = await invokeCloudflareWorkersAi(
-        perm.modelName,
-        [
-          {
-            role: 'system',
-            content:
-              'Translate marketplace listings accurately into the requested target language. Respond ONLY with JSON: {"translatedTitle": string, "translatedDescription": string}.',
-          },
-          {
-            role: 'user',
-            content: `Target Language: ${payload.targetLanguage || 'French'}\nTitle: ${payload.title || ''}\nDescription: ${payload.notes || ''}`,
-          },
-        ],
-        true
-      );
-      logAiUsage(userId, featureKey, perm.modelName, `translate:${payload.targetLanguage}`, 'success', Date.now() - start, Math.ceil(raw.length / 4));
-      return extractJsonObject(raw);
+      if (!title && !notes) {
+        throw Object.assign(new Error('Enter a listing title or description to translate.'), { statusCode: 400 });
+      }
+      const { data: parsed, estimatedTokens } = await invokeCloudflareWorkersAiJson(perm.modelName, [
+        {
+          role: 'system',
+          content:
+            'Translate marketplace listings accurately into the requested target language. Respond ONLY with JSON: {"translatedTitle": string, "translatedDescription": string}.',
+        },
+        {
+          role: 'user',
+          content: `Target Language: ${payload.targetLanguage || 'French'}\nTitle: ${title}\nDescription: ${notes}`,
+        },
+      ]);
+      logAiUsage(userId, featureKey, perm.modelName, `translate:${payload.targetLanguage}`, 'success', Date.now() - start, estimatedTokens);
+      return {
+        translatedTitle: coerceAiString(parsed.translatedTitle, title),
+        translatedDescription: coerceAiString(parsed.translatedDescription, notes),
+        targetLanguage: payload.targetLanguage || 'French',
+        provider: 'cloudflare-workers-ai',
+        model: perm.modelName,
+      };
     }
 
     if (payload.action === 'analytics') {
@@ -398,33 +485,46 @@ export async function runSellerListingAi(
         },
       ]);
 
-      logAiUsage(userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, Math.ceil(insights.length / 4));
+      logAiUsage(userId, featureKey, perm.modelName, 'shop_analytics', 'success', Date.now() - start, estimateTokens(insights));
       return { insights, stats: shopStats, provider: 'cloudflare-workers-ai', model: perm.modelName };
     }
 
-    const categories = db.prepare('SELECT id, name FROM categories WHERE is_active = 1').all();
-    const raw = await invokeCloudflareWorkersAi(
-      perm.modelName,
-      [
-        {
-          role: 'system',
-          content:
-            'You assist SOFUMER sellers in drafting accurate, clear, trustworthy listings for seller review before publication. Never invent fake certifications. Respond ONLY with valid JSON: {"suggestedTitle": string, "improvedDescription": string, "suggestedCategoryId": string, "keywords": string[], "faqs": [{"question": string, "answer": string}]}.',
-        },
-        {
-          role: 'user',
-          content: `Listing Type: ${payload.listingType || 'physical'}\nDraft Title: ${payload.title || ''}\nSeller Notes: ${payload.notes || ''}\nAvailable Categories: ${JSON.stringify(categories)}`,
-        },
-      ],
-      true
-    );
+    if (!title && !notes) {
+      throw Object.assign(new Error('Enter a product title or notes so AI can draft a listing.'), { statusCode: 400 });
+    }
+    const categories = db.prepare('SELECT id, name FROM categories WHERE is_active = 1').all() as Array<{ id: string; name: string }>;
+    const validCatIds = new Set(categories.map((c) => String(c.id)));
+    const { data: parsed, estimatedTokens } = await invokeCloudflareWorkersAiJson(perm.modelName, [
+      {
+        role: 'system',
+        content:
+          'You assist SOFUMER sellers in drafting accurate, clear, trustworthy listings for seller review before publication. Never invent fake certifications. Respond ONLY with valid JSON: {"suggestedTitle": string, "improvedDescription": string, "suggestedCategoryId": string, "keywords": string[], "faqs": [{"question": string, "answer": string}]}.',
+      },
+      {
+        role: 'user',
+        content: `Listing Type: ${payload.listingType || 'physical'}\nDraft Title: ${title}\nSeller Notes: ${notes}\nAvailable Categories: ${JSON.stringify(categories)}`,
+      },
+    ]);
+    const rawCatId = coerceAiString(parsed.suggestedCategoryId);
+    const suggestedCategoryId = validCatIds.has(rawCatId) ? rawCatId : '';
 
-    logAiUsage(userId, featureKey, perm.modelName, payload.title || 'listing_draft', 'success', Date.now() - start, Math.ceil(raw.length / 4));
-    return extractJsonObject(raw);
+    logAiUsage(userId, featureKey, perm.modelName, title || 'listing_draft', 'success', Date.now() - start, estimatedTokens);
+    return {
+      suggestedTitle: coerceAiString(parsed.suggestedTitle, title),
+      improvedDescription: coerceAiString(parsed.improvedDescription, notes),
+      suggestedCategoryId,
+      keywords: coerceAiStringList(parsed.keywords, 12),
+      faqs: normalizeFaqs(parsed.faqs),
+      provider: 'cloudflare-workers-ai',
+      model: perm.modelName,
+    };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI seller assist failed';
-    logAiUsage(userId, featureKey, perm.modelName, payload.action, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 503 });
+    if ((error as { statusCode?: number }).statusCode === 400) {
+      throw error;
+    }
+    const { internalMessage, userMessage } = sanitizeAiErrorForUser(error);
+    logAiUsage(userId, featureKey, perm.modelName, payload.action, 'error', Date.now() - start, 0, internalMessage);
+    throw Object.assign(new Error(userMessage), { statusCode: 503 });
   }
 }
 
@@ -449,11 +549,12 @@ export async function runPlatformSupportAi(userId: string, question: string) {
       },
     ]);
 
-    logAiUsage(userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, Math.ceil(reply.length / 4));
+    logAiUsage(userId, 'platform_support', perm.modelName, question, 'success', Date.now() - start, estimateTokens(reply));
     return { reply, provider: 'cloudflare-workers-ai', model: perm.modelName };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Cloudflare Workers AI support failed';
-    logAiUsage(userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, msg);
-    throw Object.assign(new Error(msg), { statusCode: 503 });
+    const { internalMessage, userMessage } = sanitizeAiErrorForUser(error);
+    logAiUsage(userId, 'platform_support', perm.modelName, question, 'error', Date.now() - start, 0, internalMessage);
+    throw Object.assign(new Error(userMessage), { statusCode: 503 });
   }
 }
+

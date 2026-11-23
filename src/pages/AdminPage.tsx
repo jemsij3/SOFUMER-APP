@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Bot, Lock, ShieldCheck } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
+import { safeStringArray, safeText } from '../lib/aiFormat';
 
 type AdminTab =
   | 'overview'
@@ -1208,9 +1209,11 @@ export function AdminPage() {
                                 Apply ({scan.recommendedStatus})
                               </button>
                             </div>
-                            <p className="text-slate-300">{scan.rationale}</p>
-                            {scan.keywordMatches.length > 0 && (
-                              <p className="text-red-300">Matched keywords: {scan.keywordMatches.join(', ')}</p>
+                            <p className="text-slate-300">{safeText(scan.rationale, 'Scan completed.')}</p>
+                            {safeStringArray(scan.keywordMatches).length > 0 && (
+                              <p className="text-red-300">
+                                Matched keywords: {safeStringArray(scan.keywordMatches).join(', ')}
+                              </p>
                             )}
                           </div>
                         )}
@@ -2034,6 +2037,8 @@ export function AdminPage() {
                       modelName: String(f.model_name || aiData.defaultModel || ''),
                       dailyLimitPerUser: String(f.daily_limit_per_user ?? 30),
                     };
+                    const availableSet = new Set(aiData.availableModels || []);
+                    const isCurrentModelActive = availableSet.has(draft.modelName);
                     const modelOptions = Array.from(
                       new Set([...(aiData.availableModels || []), String(f.model_name || '')].filter(Boolean))
                     );
@@ -2053,7 +2058,7 @@ export function AdminPage() {
                                   isAdmin: true,
                                   body: JSON.stringify({
                                     isEnabled: !f.is_enabled,
-                                    modelName: draft.modelName,
+                                    modelName: isCurrentModelActive ? draft.modelName : aiData.defaultModel,
                                     dailyLimitPerUser: Number(draft.dailyLimitPerUser),
                                   }),
                                 });
@@ -2083,7 +2088,7 @@ export function AdminPage() {
                           >
                             {modelOptions.map((m) => (
                               <option key={m} value={m}>
-                                {m}
+                                {availableSet.has(m) ? m : `${m} (Deprecated — Select Active Model)`}
                               </option>
                             ))}
                           </select>

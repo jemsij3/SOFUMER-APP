@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
+import { safeStringArray, safeText } from '../lib/aiFormat';
 import {
   type SellerMediaConfig,
   DEFAULT_MEDIA_CONFIG,
@@ -159,6 +160,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
 
   // AI Analytics explanation
   const [analyticsInsight, setAnalyticsInsight] = useState('');
+  const [analyticsAiBusy, setAnalyticsAiBusy] = useState(false);
 
   // Billing & Stars checkout state
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
@@ -469,6 +471,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   }
 
   async function handleAiDraft() {
+    if (aiBusy) return;
     if (!pTitle.trim() && !pDesc.trim()) {
       notify('Enter a rough title or notes first so AI can draft your listing for review.', 'info');
       return;
@@ -476,25 +479,29 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     setAiBusy(true);
     try {
       const res = await apiFetch<{
-        suggestedTitle: string;
-        improvedDescription: string;
-        suggestedCategoryId: string;
-        keywords: string[];
+        suggestedTitle?: unknown;
+        improvedDescription?: unknown;
+        suggestedCategoryId?: unknown;
+        keywords?: unknown;
       }>('/api/ai/seller/assist', {
         method: 'POST',
         body: JSON.stringify({
           action: 'generate_listing',
-          title: pTitle,
-          notes: pDesc,
+          title: pTitle.trim(),
+          notes: pDesc.trim(),
           listingType,
         }),
       });
-      if (res.suggestedTitle) setPTitle(res.suggestedTitle);
-      if (res.improvedDescription) setPDesc(res.improvedDescription);
-      if (res.suggestedCategoryId && categories.some((c) => c.id === res.suggestedCategoryId)) {
-        setPCat(res.suggestedCategoryId);
+      const suggestedTitle = safeText(res.suggestedTitle);
+      const improvedDescription = safeText(res.improvedDescription);
+      const suggestedCategoryId = safeText(res.suggestedCategoryId);
+      const keywords = safeStringArray(res.keywords, 12);
+      if (suggestedTitle) setPTitle(suggestedTitle);
+      if (improvedDescription) setPDesc(improvedDescription);
+      if (suggestedCategoryId && categories.some((c) => c.id === suggestedCategoryId)) {
+        setPCat(suggestedCategoryId);
       }
-      if (Array.isArray(res.keywords)) setPKeywords(res.keywords.join(', '));
+      if (keywords.length > 0) setPKeywords(keywords.join(', '));
       notify('AI draft populated — please review carefully before publishing.', 'success');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'AI assist failed', 'error');
@@ -1429,20 +1436,25 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                 <h2 className="text-base font-semibold text-white">Shop Performance Analytics</h2>
                 <button
                   type="button"
+                  disabled={analyticsAiBusy}
                   onClick={async () => {
+                    if (analyticsAiBusy) return;
+                    setAnalyticsAiBusy(true);
                     try {
-                      const res = await apiFetch<{ insights: string }>('/api/ai/seller/assist', {
+                      const res = await apiFetch<{ insights?: unknown }>('/api/ai/seller/assist', {
                         method: 'POST',
                         body: JSON.stringify({ action: 'analytics' }),
                       });
-                      setAnalyticsInsight(res.insights);
+                      setAnalyticsInsight(safeText(res.insights, 'No analytics insights were returned.'));
                     } catch (err) {
                       notify(err instanceof Error ? err.message : 'AI analytics failed', 'error');
+                    } finally {
+                      setAnalyticsAiBusy(false);
                     }
                   }}
-                  className="h-9 px-3.5 rounded-lg bg-[#131C31] border border-purple-700/40 text-purple-200 text-xs font-medium"
+                  className="h-9 px-3.5 rounded-lg bg-[#131C31] border border-purple-700/40 text-purple-200 text-xs font-medium disabled:opacity-60"
                 >
-                  Explain with AI
+                  {analyticsAiBusy ? 'Analyzing...' : 'Explain with AI'}
                 </button>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">

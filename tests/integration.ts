@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { buildSignedTelegramInitData, verifyTelegramInitData } from '../server/security.ts';
 import { db } from '../server/db.ts';
+import { runBuyerDiscoveryAi, runSellerListingAi, setWorkersAiBinding } from '../server/ai.ts';
 import worker, { type Env as WorkerEnv, type D1Database } from '../cloudflare/worker.ts';
 
 const BASE = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
@@ -160,35 +161,50 @@ async function runTests() {
     const mockEnv: WorkerEnv = {
       DB: createSqliteD1Adapter(),
       AI: {
-        async run(model, inputs) {
-          const userMsg = inputs.messages.find((m) => m.role === 'user')?.content || '';
+        async run(model: string, inputs: { messages: Array<{ role: string; content: string }> }) {
+          const userMsg = inputs.messages.find((m: { role: string; content: string }) => m.role === 'user')?.content || '';
           aiCalls.push({ model, userPrompt: userMsg });
           if (userMsg.includes('Buyer query:')) {
             return {
-              response: JSON.stringify({
+              response: {
                 answer: 'Found Precision USB-C Logic Analyzer in the catalog.',
                 matchedProductIds: [createdProductId],
                 suggestedFollowUps: ['Ask about international shipping'],
-              }),
+              },
             };
           }
           if (userMsg.includes('Target:')) {
             return {
-              response: JSON.stringify({
-                translatedTitle: 'Analyseur Logique USB-C',
-                translatedDescription: 'Analyseur 16 canaux.',
-              }),
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      translatedTitle: 'Analyseur Logique USB-C',
+                      translatedDescription: 'Analyseur 16 canaux.',
+                    }),
+                  },
+                },
+              ],
             };
           }
           if (userMsg.includes('Available Categories:') || userMsg.includes('Categories:')) {
             return {
-              response: JSON.stringify({
+              response: {
                 suggestedTitle: 'Precision USB-C 16-Channel Analyzer',
                 improvedDescription: 'Compact 16-channel analyzer.',
                 suggestedCategoryId: 'cat_electronics',
                 keywords: ['logic analyzer', 'usb-c'],
                 faqs: [{ question: 'Ships globally?', answer: 'Yes.' }],
-              }),
+              },
+            };
+          }
+          if (userMsg.includes('keywordMatches')) {
+            return {
+              response: {
+                riskLevel: 'low',
+                recommendedStatus: 'published',
+                rationale: 'Verified clean listing.',
+              },
             };
           }
           return { response: 'Cloudflare Workers AI response based on real catalog data.' };
@@ -652,6 +668,60 @@ async function runTests() {
     assert.equal(aiCfgJson.defaultModel, '@cf/meta/llama-3.1-8b-instruct-fast');
     assert.ok(aiCfgJson.availableModels.includes('@cf/meta/llama-3.1-8b-instruct-fast'));
     assert.ok(!aiCfgJson.availableModels.includes('@cf/meta/llama-3.1-8b-instruct'));
+    assert.ok(!aiCfgJson.availableModels.includes('@cf/qwen/qwen3-30b-a3b-fp8'));
+
+    const deprecatedReject = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/ai/features/global_ai', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ isEnabled: true, modelName: '@cf/qwen/qwen3-30b-a3b-fp8', dailyLimitPerUser: 30 }),
+      }),
+      mockEnv
+    );
+    assert.equal(deprecatedReject.status, 400);
+
+    const adminScanRes = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/moderation/products/${digPubJson.product.id}/ai-scan`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(adminScanRes.status, 200);
+    const adminScanJson = (await adminScanRes.json()) as { aiEvaluated: boolean; rationale: string };
+    assert.equal(adminScanJson.aiEvaluated, true);
+    assert.equal(adminScanJson.rationale, 'Verified clean listing.');
+
+    // Node/Express parity AI binding test with already-parsed object payload
+    setWorkersAiBinding({
+      async run(_model, inputs) {
+        const sys = inputs.messages.find((m) => m.role === 'system')?.content || '';
+        if (sys.includes('Shopping Assistant')) {
+          return { response: { answer: 'Node parity parsed object ok', matchedProductIds: [], suggestedFollowUps: [] } };
+        }
+        return {
+          response: {
+            suggestedTitle: 'Node Parity Title',
+            improvedDescription: 'Node parity description.',
+            suggestedCategoryId: 'cat_electronics',
+            keywords: ['node', 'parity'],
+            faqs: [],
+          },
+        };
+      },
+    });
+    try {
+      const nodeDisc = await runBuyerDiscoveryAi(buyerUserId, 'node parity check');
+      assert.equal(nodeDisc.answer, 'Node parity parsed object ok');
+      const nodeGen = await runSellerListingAi(buyerUserId, {
+        action: 'generate_listing',
+        title: 'Test',
+        notes: 'Notes',
+      });
+      assert.equal((nodeGen as { suggestedTitle: string }).suggestedTitle, 'Node Parity Title');
+    } finally {
+      setWorkersAiBinding(null);
+    }
 
     const badSettingRes = await worker.fetch(
       new Request('https://sofumer.example/api/admin/settings/stars_per_usd', {

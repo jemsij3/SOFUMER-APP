@@ -618,6 +618,12 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
           { status: 200, headers: { 'Content-Type': 'application/json' } }
         );
       }
+      if (target.includes('api.telegram.org/bot') && target.includes('/sendMessage')) {
+        return new Response(
+          JSON.stringify({ ok: true, result: { message_id: 9001 } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
       return originalFetch(input, init);
     };
 
@@ -2010,4 +2016,339 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('22. Workers AI normalization handles parsed objects (no raw.trim TypeError), OpenAI choices, SSE streams, fallbacks, malformed errors, and deprecated model cleanup', async () => {
+    const testEnvBase = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+      CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct-fast',
+    };
+
+    const loginUser = async (id, username) => {
+      const initData = await signTelegramInitData({ id, first_name: username, username }, testEnvBase.TELEGRAM_BOT_TOKEN);
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        testEnvBase,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return await res.json();
+    };
+
+    const seller = await loginUser(880001, 'ai_seller');
+    const buyer = await loginUser(880002, 'ai_buyer');
+    const admin = await loginUser(999001, 'ai_admin');
+
+    const regCtx = createExecutionContext();
+    await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          sellerType: 'business',
+          legalName: 'AI Test Labs',
+          shopName: 'AI Norm Shop',
+          countryCode: 'US',
+        }),
+      }),
+      testEnvBase,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+
+    const pCtx = createExecutionContext();
+    const pRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Edge Acoustic Studio Monitor',
+          description: 'Studio reference monitor speaker pair.',
+          categoryId: 'cat_electronics',
+          price: 299,
+          currency: 'USD',
+          status: 'published',
+        }),
+      }),
+      testEnvBase,
+      pCtx
+    );
+    await waitOnExecutionContext(pCtx);
+    const { product } = await pRes.json();
+
+    // Case A: Exact reproducer — Workers AI returns `response` as an ALREADY-PARSED JS object (and OpenAI choices)
+    let seenResponseFormatFlags = [];
+    const parsedObjectEnv = {
+      ...testEnvBase,
+      AI: {
+        async run(_model, inputs) {
+          seenResponseFormatFlags.push(Boolean(inputs.response_format));
+          const sys = inputs.messages.find((m) => m.role === 'system')?.content || '';
+          const usr = inputs.messages.find((m) => m.role === 'user')?.content || '';
+          if (sys.includes('Shopping Assistant')) {
+            return {
+              response: {
+                answer: 'Matched the Edge Acoustic Studio Monitor from the catalog.',
+                matchedProductIds: [product.id],
+                suggestedFollowUps: ['Does it include cables?'],
+              },
+            };
+          }
+          if (sys.includes('Translate listing')) {
+            return {
+              choices: [
+                {
+                  message: {
+                    parsed: {
+                      translatedTitle: 'Moniteur Studio Acoustique',
+                      translatedDescription: 'Paire de moniteurs de studio.',
+                    },
+                  },
+                },
+              ],
+            };
+          }
+          if (sys.includes('seller listing draft')) {
+            return {
+              response: {
+                suggestedTitle: 'Edge Acoustic Reference Monitors (Pair)',
+                improvedDescription: 'Balanced studio monitor pair ready for mixing.',
+                suggestedCategoryId: 'cat_electronics',
+                keywords: ['studio monitor', 'speaker'],
+                faqs: [{ question: 'Sold as pair?', answer: 'Yes, includes 2 speakers.' }],
+              },
+            };
+          }
+          if (sys.includes('Safety AI Moderator')) {
+            return {
+              response: {
+                riskLevel: 'low',
+                recommendedStatus: 'published',
+                rationale: 'Clean electronics listing.',
+              },
+            };
+          }
+          if (sys.includes('Compare real SOFUMER')) {
+            return { choices: [{ message: { content: `Comparison for ${usr.length > 0 ? 'monitor' : 'items'}.` } }] };
+          }
+          if (sys.includes('shop metrics')) {
+            const encoder = new TextEncoder();
+            return new ReadableStream({
+              start(controller) {
+                controller.enqueue(encoder.encode('data: {"response":"Shop views look "}\n\n'));
+                controller.enqueue(encoder.encode('data: {"response":"healthy."}\n\n'));
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                controller.close();
+              },
+            });
+          }
+          return { response: 'Direct orders connect buyer and seller via Telegram.' };
+        },
+      },
+    };
+
+    // 1. /api/ai/buyer/discover with parsed object response
+    const discCtx = createExecutionContext();
+    const discRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/buyer/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+        body: JSON.stringify({ query: 'studio monitor speaker' }),
+      }),
+      parsedObjectEnv,
+      discCtx
+    );
+    await waitOnExecutionContext(discCtx);
+    expect(discRes.status).toBe(200);
+    const discJson = await discRes.json();
+    expect(discJson.answer).toContain('Edge Acoustic Studio Monitor');
+    expect(discJson.matchedProducts.some((m) => m.id === product.id)).toBe(true);
+    expect(discJson.suggestedFollowUps).toEqual(['Does it include cables?']);
+
+    // 2. /api/ai/seller/assist (generate_listing) with parsed object response
+    const genCtx = createExecutionContext();
+    const genRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/seller/assist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ action: 'generate_listing', title: 'Monitor', notes: 'Pair', listingType: 'physical' }),
+      }),
+      parsedObjectEnv,
+      genCtx
+    );
+    await waitOnExecutionContext(genCtx);
+    expect(genRes.status).toBe(200);
+    const genJson = await genRes.json();
+    expect(genJson.suggestedTitle).toBe('Edge Acoustic Reference Monitors (Pair)');
+    expect(genJson.faqs[0].question).toBe('Sold as pair?');
+
+    // 3. /api/ai/seller/assist (translate) with OpenAI choices[0].message.parsed
+    const trCtx = createExecutionContext();
+    const trRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/seller/assist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ action: 'translate', title: 'Studio Monitor', notes: 'Pair', targetLanguage: 'French' }),
+      }),
+      parsedObjectEnv,
+      trCtx
+    );
+    await waitOnExecutionContext(trCtx);
+    expect(trRes.status).toBe(200);
+    const trJson = await trRes.json();
+    expect(trJson.translatedTitle).toBe('Moniteur Studio Acoustique');
+
+    // 4. /api/ai/seller/assist (analytics) with SSE ReadableStream
+    const anaCtx = createExecutionContext();
+    const anaRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/seller/assist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ action: 'analytics' }),
+      }),
+      parsedObjectEnv,
+      anaCtx
+    );
+    await waitOnExecutionContext(anaCtx);
+    expect(anaRes.status).toBe(200);
+    const anaJson = await anaRes.json();
+    expect(anaJson.insights).toBe('Shop views look healthy.');
+
+    // 5. /api/ai/buyer/compare with OpenAI choices[0].message.content
+    const cmpCtx = createExecutionContext();
+    const cmpRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/buyer/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+        body: JSON.stringify({ productIds: [product.id] }),
+      }),
+      parsedObjectEnv,
+      cmpCtx
+    );
+    await waitOnExecutionContext(cmpCtx);
+    expect(cmpRes.status).toBe(200);
+    const cmpJson = await cmpRes.json();
+    expect(cmpJson.comparison).toContain('Comparison for monitor');
+
+    // 6. /api/ai/platform/support
+    const supCtx = createExecutionContext();
+    const supRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/platform/support', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+        body: JSON.stringify({ question: 'How do direct orders work?' }),
+      }),
+      parsedObjectEnv,
+      supCtx
+    );
+    await waitOnExecutionContext(supCtx);
+    expect(supRes.status).toBe(200);
+    const supJson = await supRes.json();
+    expect(supJson.reply).toContain('Direct orders');
+
+    // 7. Admin AI Moderation Scan with parsed object response (previously failed silently on rawText.match)
+    const scanCtx = createExecutionContext();
+    const scanRes = await worker.fetch(
+      new Request(`https://sofumer-app.derartuaman8.workers.dev/api/admin/moderation/products/${product.id}/ai-scan`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${admin.token}` },
+      }),
+      parsedObjectEnv,
+      scanCtx
+    );
+    await waitOnExecutionContext(scanCtx);
+    expect(scanRes.status).toBe(200);
+    const scanJson = await scanRes.json();
+    expect(scanJson.aiEvaluated).toBe(true);
+    expect(scanJson.rationale).toBe('Clean electronics listing.');
+    expect(seenResponseFormatFlags.length).toBeGreaterThan(0);
+    expect(seenResponseFormatFlags.some(Boolean)).toBe(true);
+
+    // Case B: response_format rejected -> retries automatically without response_format
+    let retryAttempt = 0;
+    const fallbackEnv = {
+      ...testEnvBase,
+      AI: {
+        async run(_model, inputs) {
+          retryAttempt++;
+          if (inputs.response_format) {
+            throw new Error('Unsupported property: response_format json_object');
+          }
+          return {
+            response: '```json\n{"answer":"Recovered without response_format","matchedProductIds":[],"suggestedFollowUps":[]}\n```',
+          };
+        },
+      },
+    };
+    const fbCtx = createExecutionContext();
+    const fbRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/buyer/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+        body: JSON.stringify({ query: 'headphones' }),
+      }),
+      fallbackEnv,
+      fbCtx
+    );
+    await waitOnExecutionContext(fbCtx);
+    expect(fbRes.status).toBe(200);
+    expect(retryAttempt).toBe(2);
+    const fbJson = await fbRes.json();
+    expect(fbJson.answer).toBe('Recovered without response_format');
+
+    // Case C: Null / malformed outputs return sanitized user-friendly 502 (never leaking ".trim is not a function")
+    for (const badPayload of [null, undefined, [], { response: '' }, { response: 'not-valid-json' }]) {
+      const badEnv = {
+        ...testEnvBase,
+        AI: { async run() { return badPayload; } },
+      };
+      const badCtx = createExecutionContext();
+      const badRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/ai/buyer/discover', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+          body: JSON.stringify({ query: 'malformed case' }),
+        }),
+        badEnv,
+        badCtx
+      );
+      await waitOnExecutionContext(badCtx);
+      expect(badRes.status).toBe(502);
+      const badBody = await badRes.json();
+      expect(typeof badBody.error).toBe('string');
+      expect(badBody.error).not.toContain('trim');
+      expect(badBody.error).not.toContain('TypeError');
+    }
+
+    // Case D: Deprecated @cf/qwen/qwen3-30b-a3b-fp8 is rejected by Admin PATCH and auto-upgraded by ensureD1Schema
+    const depPatchCtx = createExecutionContext();
+    const depPatchRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/admin/ai/features/global_ai', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+        body: JSON.stringify({ isEnabled: true, modelName: '@cf/qwen/qwen3-30b-a3b-fp8', dailyLimitPerUser: 30 }),
+      }),
+      testEnvBase,
+      depPatchCtx
+    );
+    await waitOnExecutionContext(depPatchCtx);
+    expect(depPatchRes.status).toBe(400);
+
+    await env.DB.prepare("UPDATE ai_feature_settings SET model_name = '@cf/qwen/qwen3-30b-a3b-fp8' WHERE feature_key = 'global_ai'").run();
+    resetD1BootstrapCacheForTests();
+    const upgraded = await ensureD1Schema(env.DB);
+    expect(upgraded).toBe(true);
+    const refreshedRow = await env.DB.prepare("SELECT model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'").first();
+    expect(refreshedRow?.model_name).toBe('@cf/meta/llama-3.1-8b-instruct-fast');
+  });
 });
+

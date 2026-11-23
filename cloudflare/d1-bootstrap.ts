@@ -950,13 +950,14 @@ const UPGRADE_STATEMENTS: string[] = [
    SET model_name = '@cf/meta/llama-3.1-8b-instruct-fast',
        updated_by = 'd1_bootstrap_upgrade',
        updated_at = datetime('now')
-   WHERE model_name IN (
-     '@cf/meta/llama-3.1-8b-instruct',
-     '@cf/meta/infire-llama-3.1-8b-instruct',
-     '@cf/mistral/mistral-7b-instruct-v0.1',
-     '@cf/mistral/mistral-7b-instruct-v0.2',
-     '@cf/qwen/qwen2.5-7b-instruct'
-   ) OR model_name NOT LIKE '@cf/%'`,
+    WHERE model_name IN (
+      '@cf/meta/llama-3.1-8b-instruct',
+      '@cf/meta/infire-llama-3.1-8b-instruct',
+      '@cf/mistral/mistral-7b-instruct-v0.1',
+      '@cf/mistral/mistral-7b-instruct-v0.2',
+      '@cf/qwen/qwen2.5-7b-instruct',
+      '@cf/qwen/qwen3-30b-a3b-fp8'
+    ) OR model_name NOT LIKE '@cf/%'`,
   `CREATE TABLE IF NOT EXISTS product_media (
     id TEXT PRIMARY KEY,
     product_id TEXT NOT NULL REFERENCES products(id),
@@ -1003,7 +1004,7 @@ export async function isD1Initialized(db?: D1Database): Promise<boolean> {
     if ((catRow?.cnt ?? 0) === 0) return false;
     const staleModel = await db
       .prepare(
-        "SELECT COUNT(*) as cnt FROM ai_feature_settings WHERE model_name IN ('@cf/meta/llama-3.1-8b-instruct', '@cf/meta/infire-llama-3.1-8b-instruct', '@cf/mistral/mistral-7b-instruct-v0.1', '@cf/mistral/mistral-7b-instruct-v0.2', '@cf/qwen/qwen2.5-7b-instruct') OR model_name NOT LIKE '@cf/%'"
+        "SELECT COUNT(*) as cnt FROM ai_feature_settings WHERE model_name IN ('@cf/meta/llama-3.1-8b-instruct', '@cf/meta/infire-llama-3.1-8b-instruct', '@cf/mistral/mistral-7b-instruct-v0.1', '@cf/mistral/mistral-7b-instruct-v0.2', '@cf/qwen/qwen2.5-7b-instruct', '@cf/qwen/qwen3-30b-a3b-fp8') OR model_name NOT LIKE '@cf/%'"
       )
       .first<{ cnt: number }>();
     return (staleModel?.cnt ?? 0) === 0;

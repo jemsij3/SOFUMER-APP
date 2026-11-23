@@ -12,7 +12,7 @@ export default defineConfig(async () => {
         miniflare: {
           compatibilityDate: '2026-08-15',
           bindings: {
-            CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct',
+            CLOUDFLARE_AI_MODEL: '@cf/meta/llama-3.1-8b-instruct-fast',
             TEST_MIGRATIONS: migrations,
           },
         },
