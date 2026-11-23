@@ -1,4 +1,4 @@
-import { Heart } from 'lucide-react';
+import { Film, Heart } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { formatMoney } from '../lib/i18n';
 import type { Product } from '../types';
@@ -8,6 +8,7 @@ export function ProductCard({ product }: { product: Product }) {
   const { currencies, displayCurrency, favoriteIds, toggleFavorite, navigate } = useApp();
   const isFav = favoriteIds.has(product.id);
   const priceInfo = formatMoney(product.price, product.currency, displayCurrency, currencies);
+  const videoCount = Number(product.video_count || 0);
 
   const typeLabel =
     product.listing_type === 'digital'
@@ -28,9 +29,18 @@ export function ProductCard({ product }: { product: Product }) {
             src={product.primary_image}
             alt={product.title}
             fallbackLabel={product.category_name || typeLabel}
+            transformMode="thumb"
+            transformWidth={640}
             className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
           />
         </button>
+
+        {videoCount > 0 && (
+          <div className="pointer-events-none absolute bottom-2.5 left-2.5 px-2 py-1 rounded-lg bg-[#070B14]/80 backdrop-blur-md border border-slate-700/60 flex items-center gap-1 text-[11px] font-medium text-slate-100">
+            <Film className="w-3 h-3 text-blue-400" />
+            <span>{videoCount > 1 ? `${videoCount} Videos` : 'Video'}</span>
+          </div>
+        )}
 
         <button
           type="button"

@@ -17,7 +17,11 @@ const PRODUCT_SELECT = `
          s.country_code as shop_country, s.verification_status as shop_verification_status,
          u.display_name as seller_name,
          co.name as country_name,
-         (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1) as primary_image,
+         COALESCE(
+           (SELECT secure_url FROM product_media pm WHERE pm.product_id = p.id AND pm.media_type = 'image' ORDER BY pm.is_primary DESC, pm.sort_order ASC LIMIT 1),
+           (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1)
+         ) as primary_image,
+         (SELECT COUNT(*) FROM product_media pm WHERE pm.product_id = p.id AND pm.media_type = 'video') as video_count,
          COALESCE(inv.stock_quantity, 1) as stock_quantity,
          COALESCE(inv.unlimited_digital, 0) as unlimited_digital,
          COALESCE(inv.availability_status, 'in_stock') as availability_status,
@@ -254,10 +258,16 @@ export async function handleMarketplaceRoutes(
         .run();
     }
 
-    const [images, variants, reviews, shop] = await Promise.all([
+    const [images, mediaRows, variants, reviews, shop] = await Promise.all([
       env.DB.prepare('SELECT * FROM product_images WHERE product_id = ? ORDER BY is_primary DESC, sort_order ASC')
         .bind(product.id)
         .all(),
+      env.DB.prepare(
+        `SELECT * FROM product_media WHERE product_id = ?
+         ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+      )
+        .bind(product.id)
+        .all<Record<string, unknown>>(),
       env.DB.prepare('SELECT * FROM product_variants WHERE product_id = ? AND is_active = 1')
         .bind(product.id)
         .all(),
@@ -275,9 +285,32 @@ export async function handleMarketplaceRoutes(
         .first(),
     ]);
 
+    const normalizedMedia =
+      mediaRows.results.length > 0
+        ? mediaRows.results
+        : (images.results as Array<Record<string, unknown>>).map((img, idx) => ({
+            id: img.id,
+            product_id: img.product_id,
+            storage_provider: 'legacy_url',
+            media_type: 'image',
+            resource_type: 'image',
+            public_id: '',
+            secure_url: img.url,
+            format: '',
+            bytes: 0,
+            width: 0,
+            height: 0,
+            duration: null,
+            sort_order: idx,
+            is_primary: img.is_primary ?? (idx === 0 ? 1 : 0),
+            alt_text: img.alt_text || '',
+          }));
+
     return json({
       product,
       images: images.results,
+      media: normalizedMedia,
+      videos: normalizedMedia.filter((m) => m.media_type === 'video'),
       variants: variants.results,
       reviews: reviews.results,
       shop,

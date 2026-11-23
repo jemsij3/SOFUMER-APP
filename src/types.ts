@@ -154,11 +154,32 @@ export interface Product {
   shop_verification_status?: string;
   seller_name?: string;
   primary_image?: string | null;
+  video_count?: number;
+  media_image_count?: number;
+  media_video_count?: number;
   stock_quantity?: number;
   unlimited_digital?: number;
   availability_status?: string;
   has_digital_package?: number | boolean;
   created_at: string;
+}
+
+export interface ProductMedia {
+  id: string;
+  product_id: string;
+  storage_provider: 'cloudinary' | 'legacy_url';
+  media_type: 'image' | 'video';
+  resource_type: 'image' | 'video';
+  public_id: string;
+  secure_url: string;
+  format: string;
+  bytes: number;
+  width: number;
+  height: number;
+  duration: number | null;
+  sort_order: number;
+  is_primary: number;
+  alt_text: string;
 }
 
 export interface StarsPayment {

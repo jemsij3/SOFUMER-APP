@@ -156,6 +156,36 @@ const SETTING_METADATA: Record<string, SettingUiMeta> = {
     description: 'Optional top-bar banner displayed across buyer and seller views (leave blank to hide).',
     kind: 'textarea',
   },
+  max_product_videos: {
+    label: 'Max Short Videos Per Product',
+    group: 'Cloudinary Media Limits',
+    description: 'Maximum number of short videos (max 10s each, MP4/MOV) allowed per listing (1–5). Does not count toward the 6-photo limit.',
+    kind: 'integer',
+    min: 1,
+    max: 5,
+    step: '1',
+    unit: 'videos',
+  },
+  max_product_image_mb: {
+    label: 'Max Product Photo File Size',
+    group: 'Cloudinary Media Limits',
+    description: 'Maximum size per uploaded JPG, PNG, or WebP product photo in MB (1–20 MB).',
+    kind: 'integer',
+    min: 1,
+    max: 20,
+    step: '1',
+    unit: 'MB',
+  },
+  max_product_video_mb: {
+    label: 'Max Short Video File Size',
+    group: 'Cloudinary Media Limits',
+    description: 'Maximum size per uploaded MP4 or MOV short product video in MB (5–100 MB).',
+    kind: 'integer',
+    min: 5,
+    max: 100,
+    step: '1',
+    unit: 'MB',
+  },
 };
 
 interface AiScanResult {

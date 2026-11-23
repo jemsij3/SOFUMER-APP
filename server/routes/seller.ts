@@ -16,8 +16,149 @@ import {
   sanitizeText,
 } from '../security.ts';
 import { createTelegramInvoiceLink, notifyUserAndTelegram } from '../telegram.ts';
+import {
+  type SubmittedMediaInput,
+  type VerifiedMediaRecord,
+  ALLOWED_IMAGE_EXTENSIONS,
+  ALLOWED_VIDEO_EXTENSIONS,
+  MAX_PRODUCT_PHOTOS,
+  destroyUnreferencedCloudinaryAssetsLocal,
+  generateCloudinarySignature,
+  getCloudinaryConfigState,
+  getMediaLimitsFromLocalDb,
+  syncProductImagesFromMediaLocal,
+  validateSignRequestPayload,
+  verifyUploadedCloudinaryAsset,
+} from '../cloudinary.ts';
 
 export const sellerRouter = Router();
+
+async function resolveSubmittedProductMediaLocal(options: {
+  sellerUserId: string;
+  productId?: string;
+  productTitle: string;
+  rawMedia: unknown[];
+}): Promise<
+  | { ok: true; records: VerifiedMediaRecord[] }
+  | { ok: false; status: number; error: string }
+> {
+  const { sellerUserId, productId, productTitle, rawMedia } = options;
+  const limits = getMediaLimitsFromLocalDb();
+
+  const items = rawMedia as SubmittedMediaInput[];
+  const imageItems = items.filter((m) => (m?.mediaType || m?.resourceType || 'image') === 'image');
+  const videoItems = items.filter((m) => (m?.mediaType || m?.resourceType) === 'video');
+
+  if (imageItems.length > MAX_PRODUCT_PHOTOS) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Maximum ${MAX_PRODUCT_PHOTOS} photos allowed per product. You submitted ${imageItems.length}.`,
+    };
+  }
+  if (videoItems.length > limits.maxVideos) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Maximum ${limits.maxVideos} short video(s) allowed per product.`,
+    };
+  }
+
+  const existingById = new Map<string, Record<string, unknown>>();
+  const existingByPublicId = new Map<string, Record<string, unknown>>();
+  if (productId) {
+    const existingRows = db
+      .prepare('SELECT * FROM product_media WHERE product_id = ? AND seller_user_id = ?')
+      .all(productId, sellerUserId) as Array<Record<string, unknown>>;
+    for (const row of existingRows) {
+      existingById.set(String(row.id), row);
+      if (row.public_id) existingByPublicId.set(String(row.public_id), row);
+    }
+  }
+
+  const seenPublicIds = new Set<string>();
+  const resolvedImages: VerifiedMediaRecord[] = [];
+  const resolvedVideos: VerifiedMediaRecord[] = [];
+
+  for (const item of [...imageItems, ...videoItems]) {
+    if (!item || typeof item !== 'object') {
+      return { ok: false, status: 400, error: 'Invalid media item payload.' };
+    }
+    const existingRow =
+      (item.id && existingById.get(String(item.id))) ||
+      (item.publicId && existingByPublicId.get(String(item.publicId))) ||
+      undefined;
+
+    if (existingRow) {
+      const publicId = String(existingRow.public_id || '');
+      if (publicId) {
+        if (seenPublicIds.has(publicId)) continue;
+        seenPublicIds.add(publicId);
+      }
+      const mType = existingRow.media_type === 'video' ? 'video' : 'image';
+      const rec: VerifiedMediaRecord = {
+        id: String(existingRow.id),
+        storageProvider: existingRow.storage_provider === 'legacy_url' ? 'legacy_url' : 'cloudinary',
+        mediaType: mType,
+        resourceType: mType,
+        publicId,
+        secureUrl: String(existingRow.secure_url),
+        format: String(existingRow.format || ''),
+        bytes: Number(existingRow.bytes || 0),
+        width: Number(existingRow.width || 0),
+        height: Number(existingRow.height || 0),
+        duration:
+          existingRow.duration !== null && existingRow.duration !== undefined
+            ? Number(existingRow.duration)
+            : null,
+        sortOrder: 0,
+        isPrimary: mType === 'image' && item.isPrimary ? 1 : 0,
+        altText: sanitizeText(item.altText ?? existingRow.alt_text ?? productTitle, 160),
+      };
+      if (mType === 'image') resolvedImages.push(rec);
+      else resolvedVideos.push(rec);
+      continue;
+    }
+
+    const verified = await verifyUploadedCloudinaryAsset({
+      sellerUserId,
+      scope: 'product',
+      input: item,
+      limits,
+    });
+    if (verified.ok === false) {
+      return verified;
+    }
+    if (seenPublicIds.has(verified.media.publicId)) continue;
+    seenPublicIds.add(verified.media.publicId);
+    verified.media.altText = sanitizeText(verified.media.altText || productTitle, 160);
+    if (verified.media.mediaType === 'image') resolvedImages.push(verified.media);
+    else resolvedVideos.push(verified.media);
+  }
+
+  if (resolvedImages.length > MAX_PRODUCT_PHOTOS) {
+    return { ok: false, status: 400, error: `Maximum ${MAX_PRODUCT_PHOTOS} photos allowed per product.` };
+  }
+  if (resolvedVideos.length > limits.maxVideos) {
+    return { ok: false, status: 400, error: `Maximum ${limits.maxVideos} short video(s) allowed per product.` };
+  }
+
+  if (resolvedImages.length > 0) {
+    let primaryAssigned = false;
+    for (let i = 0; i < resolvedImages.length; i++) {
+      resolvedImages[i].sortOrder = i;
+      if (resolvedImages[i].isPrimary === 1 && !primaryAssigned) primaryAssigned = true;
+      else resolvedImages[i].isPrimary = 0;
+    }
+    if (!primaryAssigned) resolvedImages[0].isPrimary = 1;
+  }
+  for (let i = 0; i < resolvedVideos.length; i++) {
+    resolvedVideos[i].sortOrder = i;
+    resolvedVideos[i].isPrimary = 0;
+  }
+
+  return { ok: true, records: [...resolvedImages, ...resolvedVideos] };
+}
 
 const digitalStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
@@ -35,6 +176,110 @@ const digitalStorage = multer.diskStorage({
 const uploadDigital = multer({
   storage: digitalStorage,
   limits: { fileSize: 50 * 1024 * 1024 },
+});
+
+sellerRouter.get('/media/config', requireSeller, (_req, res) => {
+  const config = getCloudinaryConfigState();
+  const limits = getMediaLimitsFromLocalDb();
+  res.json({
+    configured: config.configured,
+    presetRequired: false,
+    maxPhotos: limits.maxPhotos,
+    maxVideos: limits.maxVideos,
+    maxVideoDurationSec: limits.maxVideoDurationSec,
+    maxImageBytes: limits.maxImageBytes,
+    maxVideoBytes: limits.maxVideoBytes,
+    allowedImageFormats: [...ALLOWED_IMAGE_EXTENSIONS],
+    allowedVideoFormats: [...ALLOWED_VIDEO_EXTENSIONS],
+  });
+});
+
+sellerRouter.post('/media/sign', requireSeller, (req, res) => {
+  const config = getCloudinaryConfigState();
+  if (!config.configured) {
+    return res.status(503).json({ error: 'Cloudinary media credentials are not configured on the server.' });
+  }
+  const limits = getMediaLimitsFromLocalDb();
+  const validated = validateSignRequestPayload(req.body || {}, limits);
+  if (validated.ok === false) {
+    return res.status(400).json({ error: validated.error });
+  }
+
+  const userId = req.authUser!.id;
+  const productId = sanitizeText(req.body?.productId || '', 64);
+  const replaceMediaId = sanitizeText(req.body?.replaceMediaId || '', 64);
+
+  if (productId) {
+    const product = db
+      .prepare('SELECT id FROM products WHERE id = ? AND seller_user_id = ?')
+      .get(productId, userId);
+    if (!product) return res.status(404).json({ error: 'Listing not found or unauthorized.' });
+
+    if (replaceMediaId) {
+      const target = db
+        .prepare('SELECT id, media_type FROM product_media WHERE id = ? AND product_id = ? AND seller_user_id = ?')
+        .get(replaceMediaId, productId, userId) as { id: string; media_type: string } | undefined;
+      if (!target) return res.status(404).json({ error: 'Media item to replace was not found on this listing.' });
+      if (target.media_type !== validated.mediaType) {
+        return res.status(400).json({ error: 'Replacement file must match the existing media type.' });
+      }
+    } else if (validated.mediaType === 'image') {
+      const cnt = (
+        db.prepare("SELECT COUNT(*) as cnt FROM product_media WHERE product_id = ? AND media_type = 'image'").get(productId) as {
+          cnt: number;
+        }
+      ).cnt;
+      if (cnt >= limits.maxPhotos) {
+        return res
+          .status(400)
+          .json({ error: `Maximum ${limits.maxPhotos} photos allowed per product. Remove or replace an existing photo first.` });
+      }
+    } else {
+      const cnt = (
+        db.prepare("SELECT COUNT(*) as cnt FROM product_media WHERE product_id = ? AND media_type = 'video'").get(productId) as {
+          cnt: number;
+        }
+      ).cnt;
+      if (cnt >= limits.maxVideos) {
+        return res.status(400).json({ error: `Maximum ${limits.maxVideos} short video(s) allowed per product.` });
+      }
+    }
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = validated.scope === 'shop' ? `sofumer/shops/${userId}` : `sofumer/products/${userId}`;
+  const publicId = `${validated.mediaType === 'video' ? 'vid' : 'img'}_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const signature = generateCloudinarySignature({ folder, public_id: publicId, timestamp }, config.apiSecret);
+
+  res.json({
+    cloudName: config.cloudName,
+    apiKey: config.apiKey,
+    timestamp,
+    signature,
+    folder,
+    publicId,
+    expectedFullPublicId: `${folder}/${publicId}`,
+    resourceType: validated.resourceType,
+    uploadUrl: `https://api.cloudinary.com/v1_1/${encodeURIComponent(config.cloudName)}/${validated.resourceType}/upload`,
+    maxFileBytes: validated.mediaType === 'video' ? limits.maxVideoBytes : limits.maxImageBytes,
+    maxVideoDurationSec: limits.maxVideoDurationSec,
+    maxPhotos: limits.maxPhotos,
+    maxVideos: limits.maxVideos,
+  });
+});
+
+sellerRouter.post('/media/verify', requireSeller, async (req, res) => {
+  const limits = getMediaLimitsFromLocalDb();
+  const result = await verifyUploadedCloudinaryAsset({
+    sellerUserId: req.authUser!.id,
+    scope: req.body?.scope === 'shop' ? 'shop' : 'product',
+    input: (req.body || {}) as SubmittedMediaInput,
+    limits,
+  });
+  if (result.ok === false) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  res.json({ verifiedMedia: result.media });
 });
 
 sellerRouter.post('/register', requireAuth, (req, res) => {
@@ -255,7 +500,12 @@ sellerRouter.get('/products', requireSeller, (req, res) => {
   const products = db
     .prepare(
       `SELECT p.*, c.name as category_name,
-              (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1) as primary_image,
+              COALESCE(
+                (SELECT secure_url FROM product_media pm WHERE pm.product_id = p.id AND pm.media_type = 'image' ORDER BY pm.is_primary DESC, pm.sort_order ASC LIMIT 1),
+                (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1)
+              ) as primary_image,
+              (SELECT COUNT(*) FROM product_media pm WHERE pm.product_id = p.id AND pm.media_type = 'image') as media_image_count,
+              (SELECT COUNT(*) FROM product_media pm WHERE pm.product_id = p.id AND pm.media_type = 'video') as media_video_count,
               COALESCE(inv.stock_quantity, 1) as stock_quantity,
               COALESCE(inv.availability_status, 'in_stock') as availability_status,
               EXISTS(SELECT 1 FROM product_digital_assets da WHERE da.product_id = p.id) as has_digital_package
@@ -269,7 +519,7 @@ sellerRouter.get('/products', requireSeller, (req, res) => {
   res.json({ products });
 });
 
-sellerRouter.post('/products', requireSeller, (req, res) => {
+sellerRouter.post('/products', requireSeller, async (req, res) => {
   const subSetting = db
     .prepare("SELECT value FROM platform_settings WHERE key = 'product_submissions_enabled'")
     .get() as { value: string } | undefined;
@@ -367,13 +617,31 @@ sellerRouter.post('/products', requireSeller, (req, res) => {
   const availabilityStatus =
     unlimitedDigital || stockQuantity > 3 ? 'in_stock' : stockQuantity > 0 ? 'low_stock' : 'out_of_stock';
 
-  const rawImages = Array.isArray(req.body?.images) ? req.body.images.slice(0, 6) : [];
-  for (const u of rawImages) {
-    if (!isSafeUrlOrEmpty(u, 300)) {
-      return res.status(400).json({ error: 'Product image URLs must use http(s) or a valid relative path.' });
+  let verifiedMediaRecords: VerifiedMediaRecord[] = [];
+  let legacyImages: string[] = [];
+
+  if (Array.isArray(req.body?.media)) {
+    const mediaRes = await resolveSubmittedProductMediaLocal({
+      sellerUserId: userId,
+      productTitle: title,
+      rawMedia: req.body.media,
+    });
+    if (mediaRes.ok === false) {
+      return res.status(mediaRes.status).json({ error: mediaRes.error });
     }
+    verifiedMediaRecords = mediaRes.records;
+  } else if (Array.isArray(req.body?.images)) {
+    if (req.body.images.length > MAX_PRODUCT_PHOTOS) {
+      return res.status(400).json({ error: `Maximum ${MAX_PRODUCT_PHOTOS} photos allowed per product.` });
+    }
+    const rawImages = req.body.images;
+    for (const u of rawImages) {
+      if (!isSafeUrlOrEmpty(u, 500)) {
+        return res.status(400).json({ error: 'Product image URLs must use http(s) or a valid relative path.' });
+      }
+    }
+    legacyImages = rawImages.map((u: unknown) => sanitizeSafeUrl(u, 500)).filter(Boolean);
   }
-  const images: string[] = rawImages.map((u: unknown) => sanitizeSafeUrl(u, 300)).filter(Boolean);
 
   const faqsJson = Array.isArray(req.body?.faqs) ? JSON.stringify(req.body.faqs.slice(0, 8)) : '[]';
 
@@ -425,18 +693,53 @@ sellerRouter.post('/products', requireSeller, (req, res) => {
        VALUES (?, ?, ?, ?, ?)`
     ).run(newId('inv'), productId, stockQuantity, unlimitedDigital, availabilityStatus);
 
-    images.forEach((url, idx) => {
-      db.prepare(
-        `INSERT INTO product_images (id, product_id, url, alt_text, sort_order, is_primary)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(newId('img'), productId, url, title, idx, idx === 0 ? 1 : 0);
-    });
+    if (verifiedMediaRecords.length > 0) {
+      for (const rec of verifiedMediaRecords) {
+        db.prepare(
+          `INSERT INTO product_media (
+             id, product_id, seller_user_id, storage_provider, media_type, resource_type,
+             public_id, secure_url, format, bytes, width, height, duration, sort_order, is_primary, alt_text
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          newId('med'),
+          productId,
+          userId,
+          rec.storageProvider,
+          rec.mediaType,
+          rec.resourceType,
+          rec.publicId,
+          rec.secureUrl,
+          rec.format,
+          rec.bytes,
+          rec.width,
+          rec.height,
+          rec.duration,
+          rec.sortOrder,
+          rec.isPrimary,
+          rec.altText || title
+        );
+      }
+      syncProductImagesFromMediaLocal(productId, title);
+    } else {
+      legacyImages.forEach((url, idx) => {
+        db.prepare(
+          `INSERT INTO product_images (id, product_id, url, alt_text, sort_order, is_primary)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(newId('img'), productId, url, title, idx, idx === 0 ? 1 : 0);
+      });
+    }
   });
 
   tx();
 
   const created = db.prepare('SELECT * FROM products WHERE id = ?').get(productId);
-  res.status(201).json({ product: created, moderationNotes });
+  const savedMedia = db
+    .prepare(
+      `SELECT * FROM product_media WHERE product_id = ?
+       ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+    )
+    .all(productId);
+  res.status(201).json({ product: created, media: savedMedia, moderationNotes });
 });
 
 sellerRouter.get('/products/:id/digital-asset', requireSeller, (req, res) => {
@@ -542,7 +845,110 @@ sellerRouter.post('/products/:id/digital-asset', requireSeller, (req, res) => {
   return handleSave();
 });
 
-sellerRouter.patch('/products/:id', requireSeller, (req, res) => {
+sellerRouter.get('/products/:id', requireSeller, (req, res) => {
+  const userId = req.authUser!.id;
+  const product = db
+    .prepare(
+      `SELECT p.*, COALESCE(inv.stock_quantity, 1) as stock_quantity
+       FROM products p LEFT JOIN product_inventory inv ON inv.product_id = p.id
+       WHERE p.id = ? AND p.seller_user_id = ?`
+    )
+    .get(req.params.id, userId) as Record<string, unknown> | undefined;
+  if (!product) return res.status(404).json({ error: 'Listing not found or unauthorized.' });
+
+  const legacyImgs = db
+    .prepare('SELECT * FROM product_images WHERE product_id = ? ORDER BY is_primary DESC, sort_order ASC')
+    .all(product.id) as Array<Record<string, unknown>>;
+
+  let media = db
+    .prepare(
+      `SELECT * FROM product_media WHERE product_id = ?
+       ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+    )
+    .all(product.id) as Array<Record<string, unknown>>;
+
+  if (media.length === 0 && legacyImgs.length > 0) {
+    legacyImgs.slice(0, MAX_PRODUCT_PHOTOS).forEach((leg, idx) => {
+      db.prepare(
+        `INSERT INTO product_media (
+           id, product_id, seller_user_id, storage_provider, media_type, resource_type,
+           public_id, secure_url, format, bytes, width, height, duration, sort_order, is_primary, alt_text
+         ) VALUES (?, ?, ?, 'legacy_url', 'image', 'image', '', ?, '', 0, 0, 0, NULL, ?, ?, ?)`
+      ).run(
+        newId('med'),
+        product.id,
+        userId,
+        String(leg.url),
+        idx,
+        Number(leg.is_primary || (idx === 0 ? 1 : 0)),
+        sanitizeText(String(leg.alt_text || product.title || ''), 160)
+      );
+    });
+    media = db
+      .prepare(
+        `SELECT * FROM product_media WHERE product_id = ?
+         ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+      )
+      .all(product.id) as Array<Record<string, unknown>>;
+  }
+
+  res.json({
+    product,
+    media,
+    images: legacyImgs,
+    videos: media.filter((m) => m.media_type === 'video'),
+  });
+});
+
+sellerRouter.patch('/products/:id/media/reorder', requireSeller, (req, res) => {
+  const userId = req.authUser!.id;
+  const productId = req.params.id;
+  const product = db
+    .prepare('SELECT id, title FROM products WHERE id = ? AND seller_user_id = ?')
+    .get(productId, userId) as { id: string; title: string } | undefined;
+  if (!product) return res.status(404).json({ error: 'Listing not found or unauthorized.' });
+
+  const rows = db
+    .prepare('SELECT * FROM product_media WHERE product_id = ? AND seller_user_id = ? ORDER BY sort_order ASC')
+    .all(productId, userId) as Array<Record<string, unknown>>;
+
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id: unknown) => String(id)) : [];
+  const primaryMediaId = sanitizeText(req.body?.primaryMediaId || '', 64);
+  const byId = new Map(rows.map((r) => [String(r.id), r]));
+
+  db.transaction(() => {
+    let imgIdx = 0;
+    let vidIdx = 0;
+    for (const id of orderedIds) {
+      const row = byId.get(id);
+      if (!row) continue;
+      if (row.media_type === 'image') {
+        db.prepare("UPDATE product_media SET sort_order = ?, updated_at = datetime('now') WHERE id = ?").run(imgIdx++, id);
+      } else {
+        db.prepare("UPDATE product_media SET sort_order = ?, updated_at = datetime('now') WHERE id = ?").run(vidIdx++, id);
+      }
+    }
+    if (primaryMediaId) {
+      const target = byId.get(primaryMediaId);
+      if (target && target.media_type === 'image') {
+        db.prepare(
+          "UPDATE product_media SET is_primary = CASE WHEN id = ? THEN 1 ELSE 0 END, updated_at = datetime('now') WHERE product_id = ? AND media_type = 'image'"
+        ).run(primaryMediaId, productId);
+      }
+    }
+    syncProductImagesFromMediaLocal(productId, product.title);
+  })();
+
+  const updatedMedia = db
+    .prepare(
+      `SELECT * FROM product_media WHERE product_id = ?
+       ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+    )
+    .all(productId);
+  res.json({ media: updatedMedia });
+});
+
+sellerRouter.patch('/products/:id', requireSeller, async (req, res) => {
   const userId = req.authUser!.id;
   const existing = db
     .prepare('SELECT * FROM products WHERE id = ? AND seller_user_id = ?')
@@ -562,78 +968,159 @@ sellerRouter.patch('/products/:id', requireSeller, (req, res) => {
   if (!db.prepare('SELECT code FROM currencies WHERE code = ?').get(currency)) {
     return res.status(400).json({ error: `Unsupported currency code "${currency}".` });
   }
-  const nextStatusInput = req.body?.status ? String(req.body.status) : String(existing.status);
 
+  let categoryId = String(existing.category_id);
+  let subcategoryId = existing.subcategory_id ? String(existing.subcategory_id) : null;
+  if (req.body?.categoryId !== undefined) {
+    const nextCat = sanitizeText(req.body.categoryId, 64);
+    if (!db.prepare('SELECT id FROM categories WHERE id = ? AND is_active = 1').get(nextCat)) {
+      return res.status(400).json({ error: 'Selected category does not exist.' });
+    }
+    categoryId = nextCat;
+    subcategoryId = req.body.subcategoryId ? sanitizeText(req.body.subcategoryId, 64) : null;
+    if (
+      subcategoryId &&
+      !db.prepare('SELECT id FROM subcategories WHERE id = ? AND category_id = ? AND is_active = 1').get(subcategoryId, categoryId)
+    ) {
+      return res.status(400).json({ error: 'Selected subcategory does not belong to this category.' });
+    }
+  }
+
+  const nextStatusInput = req.body?.status ? String(req.body.status) : String(existing.status);
   let finalStatus = String(existing.status);
   if (['draft', 'published', 'archived'].includes(nextStatusInput)) {
     finalStatus = nextStatusInput;
     if (finalStatus === 'published') {
       const flagged = checkProhibitedKeywords(`${title} ${description}`);
-      if (flagged.length > 0) {
-        finalStatus = 'pending_review';
-      }
+      if (flagged.length > 0) finalStatus = 'pending_review';
     }
   }
 
-  db.prepare(
-    `UPDATE products
-     SET title = ?, description = ?, price = ?, currency = ?,
-         shipping_info = ?, international_shipping = ?, return_policy = ?,
-         delivery_timeframe = ?, status = ?, updated_at = datetime('now')
-     WHERE id = ? AND seller_user_id = ?`
-  ).run(
-    title,
-    description,
-    price,
-    currency,
-    sanitizeText(req.body?.shippingInfo ?? existing.shipping_info, 500),
-    req.body?.internationalShipping !== undefined
-      ? req.body.internationalShipping
-        ? 1
-        : 0
-      : existing.international_shipping,
-    sanitizeText(req.body?.returnPolicy ?? existing.return_policy, 500),
-    sanitizeText(req.body?.deliveryTimeframe ?? existing.delivery_timeframe, 120),
-    finalStatus,
-    existing.id,
-    userId
-  );
-
-  if (req.body?.stockQuantity !== undefined) {
-    const qty = Math.max(0, Math.floor(Number(req.body.stockQuantity)));
-    const avail = qty > 3 ? 'in_stock' : qty > 0 ? 'low_stock' : 'out_of_stock';
-    db.prepare(
-      `INSERT INTO product_inventory (id, product_id, stock_quantity, unlimited_digital, availability_status, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))
-       ON CONFLICT(product_id) DO UPDATE SET
-         stock_quantity = excluded.stock_quantity,
-         availability_status = excluded.availability_status,
-         updated_at = datetime('now')`
-    ).run(newId('inv'), existing.id, qty, existing.listing_type === 'digital' ? 1 : 0, avail);
-  }
-
-  if (Array.isArray(req.body?.images)) {
-    const rawImgs = req.body.images.slice(0, 6);
-    for (const u of rawImgs) {
-      if (!isSafeUrlOrEmpty(u, 300)) {
-        return res.status(400).json({ error: 'Product image URLs must use http(s) or a valid relative path.' });
-      }
-    }
-    const imgs = rawImgs.map((u: unknown) => sanitizeSafeUrl(u, 300)).filter(Boolean);
-    db.prepare('DELETE FROM product_images WHERE product_id = ?').run(existing.id);
-    imgs.forEach((url: string, idx: number) => {
-      db.prepare(
-        `INSERT INTO product_images (id, product_id, url, alt_text, sort_order, is_primary)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(newId('img'), existing.id, url, title, idx, idx === 0 ? 1 : 0);
+  let verifiedMediaRecords: VerifiedMediaRecord[] | null = null;
+  if (Array.isArray(req.body?.media)) {
+    const mediaRes = await resolveSubmittedProductMediaLocal({
+      sellerUserId: userId,
+      productId: String(existing.id),
+      productTitle: title,
+      rawMedia: req.body.media,
     });
+    if (mediaRes.ok === false) {
+      return res.status(mediaRes.status).json({ error: mediaRes.error });
+    }
+    verifiedMediaRecords = mediaRes.records;
+  } else if (Array.isArray(req.body?.images)) {
+    if (req.body.images.length > MAX_PRODUCT_PHOTOS) {
+      return res.status(400).json({ error: `Maximum ${MAX_PRODUCT_PHOTOS} photos allowed per product.` });
+    }
+  }
+
+  let removedCloudinaryAssets: Array<Record<string, unknown>> = [];
+
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE products
+       SET category_id = ?, subcategory_id = ?, title = ?, description = ?, price = ?, currency = ?,
+           shipping_info = ?, international_shipping = ?, return_policy = ?,
+           delivery_timeframe = ?, keywords = ?, status = ?, updated_at = datetime('now')
+       WHERE id = ? AND seller_user_id = ?`
+    ).run(
+      categoryId,
+      subcategoryId,
+      title,
+      description,
+      price,
+      currency,
+      sanitizeText(req.body?.shippingInfo ?? existing.shipping_info, 500),
+      req.body?.internationalShipping !== undefined
+        ? req.body.internationalShipping
+          ? 1
+          : 0
+        : existing.international_shipping,
+      sanitizeText(req.body?.returnPolicy ?? existing.return_policy, 500),
+      sanitizeText(req.body?.deliveryTimeframe ?? existing.delivery_timeframe, 120),
+      sanitizeText(req.body?.keywords ?? existing.keywords, 300),
+      finalStatus,
+      existing.id,
+      userId
+    );
+
+    if (req.body?.stockQuantity !== undefined) {
+      const qty = Math.max(0, Math.floor(Number(req.body.stockQuantity)));
+      const avail = qty > 3 ? 'in_stock' : qty > 0 ? 'low_stock' : 'out_of_stock';
+      db.prepare(
+        `INSERT INTO product_inventory (id, product_id, stock_quantity, unlimited_digital, availability_status, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(product_id) DO UPDATE SET
+           stock_quantity = excluded.stock_quantity,
+           availability_status = excluded.availability_status,
+           updated_at = datetime('now')`
+      ).run(newId('inv'), existing.id, qty, existing.listing_type === 'digital' ? 1 : 0, avail);
+    }
+
+    if (verifiedMediaRecords !== null) {
+      const prevRows = db
+        .prepare('SELECT id, public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+        .all(existing.id) as Array<Record<string, unknown>>;
+      const nextPublicIds = new Set(verifiedMediaRecords.map((m) => m.publicId).filter(Boolean));
+      removedCloudinaryAssets = prevRows.filter(
+        (oldRow) => oldRow.public_id && !nextPublicIds.has(String(oldRow.public_id))
+      );
+
+      db.prepare('DELETE FROM product_media WHERE product_id = ?').run(existing.id);
+      for (const rec of verifiedMediaRecords) {
+        db.prepare(
+          `INSERT INTO product_media (
+             id, product_id, seller_user_id, storage_provider, media_type, resource_type,
+             public_id, secure_url, format, bytes, width, height, duration, sort_order, is_primary, alt_text
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          rec.id || newId('med'),
+          existing.id,
+          userId,
+          rec.storageProvider,
+          rec.mediaType,
+          rec.resourceType,
+          rec.publicId,
+          rec.secureUrl,
+          rec.format,
+          rec.bytes,
+          rec.width,
+          rec.height,
+          rec.duration,
+          rec.sortOrder,
+          rec.isPrimary,
+          rec.altText || title
+        );
+      }
+      syncProductImagesFromMediaLocal(String(existing.id), title);
+    } else if (Array.isArray(req.body?.images)) {
+      const rawImgs = req.body.images;
+      const imgs = rawImgs.map((u: unknown) => sanitizeSafeUrl(u, 500)).filter(Boolean);
+      db.prepare('DELETE FROM product_images WHERE product_id = ?').run(existing.id);
+      imgs.forEach((url: string, idx: number) => {
+        db.prepare(
+          `INSERT INTO product_images (id, product_id, url, alt_text, sort_order, is_primary)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(newId('img'), existing.id, url, title, idx, idx === 0 ? 1 : 0);
+      });
+    }
+  })();
+
+  if (removedCloudinaryAssets.length > 0) {
+    await destroyUnreferencedCloudinaryAssetsLocal(removedCloudinaryAssets);
   }
 
   const updated = db.prepare('SELECT * FROM products WHERE id = ?').get(existing.id);
-  res.json({ product: updated });
+  const updatedMedia = db
+    .prepare(
+      `SELECT * FROM product_media WHERE product_id = ?
+       ORDER BY CASE WHEN media_type = 'image' THEN 0 ELSE 1 END, is_primary DESC, sort_order ASC`
+    )
+    .all(existing.id);
+  res.json({ product: updated, media: updatedMedia });
 });
 
-sellerRouter.delete('/products/:id', requireSeller, (req, res) => {
+sellerRouter.delete('/products/:id', requireSeller, async (req, res) => {
   const productId = req.params.id;
   const userId = req.authUser!.id;
   const existing = db
@@ -655,6 +1142,10 @@ sellerRouter.delete('/products/:id', requireSeller, (req, res) => {
     return res.json({ deleted: true, archived: true });
   }
 
+  const mediaToDestroy = db
+    .prepare('SELECT public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+    .all(productId) as Array<Record<string, unknown>>;
+
   db.transaction(() => {
     db.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').run(productId);
     db.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').run(productId);
@@ -664,10 +1155,13 @@ sellerRouter.delete('/products/:id', requireSeller, (req, res) => {
     db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(productId);
     db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(productId);
     db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(productId);
+    db.prepare('DELETE FROM product_media WHERE product_id = ?').run(productId);
     db.prepare('DELETE FROM product_images WHERE product_id = ?').run(productId);
     db.prepare('DELETE FROM product_inventory WHERE product_id = ?').run(productId);
     db.prepare('DELETE FROM products WHERE id = ? AND seller_user_id = ?').run(productId, userId);
   })();
+
+  await destroyUnreferencedCloudinaryAssetsLocal(mediaToDestroy);
 
   res.json({ deleted: true, archived: false });
 });

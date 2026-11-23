@@ -712,6 +712,66 @@ async function runTests() {
       }),
       mockEnv
     );
+
+    // 11. Cloudinary media endpoints & strict photo/duration enforcement
+    const cldEnv: WorkerEnv = {
+      ...mockEnv,
+      CLOUDINARY_CLOUD_NAME: 'sofumer-int-cloud',
+      CLOUDINARY_API_KEY: 'int_cld_key',
+      CLOUDINARY_API_SECRET: 'int_cld_secret_private',
+    };
+    const cldCfgRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/media/config', {
+        headers: { Authorization: `Bearer ${sellerAuth.token}` },
+      }),
+      cldEnv
+    );
+    assert.equal(cldCfgRes.status, 200);
+    const cldCfg = (await cldCfgRes.json()) as {
+      configured: boolean;
+      presetRequired: boolean;
+      maxPhotos: number;
+      maxVideoDurationSec: number;
+    };
+    assert.equal(cldCfg.configured, true);
+    assert.equal(cldCfg.presetRequired, false);
+    assert.equal(cldCfg.maxPhotos, 6);
+    assert.equal(cldCfg.maxVideoDurationSec, 10);
+    assert.ok(!JSON.stringify(cldCfg).includes('int_cld_secret_private'));
+
+    const longVidSignRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/media/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          mediaType: 'video',
+          mimeType: 'video/mp4',
+          fileName: 'too-long.mp4',
+          fileSize: 102400,
+          duration: 11,
+        }),
+      }),
+      cldEnv
+    );
+    assert.equal(longVidSignRes.status, 400);
+
+    const legacySevenRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Seven Photos Rejected',
+          description: 'Validation check',
+          categoryId: 'cat_electronics',
+          price: 20,
+          currency: 'USD',
+          images: Array.from({ length: 7 }, (_, i) => `https://res.cloudinary.com/sofumer-int-cloud/image/upload/v1/p${i}.jpg`),
+        }),
+      }),
+      cldEnv
+    );
+    assert.equal(legacySevenRes.status, 400);
   });
 
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);

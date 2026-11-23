@@ -2,9 +2,12 @@ import { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   Bot,
+  ChevronLeft,
+  ChevronRight,
   Flag,
   Heart,
   MessageSquare,
+  Play,
   Share2,
   ShieldAlert,
   Star,
@@ -12,13 +15,16 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
+import { optimizeCloudinaryUrl } from '../lib/cloudinary';
 import { formatMoney, t } from '../lib/i18n';
-import type { Product, Shop } from '../types';
+import type { Product, ProductMedia, Shop } from '../types';
 import { ImageWithFallback } from '../components/ImageWithFallback';
 
 interface ProductDetailPayload {
   product: Product;
   images: Array<{ id: string; url: string; alt_text: string }>;
+  media?: ProductMedia[];
+  videos?: ProductMedia[];
   variants: Array<{ id: string; name: string; price_delta: number }>;
   reviews: Array<{
     id: string;
@@ -95,7 +101,7 @@ export function ProductDetailPage({ productId }: { productId: string }) {
     );
   }
 
-  const { product, images, reviews, shop } = detail;
+  const { product, images, media, reviews, shop } = detail;
   const priceInfo = formatMoney(product.price, product.currency, displayCurrency, currencies);
   const isFav = favoriteIds.has(product.id);
   const isOwnListing = user?.id === product.seller_user_id;
@@ -166,7 +172,44 @@ export function ProductDetailPage({ productId }: { productId: string }) {
     }
   }
 
-  const gallery = images.length > 0 ? images : [{ id: 'empty', url: '', alt_text: product.title }];
+  const normalizedMedia: Array<{
+    id: string;
+    mediaType: 'image' | 'video';
+    url: string;
+    altText: string;
+    duration: number | null;
+  }> =
+    media && media.length > 0
+      ? [...media]
+          .sort((a, b) => {
+            if (a.media_type !== b.media_type) return a.media_type === 'image' ? -1 : 1;
+            if (a.media_type === 'image' && Number(b.is_primary) !== Number(a.is_primary)) {
+              return Number(b.is_primary) - Number(a.is_primary);
+            }
+            return Number(a.sort_order) - Number(b.sort_order);
+          })
+          .map((m) => ({
+            id: m.id,
+            mediaType: m.media_type,
+            url: m.secure_url,
+            altText: m.alt_text || product.title,
+            duration: m.duration ?? null,
+          }))
+      : images.map((img) => ({
+          id: img.id,
+          mediaType: 'image' as const,
+          url: img.url,
+          altText: img.alt_text || product.title,
+          duration: null,
+        }));
+
+  const gallery =
+    normalizedMedia.length > 0
+      ? normalizedMedia
+      : [{ id: 'empty', mediaType: 'image' as const, url: '', altText: product.title, duration: null }];
+
+  const activeIdx = Math.min(selectedImage, gallery.length - 1);
+  const currentMedia = gallery[activeIdx];
 
   return (
     <div className="space-y-6 pb-20">
@@ -182,26 +225,96 @@ export function ProductDetailPage({ productId }: { productId: string }) {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Gallery */}
         <div className="lg:col-span-7 space-y-3">
-          <div className="aspect-[4/3] rounded-2xl overflow-hidden bg-[#0E1525] border border-slate-800">
-            <ImageWithFallback
-              src={gallery[selectedImage]?.url}
-              alt={product.title}
-              fallbackLabel={product.category_name}
-              className="w-full h-full object-cover"
-            />
-          </div>
-          {images.length > 1 && (
-            <div className="flex gap-2.5 overflow-x-auto pb-1">
-              {images.map((img, idx) => (
+          <div className="relative aspect-[4/3] rounded-2xl overflow-hidden bg-[#0E1525] border border-slate-800">
+            {currentMedia.mediaType === 'video' ? (
+              <video
+                key={currentMedia.id}
+                src={optimizeCloudinaryUrl(currentMedia.url, 'video') || currentMedia.url}
+                poster={optimizeCloudinaryUrl(currentMedia.url, 'poster', 960) || undefined}
+                controls
+                playsInline
+                preload="metadata"
+                className="w-full h-full object-contain bg-black"
+              />
+            ) : (
+              <ImageWithFallback
+                src={currentMedia.url}
+                alt={currentMedia.altText || product.title}
+                fallbackLabel={product.category_name}
+                transformMode="gallery"
+                transformWidth={1200}
+                className="w-full h-full object-cover"
+              />
+            )}
+
+            {gallery.length > 1 && (
+              <>
+                <div className="pointer-events-none absolute top-3 right-3 px-2.5 py-1 rounded-lg bg-[#070B14]/75 border border-slate-700/70 text-[11px] font-mono-nums text-slate-100">
+                  {activeIdx + 1} / {gallery.length}
+                </div>
                 <button
-                  key={img.id}
+                  type="button"
+                  aria-label="Previous media"
+                  onClick={() => setSelectedImage((prev) => (prev - 1 + gallery.length) % gallery.length)}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full bg-[#070B14]/75 border border-slate-700/70 text-white flex items-center justify-center hover:bg-[#070B14]"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  aria-label="Next media"
+                  onClick={() => setSelectedImage((prev) => (prev + 1) % gallery.length)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full bg-[#070B14]/75 border border-slate-700/70 text-white flex items-center justify-center hover:bg-[#070B14]"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </>
+            )}
+
+            {currentMedia.mediaType === 'video' && currentMedia.duration !== null && (
+              <span className="pointer-events-none absolute top-3 left-3 px-2 py-0.5 rounded-lg bg-[#070B14]/80 border border-slate-700/70 text-[11px] font-mono-nums text-slate-100">
+                {Number(currentMedia.duration).toFixed(1)}s
+              </span>
+            )}
+          </div>
+
+          {gallery.length > 1 && (
+            <div className="flex gap-2.5 overflow-x-auto pb-1">
+              {gallery.map((item, idx) => (
+                <button
+                  key={item.id}
                   type="button"
                   onClick={() => setSelectedImage(idx)}
-                  className={`w-20 h-16 rounded-xl overflow-hidden border shrink-0 ${
-                    selectedImage === idx ? 'border-blue-500' : 'border-slate-800 opacity-70 hover:opacity-100'
+                  className={`relative w-20 h-16 rounded-xl overflow-hidden border shrink-0 bg-[#0A101D] ${
+                    activeIdx === idx ? 'border-blue-500' : 'border-slate-800 opacity-75 hover:opacity-100'
                   }`}
                 >
-                  <ImageWithFallback src={img.url} alt={img.alt_text} className="w-full h-full object-cover" />
+                  {item.mediaType === 'video' ? (
+                    <>
+                      <ImageWithFallback
+                        src={optimizeCloudinaryUrl(item.url, 'poster', 240)}
+                        alt={`Video preview ${idx + 1}`}
+                        transformMode="none"
+                        className="w-full h-full object-cover"
+                      />
+                      <div className="absolute inset-0 bg-black/40 flex flex-col items-center justify-center">
+                        <Play className="w-4 h-4 text-white fill-white" />
+                        {item.duration !== null && (
+                          <span className="text-[10px] font-mono-nums text-white mt-0.5">
+                            {Number(item.duration).toFixed(0)}s
+                          </span>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <ImageWithFallback
+                      src={item.url}
+                      alt={item.altText}
+                      transformMode="thumb"
+                      transformWidth={240}
+                      className="w-full h-full object-cover"
+                    />
+                  )}
                 </button>
               ))}
             </div>

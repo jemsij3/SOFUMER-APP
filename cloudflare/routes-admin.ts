@@ -72,6 +72,24 @@ async function validateAndNormalizeSetting(
       }
       return { ok: true, value: String(Number(num.toFixed(2))) };
     }
+    if (key === 'max_product_videos') {
+      if (!Number.isInteger(num) || num < 1 || num > 5) {
+        return { ok: false, error: 'max_product_videos must be a whole number between 1 and 5.', status: 400 };
+      }
+      return { ok: true, value: String(num) };
+    }
+    if (key === 'max_product_image_mb') {
+      if (num < 1 || num > 20) {
+        return { ok: false, error: 'max_product_image_mb must be between 1 and 20 MB.', status: 400 };
+      }
+      return { ok: true, value: String(Number(num.toFixed(1))) };
+    }
+    if (key === 'max_product_video_mb') {
+      if (num < 5 || num > 100) {
+        return { ok: false, error: 'max_product_video_mb must be between 5 and 100 MB.', status: 400 };
+      }
+      return { ok: true, value: String(Number(num.toFixed(1))) };
+    }
     if (num < 0) {
       return { ok: false, error: `${key} must be a non-negative number.`, status: 400 };
     }

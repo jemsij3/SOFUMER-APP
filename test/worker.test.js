@@ -1289,5 +1289,725 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const staffRelogin = await loginByTg(750001, 'support_staff');
     expect(staffRelogin.isAdmin).toBe(false);
   });
-});
 
+  it('18. Cloudinary signed uploads validate mime/size/10s duration, enforce signature + Admin API check, never leak secret, and destroy rejected >10s videos', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+      CLOUDINARY_CLOUD_NAME: 'sofumer-test-cloud',
+      CLOUDINARY_API_KEY: 'test_cld_key',
+      CLOUDINARY_API_SECRET: 'test_cld_secret_super_private',
+    };
+
+    const sha1Hex = async (value) => {
+      const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(value));
+      return Array.from(new Uint8Array(buf))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    };
+
+    // Unauthenticated & non-seller checks
+    const unauthCfgCtx = createExecutionContext();
+    const unauthCfg = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/config'),
+      testEnv,
+      unauthCfgCtx
+    );
+    await waitOnExecutionContext(unauthCfgCtx);
+    expect(unauthCfg.status).toBe(401);
+
+    const sellerInit = await signTelegramInitData(
+      { id: 760001, first_name: 'CloudSeller', username: 'cloud_seller' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const loginCtx = createExecutionContext();
+    const loginRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData: sellerInit }),
+      }),
+      testEnv,
+      loginCtx
+    );
+    await waitOnExecutionContext(loginCtx);
+    const { token } = await loginRes.json();
+
+    const nonSellerCtx = createExecutionContext();
+    const nonSellerCfg = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/config', {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      testEnv,
+      nonSellerCtx
+    );
+    await waitOnExecutionContext(nonSellerCtx);
+    expect(nonSellerCfg.status).toBe(403);
+
+    // Register seller
+    const regCtx = createExecutionContext();
+    const regRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Cloud Media Seller',
+          shopName: 'Cloud Media Shop',
+          countryCode: 'US',
+        }),
+      }),
+      testEnv,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+    expect(regRes.status).toBe(201);
+
+    // Config returns limits without preset requirement or API secret
+    const cfgCtx = createExecutionContext();
+    const cfgRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/config', {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      testEnv,
+      cfgCtx
+    );
+    await waitOnExecutionContext(cfgCtx);
+    expect(cfgRes.status).toBe(200);
+    const cfgJson = await cfgRes.json();
+    expect(cfgJson.configured).toBe(true);
+    expect(cfgJson.presetRequired).toBe(false);
+    expect(cfgJson.maxPhotos).toBe(6);
+    expect(cfgJson.maxVideos).toBe(2);
+    expect(cfgJson.maxVideoDurationSec).toBe(10);
+    expect(JSON.stringify(cfgJson)).not.toContain(testEnv.CLOUDINARY_API_SECRET);
+
+    // Missing Cloudinary credentials fails safely with 503
+    const noCldCtx = createExecutionContext();
+    const noCldRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ mediaType: 'image', mimeType: 'image/jpeg', fileName: 'photo.jpg', fileSize: 2048 }),
+      }),
+      { ...testEnv, CLOUDINARY_API_SECRET: '' },
+      noCldCtx
+    );
+    await waitOnExecutionContext(noCldCtx);
+    expect(noCldRes.status).toBe(503);
+
+    // Sign validation rejections (bad mime, bad video ext, oversized, >10s duration)
+    const badCases = [
+      { mediaType: 'image', mimeType: 'image/svg+xml', fileName: 'evil.svg', fileSize: 1024 },
+      { mediaType: 'video', mimeType: 'video/x-msvideo', fileName: 'clip.avi', fileSize: 102400, duration: 5 },
+      { mediaType: 'image', mimeType: 'image/png', fileName: 'huge.png', fileSize: 12 * 1024 * 1024 },
+      { mediaType: 'video', mimeType: 'video/mp4', fileName: 'huge.mp4', fileSize: 40 * 1024 * 1024, duration: 5 },
+      { mediaType: 'video', mimeType: 'video/mp4', fileName: 'long.mp4', fileSize: 500000, duration: 10.5 },
+    ];
+    for (const payload of badCases) {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/sign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      expect(res.status).toBe(400);
+    }
+
+    // Valid image sign returns verifiable SHA-1 signature and never exposes secret
+    const signCtx = createExecutionContext();
+    const signRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          mediaType: 'image',
+          mimeType: 'image/webp',
+          fileName: 'hero.webp',
+          fileSize: 250000,
+        }),
+      }),
+      testEnv,
+      signCtx
+    );
+    await waitOnExecutionContext(signCtx);
+    expect(signRes.status).toBe(200);
+    const signJson = await signRes.json();
+    expect(signJson.cloudName).toBe('sofumer-test-cloud');
+    expect(signJson.apiKey).toBe('test_cld_key');
+    expect(JSON.stringify(signJson)).not.toContain(testEnv.CLOUDINARY_API_SECRET);
+
+    const expectedReqSig = await sha1Hex(
+      `folder=${signJson.folder}&public_id=${signJson.publicId}&timestamp=${signJson.timestamp}${testEnv.CLOUDINARY_API_SECRET}`
+    );
+    expect(signJson.signature).toBe(expectedReqSig);
+
+    // Get seller user id to construct expected public_id prefixes
+    const meCtx = createExecutionContext();
+    const meRes = await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      testEnv,
+      meCtx
+    );
+    await waitOnExecutionContext(meCtx);
+    const meJson = await meRes.json();
+    const sellerUserId = meJson.user.id;
+    expect(signJson.folder).toBe(`sofumer/products/${sellerUserId}`);
+
+    const destroyCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const target = typeof input === 'string' ? input : input.url;
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/resources/video/upload/`)) {
+        if (target.includes('vid_toolong')) {
+          return new Response(
+            JSON.stringify({
+              public_id: `sofumer/products/${sellerUserId}/vid_toolong`,
+              resource_type: 'video',
+              format: 'mp4',
+              bytes: 1200000,
+              width: 1280,
+              height: 720,
+              duration: 12.4,
+              secure_url: `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/video/upload/v1/sofumer/products/${sellerUserId}/vid_toolong.mp4`,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            public_id: `sofumer/products/${sellerUserId}/vid_ok`,
+            resource_type: 'video',
+            format: 'mp4',
+            bytes: 950000,
+            width: 1280,
+            height: 720,
+            duration: 8.5,
+            secure_url: `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/video/upload/v1/sofumer/products/${sellerUserId}/vid_ok.mp4`,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/resources/image/upload/`)) {
+        return new Response(
+          JSON.stringify({
+            public_id: signJson.expectedFullPublicId,
+            resource_type: 'image',
+            format: 'webp',
+            bytes: 250000,
+            width: 1200,
+            height: 900,
+            secure_url: `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/image/upload/v1/${signJson.expectedFullPublicId}.webp`,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/`) && target.endsWith('/destroy')) {
+        destroyCalls.push({ url: target, body: String(init?.body || '') });
+        return new Response(JSON.stringify({ result: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      // Cross-seller prefix rejected -> 403
+      const crossCtx = createExecutionContext();
+      const crossRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            mediaType: 'image',
+            publicId: 'sofumer/products/usr_someone_else/img_stolen',
+            version: 1,
+            signature: '0'.repeat(40),
+          }),
+        }),
+        testEnv,
+        crossCtx
+      );
+      await waitOnExecutionContext(crossCtx);
+      expect(crossRes.status).toBe(403);
+
+      // Tampered Cloudinary response signature rejected -> 400
+      const badSigCtx = createExecutionContext();
+      const badSigRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            mediaType: 'image',
+            publicId: signJson.expectedFullPublicId,
+            version: 1,
+            signature: 'a'.repeat(40),
+          }),
+        }),
+        testEnv,
+        badSigCtx
+      );
+      await waitOnExecutionContext(badSigCtx);
+      expect(badSigRes.status).toBe(400);
+
+      // Video longer than 10s according to Cloudinary Admin API is rejected AND automatically destroyed
+      const longPublicId = `sofumer/products/${sellerUserId}/vid_toolong`;
+      const longSig = await sha1Hex(`public_id=${longPublicId}&version=1${testEnv.CLOUDINARY_API_SECRET}`);
+      const longCtx = createExecutionContext();
+      const longRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            mediaType: 'video',
+            resourceType: 'video',
+            publicId: longPublicId,
+            version: 1,
+            signature: longSig,
+          }),
+        }),
+        testEnv,
+        longCtx
+      );
+      await waitOnExecutionContext(longCtx);
+      expect(longRes.status).toBe(400);
+      const longJson = await longRes.json();
+      expect(longJson.error).toContain('10 seconds');
+      expect(destroyCalls.some((c) => c.url.includes('/video/destroy') && c.body.includes('vid_toolong'))).toBe(true);
+
+      // Valid photo verifies cleanly
+      const imgSig = await sha1Hex(
+        `public_id=${signJson.expectedFullPublicId}&version=1${testEnv.CLOUDINARY_API_SECRET}`
+      );
+      const okImgCtx = createExecutionContext();
+      const okImgRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            mediaType: 'image',
+            resourceType: 'image',
+            publicId: signJson.expectedFullPublicId,
+            version: 1,
+            signature: imgSig,
+          }),
+        }),
+        testEnv,
+        okImgCtx
+      );
+      await waitOnExecutionContext(okImgCtx);
+      expect(okImgRes.status).toBe(200);
+      const okImgJson = await okImgRes.json();
+      expect(okImgJson.verifiedMedia.publicId).toBe(signJson.expectedFullPublicId);
+
+      // Valid 8.5s video verifies cleanly
+      const okVidId = `sofumer/products/${sellerUserId}/vid_ok`;
+      const okVidSig = await sha1Hex(`public_id=${okVidId}&version=1${testEnv.CLOUDINARY_API_SECRET}`);
+      const okVidCtx = createExecutionContext();
+      const okVidRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            mediaType: 'video',
+            resourceType: 'video',
+            publicId: okVidId,
+            version: 1,
+            signature: okVidSig,
+          }),
+        }),
+        testEnv,
+        okVidCtx
+      );
+      await waitOnExecutionContext(okVidCtx);
+      expect(okVidRes.status).toBe(200);
+      const okVidJson = await okVidRes.json();
+      expect(okVidJson.verifiedMedia.duration).toBe(8.5);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('19. Product enforces max 6 photos independently from short videos, supports reorder/primary/replace/delete cleanup, and preserves ordered archive media', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+      CLOUDINARY_CLOUD_NAME: 'sofumer-test-cloud',
+      CLOUDINARY_API_KEY: 'test_cld_key',
+      CLOUDINARY_API_SECRET: 'test_cld_secret_super_private',
+    };
+
+    const sha1Hex = async (value) => {
+      const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(value));
+      return Array.from(new Uint8Array(buf))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    };
+
+    const loginAs = async (id, username) => {
+      const initData = await signTelegramInitData({ id, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      const authData = await res.json();
+      const meCtx = createExecutionContext();
+      const meRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/auth/me', {
+          headers: { Authorization: `Bearer ${authData.token}` },
+        }),
+        testEnv,
+        meCtx
+      );
+      await waitOnExecutionContext(meCtx);
+      const meData = await meRes.json();
+      return { token: authData.token, user: meData.user };
+    };
+
+    const seller = await loginAs(770001, 'media_seller');
+    const buyer = await loginAs(770002, 'media_buyer');
+
+    const regCtx = createExecutionContext();
+    await worker.fetch(
+      new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ sellerType: 'individual', legalName: 'Media Seller', shopName: 'Media Gallery Shop', countryCode: 'US' }),
+      }),
+      testEnv,
+      regCtx
+    );
+    await waitOnExecutionContext(regCtx);
+
+    const buildMediaPayload = async (type, slug, extra = {}) => {
+      const publicId = `sofumer/products/${seller.user.id}/${slug}`;
+      const sig = await sha1Hex(`public_id=${publicId}&version=1${testEnv.CLOUDINARY_API_SECRET}`);
+      return {
+        mediaType: type,
+        resourceType: type,
+        publicId,
+        version: 1,
+        signature: sig,
+        ...extra,
+      };
+    };
+
+    const destroyCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const target = typeof input === 'string' ? input : input.url;
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/resources/image/upload/`)) {
+        const pub = decodeURIComponent(target.split('/resources/image/upload/')[1]);
+        return new Response(
+          JSON.stringify({
+            public_id: pub,
+            resource_type: 'image',
+            format: 'jpg',
+            bytes: 180000,
+            width: 1000,
+            height: 750,
+            secure_url: `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/image/upload/v1/${pub}.jpg`,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/resources/video/upload/`)) {
+        const pub = decodeURIComponent(target.split('/resources/video/upload/')[1]);
+        return new Response(
+          JSON.stringify({
+            public_id: pub,
+            resource_type: 'video',
+            format: pub.includes('mov') ? 'mov' : 'mp4',
+            bytes: 1400000,
+            width: 1080,
+            height: 1920,
+            duration: 6.5,
+            secure_url: `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/video/upload/v1/${pub}.mp4`,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.includes(`https://api.cloudinary.com/v1_1/${testEnv.CLOUDINARY_CLOUD_NAME}/`) && target.endsWith('/destroy')) {
+        destroyCalls.push({ url: target, body: String(init?.body || '') });
+        return new Response(JSON.stringify({ result: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      const sixPhotos = [];
+      for (let i = 1; i <= 6; i++) {
+        sixPhotos.push(await buildMediaPayload('image', `img_${i}`, { isPrimary: i === 2 }));
+      }
+      const seventhPhoto = await buildMediaPayload('image', 'img_7');
+      const vid1 = await buildMediaPayload('video', 'vid_mp4_1');
+      const vid2 = await buildMediaPayload('video', 'vid_mov_2');
+
+      // 7 photos rejected -> 400
+      const sevenCtx = createExecutionContext();
+      const sevenRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            listingType: 'physical',
+            title: 'Too Many Photos',
+            description: 'Should reject seventh photo',
+            categoryId: 'cat_electronics',
+            price: 99,
+            currency: 'USD',
+            media: [...sixPhotos, seventhPhoto],
+          }),
+        }),
+        testEnv,
+        sevenCtx
+      );
+      await waitOnExecutionContext(sevenCtx);
+      expect(sevenRes.status).toBe(400);
+
+      // 6 photos + 2 short videos accepted -> 201 (videos independent of 6-photo limit!)
+      const createCtx = createExecutionContext();
+      const createRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            listingType: 'physical',
+            title: 'Full Media Camera Kit',
+            description: '6 photos plus 2 short demo clips.',
+            categoryId: 'cat_electronics',
+            price: 399,
+            currency: 'USD',
+            media: [...sixPhotos, vid1, vid2],
+            status: 'published',
+          }),
+        }),
+        testEnv,
+        createCtx
+      );
+      await waitOnExecutionContext(createCtx);
+      expect(createRes.status).toBe(201);
+      const created = await createRes.json();
+      expect(created.media.length).toBe(8);
+
+      const productId = created.product.id;
+
+      // Signing a 7th photo slot on this 6-photo listing is blocked -> 400
+      const sign7Ctx = createExecutionContext();
+      const sign7Res = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/media/sign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            mediaType: 'image',
+            mimeType: 'image/jpeg',
+            fileName: 'extra7.jpg',
+            fileSize: 50000,
+            productId,
+          }),
+        }),
+        testEnv,
+        sign7Ctx
+      );
+      await waitOnExecutionContext(sign7Ctx);
+      expect(sign7Res.status).toBe(400);
+
+      // Committing a 7th photo directly on /media endpoint rejected -> 400 and cleans up uploaded asset
+      const add7Ctx = createExecutionContext();
+      const add7Res = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${productId}/media`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify(seventhPhoto),
+        }),
+        testEnv,
+        add7Ctx
+      );
+      await waitOnExecutionContext(add7Ctx);
+      expect(add7Res.status).toBe(400);
+      expect(destroyCalls.some((c) => c.body.includes('img_7'))).toBe(true);
+
+      // Buyer detail view returns primary image, 6 photos, 2 videos, video_count=2
+      const detailCtx = createExecutionContext();
+      const detailRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/marketplace/products/${productId}`, {
+          headers: { Authorization: `Bearer ${buyer.token}` },
+        }),
+        testEnv,
+        detailCtx
+      );
+      await waitOnExecutionContext(detailCtx);
+      expect(detailRes.status).toBe(200);
+      const detailJson = await detailRes.json();
+      expect(detailJson.media.length).toBe(8);
+      expect(detailJson.videos.length).toBe(2);
+      expect(detailJson.product.video_count).toBe(2);
+      expect(detailJson.product.primary_image).toContain('img_2');
+
+      // Reorder & set img_5 as primary
+      const photosOnly = detailJson.media.filter((m) => m.media_type === 'image');
+      const img5 = photosOnly.find((m) => m.public_id.endsWith('/img_5'));
+      const reorderedIds = [...photosOnly].reverse().map((m) => m.id);
+      const reordCtx = createExecutionContext();
+      const reordRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${productId}/media/reorder`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({ orderedIds: reorderedIds, primaryMediaId: img5.id }),
+        }),
+        testEnv,
+        reordCtx
+      );
+      await waitOnExecutionContext(reordCtx);
+      expect(reordRes.status).toBe(200);
+      const reordJson = await reordRes.json();
+      expect(reordJson.media[0].public_id).toContain('img_5');
+      expect(reordJson.media[0].is_primary).toBe(1);
+
+      // Delete primary photo (img_5) -> promotes next photo and destroys img_5 in Cloudinary
+      const delMedCtx = createExecutionContext();
+      const delMedRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${productId}/media/${img5.id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${seller.token}` },
+        }),
+        testEnv,
+        delMedCtx
+      );
+      await waitOnExecutionContext(delMedCtx);
+      expect(delMedRes.status).toBe(200);
+      const delMedJson = await delMedRes.json();
+      expect(delMedJson.media.filter((m) => m.media_type === 'image').some((m) => m.is_primary === 1)).toBe(true);
+      expect(destroyCalls.some((c) => c.body.includes('img_5'))).toBe(true);
+
+      // Edit product replacing img_1 with img_replaced -> destroys img_1
+      const imgReplaced = await buildMediaPayload('image', 'img_replaced', { isPrimary: true });
+      const remainingMediaForEdit = delMedJson.media
+        .filter((m) => !m.public_id.endsWith('/img_1'))
+        .map((m) => ({
+          id: m.id,
+          mediaType: m.media_type,
+          resourceType: m.resource_type,
+          publicId: m.public_id,
+          isPrimary: false,
+        }));
+      const patchCtx = createExecutionContext();
+      const patchRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${productId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            title: 'Full Media Camera Kit v2',
+            media: [imgReplaced, ...remainingMediaForEdit],
+          }),
+        }),
+        testEnv,
+        patchCtx
+      );
+      await waitOnExecutionContext(patchCtx);
+      expect(patchRes.status).toBe(200);
+      expect(destroyCalls.some((c) => c.body.includes('img_1'))).toBe(true);
+
+      // Permanent product delete destroys remaining Cloudinary assets
+      const destroyCountBeforeDel = destroyCalls.length;
+      const delProdCtx = createExecutionContext();
+      const delProdRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${productId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${seller.token}` },
+        }),
+        testEnv,
+        delProdCtx
+      );
+      await waitOnExecutionContext(delProdCtx);
+      expect(delProdRes.status).toBe(200);
+      const delProdJson = await delProdRes.json();
+      expect(delProdJson.deleted).toBe(true);
+      expect(destroyCalls.length).toBeGreaterThan(destroyCountBeforeDel);
+
+      // Archived product (with existing order item) preserves Cloudinary asset
+      const keepImg = await buildMediaPayload('image', 'img_ordered_keep', { isPrimary: true });
+      const ordProdCtx = createExecutionContext();
+      const ordProdRes = await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/seller/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            listingType: 'physical',
+            title: 'Ordered Archive Item',
+            description: 'Archive preserves order media.',
+            categoryId: 'cat_electronics',
+            price: 49,
+            currency: 'USD',
+            media: [keepImg],
+            status: 'published',
+          }),
+        }),
+        testEnv,
+        ordProdCtx
+      );
+      await waitOnExecutionContext(ordProdCtx);
+      const ordProdJson = await ordProdRes.json();
+
+      const ordCtx = createExecutionContext();
+      await worker.fetch(
+        new Request('https://sofumer-app.derartuaman8.workers.dev/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+          body: JSON.stringify({
+            productId: ordProdJson.product.id,
+            buyerUserId: buyer.user.id,
+            quantity: 1,
+            agreedTotal: 49,
+            currency: 'USD',
+          }),
+        }),
+        testEnv,
+        ordCtx
+      );
+      await waitOnExecutionContext(ordCtx);
+
+      const destroysBeforeArchive = destroyCalls.length;
+      const archDelCtx = createExecutionContext();
+      const archDelRes = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev/api/seller/products/${ordProdJson.product.id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${seller.token}` },
+        }),
+        testEnv,
+        archDelCtx
+      );
+      await waitOnExecutionContext(archDelCtx);
+      expect(archDelRes.status).toBe(200);
+      const archDelJson = await archDelRes.json();
+      expect(archDelJson.archived).toBe(true);
+      expect(destroyCalls.length).toBe(destroysBeforeArchive);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

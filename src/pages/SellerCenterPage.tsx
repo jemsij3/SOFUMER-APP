@@ -6,6 +6,7 @@ import {
   ImagePlus,
   KeyRound,
   Package,
+  Pencil,
   Plus,
   Sparkles,
   Store,
@@ -13,9 +14,17 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
+import {
+  type SellerMediaConfig,
+  DEFAULT_MEDIA_CONFIG,
+  fetchSellerMediaConfig,
+  uploadSignedMediaToCloudinary,
+  validateImageFile,
+} from '../lib/cloudinary';
 import { openTelegramInvoice } from '../lib/telegram';
-import type { Product, ProductDigitalAsset, Shop, StarsPayment } from '../types';
+import type { Product, ProductDigitalAsset, ProductMedia, Shop, StarsPayment } from '../types';
 import { ImageWithFallback } from '../components/ImageWithFallback';
+import { ProductMediaManager, type DraftMediaItem } from '../components/ProductMediaManager';
 
 type SellerModule =
   | 'dashboard'
@@ -103,7 +112,10 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [regPhone, setRegPhone] = useState('');
   const [regBusy, setRegBusy] = useState(false);
 
-  // Add Product form state
+  // Add / Edit Product form state
+  const [editingProductId, setEditingProductId] = useState<string | null>(null);
+  const [loadingProductEdit, setLoadingProductEdit] = useState(false);
+  const [savingProduct, setSavingProduct] = useState(false);
   const [listingType, setListingType] = useState<'physical' | 'digital' | 'service'>('physical');
   const [pTitle, setPTitle] = useState('');
   const [pDesc, setPDesc] = useState('');
@@ -124,7 +136,8 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [pTimeframe, setPTimeframe] = useState('');
   const [pReturnPolicy, setPReturnPolicy] = useState('');
   const [pKeywords, setPKeywords] = useState('');
-  const [pImages, setPImages] = useState<string[]>([]);
+  const [mediaConfig, setMediaConfig] = useState<SellerMediaConfig>(DEFAULT_MEDIA_CONFIG);
+  const [mediaItems, setMediaItems] = useState<DraftMediaItem[]>([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
 
@@ -169,12 +182,14 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     }
     setLoading(true);
     try {
-      const [d, p] = await Promise.all([
+      const [d, p, mc] = await Promise.all([
         apiFetch<SellerDashboardData>('/api/seller/dashboard'),
         apiFetch<{ products: Product[] }>('/api/seller/products'),
+        fetchSellerMediaConfig().catch(() => DEFAULT_MEDIA_CONFIG),
       ]);
       setDash(d);
       setProducts(p.products);
+      setMediaConfig(mc);
       setEditShopName(d.shop.name);
       setEditShopDesc(d.shop.description);
       setEditReturnPolicy(d.shop.return_policy);
@@ -346,24 +361,111 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     );
   }
 
-  async function uploadImage(file: File): Promise<string> {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiFetch<{ url: string }>('/api/uploads', { method: 'POST', body: fd });
-    return res.url;
+  function resetProductForm() {
+    setEditingProductId(null);
+    setListingType('physical');
+    setPTitle('');
+    setPDesc('');
+    setPCat(categories[0]?.id || 'cat_electronics');
+    setPSubCat('');
+    setPPrice('');
+    setPCurrency(dash?.shop.default_currency || 'USD');
+    setPCondition('new');
+    setPStock('10');
+    setPShipping('');
+    setPIntlShipping(true);
+    setPLocation('');
+    setPFileFormat('');
+    setPDigitalDelivery('');
+    setPLicense('');
+    setPPricingModel('fixed');
+    setPServiceMode('remote');
+    setPTimeframe('');
+    setPReturnPolicy('');
+    setPKeywords('');
+    setMediaItems((prev) => {
+      for (const item of prev) {
+        if (item.previewUrl && item.previewUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+      }
+      return [];
+    });
+    setPreviewOpen(false);
   }
 
-  async function handleProductImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files || []).slice(0, 6 - pImages.length);
-    for (const f of files) {
-      try {
-        const url = await uploadImage(f);
-        setPImages((prev) => [...prev, url]);
-      } catch (err) {
-        notify(err instanceof Error ? err.message : 'Upload failed', 'error');
-      }
+  async function startEditProduct(productId: string) {
+    setLoadingProductEdit(true);
+    setModule('add_product');
+    try {
+      const res = await apiFetch<{
+        product: Product & { stock_quantity?: number };
+        media: ProductMedia[];
+      }>(`/api/seller/products/${productId}`);
+      const prod = res.product;
+      setEditingProductId(prod.id);
+      setListingType(prod.listing_type || 'physical');
+      setPTitle(prod.title || '');
+      setPDesc(prod.description || '');
+      setPCat(prod.category_id || categories[0]?.id || 'cat_electronics');
+      setPSubCat(prod.subcategory_id || '');
+      setPPrice(String(prod.price ?? ''));
+      setPCurrency(prod.currency || 'USD');
+      setPCondition(prod.condition && prod.condition !== 'not_applicable' ? prod.condition : 'new');
+      setPStock(String(prod.stock_quantity ?? 1));
+      setPShipping(prod.shipping_info || '');
+      setPIntlShipping(Boolean(prod.international_shipping));
+      setPLocation(prod.location_text || '');
+      setPFileFormat(prod.file_format || '');
+      setPDigitalDelivery(prod.digital_delivery_method || '');
+      setPLicense(prod.license_info || '');
+      setPPricingModel(prod.pricing_model || 'fixed');
+      setPServiceMode(prod.service_mode && prod.service_mode !== 'not_applicable' ? prod.service_mode : 'remote');
+      setPTimeframe(prod.delivery_timeframe || '');
+      setPReturnPolicy(prod.return_policy || '');
+      setPKeywords(prod.keywords || '');
+      setMediaItems(
+        (res.media || []).map((m) => ({
+          id: m.id,
+          localKey: m.id,
+          storageProvider: m.storage_provider,
+          mediaType: m.media_type,
+          resourceType: m.resource_type,
+          publicId: m.public_id,
+          secureUrl: m.secure_url,
+          previewUrl: m.secure_url,
+          format: m.format || '',
+          bytes: Number(m.bytes || 0),
+          width: Number(m.width || 0),
+          height: Number(m.height || 0),
+          duration: m.duration ?? null,
+          sortOrder: Number(m.sort_order || 0),
+          isPrimary: Boolean(m.is_primary),
+          altText: m.alt_text || '',
+          status: 'ready' as const,
+          progress: 100,
+        }))
+      );
+      setPreviewOpen(false);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to load listing for editing', 'error');
+      setModule('products');
+    } finally {
+      setLoadingProductEdit(false);
     }
-    e.target.value = '';
+  }
+
+  async function uploadShopImage(file: File): Promise<string> {
+    const check = validateImageFile(file, mediaConfig.maxImageBytes);
+    if (check.ok === false) {
+      throw new Error(check.error);
+    }
+    const uploaded = await uploadSignedMediaToCloudinary({
+      file,
+      mediaType: 'image',
+      scope: 'shop',
+    });
+    return uploaded.secureUrl;
   }
 
   async function handleAiDraft() {
@@ -402,51 +504,119 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   }
 
   async function submitProduct(publishStatus: 'draft' | 'published') {
+    if (mediaItems.some((m) => m.status === 'uploading')) {
+      notify('Please wait for all photos and videos to finish uploading.', 'info');
+      return;
+    }
+    if (mediaItems.some((m) => m.status === 'error')) {
+      notify('Remove or retry failed media uploads before saving this listing.', 'error');
+      return;
+    }
+
+    const readyPhotos = mediaItems.filter((m) => m.status === 'ready' && m.mediaType === 'image');
+    const readyVideos = mediaItems.filter((m) => m.status === 'ready' && m.mediaType === 'video');
+    if (readyPhotos.length > mediaConfig.maxPhotos) {
+      notify(`Maximum ${mediaConfig.maxPhotos} photos allowed per product.`, 'error');
+      return;
+    }
+    if (readyVideos.length > mediaConfig.maxVideos) {
+      notify(`Maximum ${mediaConfig.maxVideos} short video(s) allowed per product.`, 'error');
+      return;
+    }
+
+    const mediaPayload = [
+      ...readyPhotos.map((m, idx) => ({
+        id: m.id,
+        storageProvider: m.storageProvider,
+        mediaType: 'image' as const,
+        resourceType: 'image' as const,
+        publicId: m.publicId,
+        version: m.version,
+        signature: m.signature,
+        secureUrl: m.secureUrl,
+        format: m.format,
+        bytes: m.bytes,
+        width: m.width,
+        height: m.height,
+        duration: null,
+        sortOrder: idx,
+        isPrimary: m.isPrimary,
+        altText: m.altText || pTitle,
+      })),
+      ...readyVideos.map((m, idx) => ({
+        id: m.id,
+        storageProvider: m.storageProvider,
+        mediaType: 'video' as const,
+        resourceType: 'video' as const,
+        publicId: m.publicId,
+        version: m.version,
+        signature: m.signature,
+        secureUrl: m.secureUrl,
+        format: m.format,
+        bytes: m.bytes,
+        width: m.width,
+        height: m.height,
+        duration: m.duration,
+        sortOrder: idx,
+        isPrimary: false,
+        altText: m.altText || pTitle,
+      })),
+    ];
+
+    setSavingProduct(true);
     try {
-      const res = await apiFetch<{ product: Product; moderationNotes?: string }>('/api/seller/products', {
-        method: 'POST',
-        body: JSON.stringify({
-          listingType,
-          title: pTitle,
-          description: pDesc,
-          categoryId: pCat,
-          subcategoryId: pSubCat || null,
-          price: Number(pPrice || 0),
-          currency: pCurrency,
-          condition: pCondition,
-          stockQuantity: Number(pStock || 1),
-          shippingInfo: pShipping,
-          internationalShipping: pIntlShipping,
-          locationText: pLocation,
-          fileFormat: pFileFormat,
-          digitalDeliveryMethod: pDigitalDelivery,
-          licenseInfo: pLicense,
-          pricingModel: pPricingModel,
-          serviceMode: pServiceMode,
-          deliveryTimeframe: pTimeframe,
-          returnPolicy: pReturnPolicy,
-          keywords: pKeywords,
-          images: pImages,
-          status: publishStatus,
-        }),
-      });
+      const payload = {
+        listingType,
+        title: pTitle,
+        description: pDesc,
+        categoryId: pCat,
+        subcategoryId: pSubCat || null,
+        price: Number(pPrice || 0),
+        currency: pCurrency,
+        condition: pCondition,
+        stockQuantity: Number(pStock || 1),
+        shippingInfo: pShipping,
+        internationalShipping: pIntlShipping,
+        locationText: pLocation,
+        fileFormat: pFileFormat,
+        digitalDeliveryMethod: pDigitalDelivery,
+        licenseInfo: pLicense,
+        pricingModel: pPricingModel,
+        serviceMode: pServiceMode,
+        deliveryTimeframe: pTimeframe,
+        returnPolicy: pReturnPolicy,
+        keywords: pKeywords,
+        media: mediaPayload,
+        status: publishStatus,
+      };
+
+      const res = editingProductId
+        ? await apiFetch<{ product: Product; moderationNotes?: string }>(
+            `/api/seller/products/${editingProductId}`,
+            { method: 'PATCH', body: JSON.stringify(payload) }
+          )
+        : await apiFetch<{ product: Product; moderationNotes?: string }>('/api/seller/products', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          });
+
       notify(
         res.moderationNotes
           ? res.moderationNotes
+          : editingProductId
+          ? 'Listing changes saved!'
           : publishStatus === 'published'
           ? 'Listing published!'
           : 'Saved as draft',
         'success'
       );
-      setPTitle('');
-      setPDesc('');
-      setPPrice('');
-      setPImages([]);
-      setPreviewOpen(false);
+      resetProductForm();
       await loadSellerData();
       setModule('products');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to save listing', 'error');
+    } finally {
+      setSavingProduct(false);
     }
   }
 
@@ -659,7 +829,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     { key: 'dashboard', label: 'Dashboard' },
     { key: 'my_shop', label: 'My Shop' },
     { key: 'products', label: 'Products' },
-    { key: 'add_product', label: 'Add Product' },
+    { key: 'add_product', label: editingProductId ? 'Edit Listing' : 'Add Product' },
     { key: 'orders', label: 'Orders & Inquiries' },
     { key: 'analytics', label: 'Analytics' },
     { key: 'promotions', label: 'Promotions' },
@@ -702,7 +872,10 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
           )}
           <button
             type="button"
-            onClick={() => setModule('add_product')}
+            onClick={() => {
+              resetProductForm();
+              setModule('add_product');
+            }}
             className="h-10 px-4 rounded-xl bg-blue-600 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap"
           >
             <Plus className="w-4 h-4" />
@@ -795,6 +968,8 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                         <div className="text-sm font-semibold text-white truncate">{p.title}</div>
                         <div className="text-xs text-slate-400 font-mono-nums">
                           {p.listing_type} · {p.currency} {p.price} · Status: {p.status} · Views: {p.view_count}
+                          {(Number(p.media_image_count || 0) > 0 || Number(p.media_video_count || 0) > 0) &&
+                            ` · ${p.media_image_count || 0} photos${Number(p.media_video_count || 0) > 0 ? `, ${p.media_video_count} videos` : ''}`}
                         </div>
                         {p.moderation_notes && (
                           <div className="text-[11px] text-amber-300 mt-0.5">{p.moderation_notes}</div>
@@ -812,6 +987,14 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                           <span>{p.has_digital_package ? 'Digital Package' : 'Attach Package'}</span>
                         </button>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => startEditProduct(p.id)}
+                        className="h-9 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-xs text-slate-100 flex items-center gap-1 hover:border-blue-500"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                        <span>Edit</span>
+                      </button>
                       <button
                         type="button"
                         onClick={() => navigate({ type: 'product', productId: p.id })}
@@ -940,11 +1123,27 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
           {module === 'add_product' && (
             <div className="p-5 sm:p-6 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-lg font-semibold text-white">Publish New Listing</h2>
+                <div className="flex items-center gap-3">
+                  <h2 className="text-lg font-semibold text-white">
+                    {editingProductId ? 'Edit Listing' : 'Publish New Listing'}
+                  </h2>
+                  {editingProductId && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        resetProductForm();
+                        setModule('products');
+                      }}
+                      className="h-8 px-3 rounded-lg bg-slate-800 text-xs text-slate-300 hover:text-white"
+                    >
+                      Cancel Edit
+                    </button>
+                  )}
+                </div>
                 <button
                   type="button"
                   onClick={handleAiDraft}
-                  disabled={aiBusy}
+                  disabled={aiBusy || loadingProductEdit}
                   className="h-10 px-4 rounded-xl bg-[#131C31] border border-purple-700/40 text-purple-200 text-xs font-medium flex items-center gap-2"
                 >
                   <Bot className="w-4 h-4" />
@@ -952,18 +1151,25 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                 </button>
               </div>
 
+              {loadingProductEdit && (
+                <div className="p-4 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-300">
+                  Loading listing details and Cloudinary media...
+                </div>
+              )}
+
               {/* Listing Type Selector */}
               <div className="grid grid-cols-3 gap-2">
                 {(['physical', 'digital', 'service'] as const).map((lt) => (
                   <button
                     key={lt}
                     type="button"
+                    disabled={Boolean(editingProductId)}
                     onClick={() => setListingType(lt)}
                     className={`h-11 rounded-xl border text-xs sm:text-sm font-medium capitalize ${
                       listingType === lt
                         ? 'bg-blue-600 border-blue-500 text-white'
                         : 'bg-[#070B14] border-slate-800 text-slate-300'
-                    }`}
+                    } ${editingProductId ? 'opacity-70 cursor-not-allowed' : ''}`}
                   >
                     {lt === 'physical' ? 'Physical Product' : lt === 'digital' ? 'Digital Product' : 'Service'}
                   </button>
@@ -1130,50 +1336,73 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                 </div>
               </div>
 
-              {/* Image Uploader */}
-              <div className="space-y-2">
-                <label className="block text-xs text-slate-400">Product / Preview Images (up to 6)</label>
-                <div className="flex flex-wrap gap-3">
-                  {pImages.map((url, idx) => (
-                    <div key={idx} className="relative w-24 h-20 rounded-xl overflow-hidden border border-slate-800">
-                      <ImageWithFallback src={url} alt="Upload" className="w-full h-full object-cover" />
-                      <button
-                        type="button"
-                        onClick={() => setPImages((prev) => prev.filter((_, i) => i !== idx))}
-                        className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/70 text-white text-xs"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                  {pImages.length < 6 && (
-                    <label className="w-24 h-20 rounded-xl border border-dashed border-slate-700 hover:border-blue-500 flex flex-col items-center justify-center text-xs text-slate-400 cursor-pointer">
-                      <ImagePlus className="w-5 h-5 mb-1" />
-                      <span>Upload</span>
-                      <input type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif" onChange={handleProductImageUpload} className="hidden" />
-                    </label>
-                  )}
-                </div>
-              </div>
+              <ProductMediaManager
+                items={mediaItems}
+                onChange={setMediaItems}
+                config={mediaConfig}
+                productId={editingProductId || undefined}
+                notify={notify}
+              />
 
               <div className="flex flex-wrap gap-2.5 pt-2">
-                <button type="button" onClick={() => setPreviewOpen((v) => !v)} className="h-11 px-4 rounded-xl bg-[#131C31] border border-slate-700 text-slate-200 text-sm font-medium flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPreviewOpen((v) => !v)}
+                  className="h-11 px-4 rounded-xl bg-[#131C31] border border-slate-700 text-slate-200 text-sm font-medium flex items-center gap-2"
+                >
                   <Eye className="w-4 h-4" />
                   <span>Preview</span>
                 </button>
-                <button type="button" onClick={() => submitProduct('draft')} className="h-11 px-4 rounded-xl bg-slate-800 text-slate-100 text-sm font-medium">
-                  Save Draft
+                <button
+                  type="button"
+                  disabled={savingProduct || loadingProductEdit}
+                  onClick={() => submitProduct('draft')}
+                  className="h-11 px-4 rounded-xl bg-slate-800 text-slate-100 text-sm font-medium disabled:opacity-60"
+                >
+                  {savingProduct ? 'Saving...' : 'Save Draft'}
                 </button>
-                <button type="button" onClick={() => submitProduct('published')} className="h-11 px-5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold">
-                  Publish Listing
+                <button
+                  type="button"
+                  disabled={savingProduct || loadingProductEdit}
+                  onClick={() => submitProduct('published')}
+                  className="h-11 px-5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold disabled:opacity-60"
+                >
+                  {savingProduct
+                    ? 'Saving...'
+                    : editingProductId
+                    ? 'Save & Publish'
+                    : 'Publish Listing'}
                 </button>
               </div>
 
               {previewOpen && (
-                <div className="p-4 rounded-xl bg-[#070B14] border border-blue-800/50 space-y-2">
+                <div className="p-4 rounded-xl bg-[#070B14] border border-blue-800/50 space-y-2.5">
                   <div className="text-xs text-blue-400">Listing Preview</div>
-                  <div className="text-base font-bold text-white">{pTitle || 'Untitled Listing'}</div>
-                  <div className="text-sm font-mono-nums text-slate-200">{pCurrency} {pPrice || '0.00'}</div>
+                  {(() => {
+                    const photos = mediaItems.filter((m) => m.mediaType === 'image');
+                    const primary = photos.find((p) => p.isPrimary) || photos[0];
+                    const videos = mediaItems.filter((m) => m.mediaType === 'video');
+                    return (
+                      <div className="flex flex-wrap items-center gap-3">
+                        {primary && (
+                          <div className="w-24 h-18 rounded-lg overflow-hidden border border-slate-800 shrink-0">
+                            <ImageWithFallback
+                              src={primary.previewUrl || primary.secureUrl}
+                              alt={pTitle || 'Listing cover'}
+                              className="w-full h-full object-cover"
+                            />
+                          </div>
+                        )}
+                        <div className="space-y-1">
+                          <div className="text-base font-bold text-white">{pTitle || 'Untitled Listing'}</div>
+                          <div className="text-sm font-mono-nums text-slate-200">{pCurrency} {pPrice || '0.00'}</div>
+                          <div className="text-xs text-slate-400 font-mono-nums">
+                            {photos.length} photo{photos.length === 1 ? '' : 's'} · {videos.length} short video{videos.length === 1 ? '' : 's'}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
                   <p className="text-xs text-slate-300 whitespace-pre-line">{pDesc || 'No description yet.'}</p>
                 </div>
               )}
@@ -1428,11 +1657,13 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                   <label className="h-10 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-200 flex items-center gap-2 cursor-pointer">
                     <ImagePlus className="w-4 h-4" />
                     <span>Upload Logo</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={async (e) => {
+                    <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" className="hidden" onChange={async (e) => {
                       const f = e.target.files?.[0];
+                      e.target.value = '';
                       if (!f) return;
                       try {
-                        setEditLogo(await uploadImage(f));
+                        setEditLogo(await uploadShopImage(f));
+                        notify('Logo uploaded to Cloudinary. Click Save Settings to apply.', 'success');
                       } catch (err) {
                         notify(err instanceof Error ? err.message : 'Logo upload failed', 'error');
                       }
@@ -1441,11 +1672,13 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                   <label className="h-10 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-200 flex items-center gap-2 cursor-pointer">
                     <ImagePlus className="w-4 h-4" />
                     <span>Upload Banner</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={async (e) => {
+                    <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" className="hidden" onChange={async (e) => {
                       const f = e.target.files?.[0];
+                      e.target.value = '';
                       if (!f) return;
                       try {
-                        setEditBanner(await uploadImage(f));
+                        setEditBanner(await uploadShopImage(f));
+                        notify('Banner uploaded to Cloudinary. Click Save Settings to apply.', 'success');
                       } catch (err) {
                         notify(err instanceof Error ? err.message : 'Banner upload failed', 'error');
                       }
