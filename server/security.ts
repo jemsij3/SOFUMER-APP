@@ -51,7 +51,7 @@ export function getJwtSecret(): string {
 }
 
 export function isTelegramIdAdmin(telegramId: string): boolean {
-  const raw = process.env.ADMIN_TELEGRAM_IDS || '';
+  const raw = [process.env.ADMIN_TELEGRAM_IDS, process.env.ADMIN_TELEGRAM_ID].filter(Boolean).join(',');
   const target = telegramId.trim();
   if (!target || !/^\d+$/.test(target) || !raw) return false;
 

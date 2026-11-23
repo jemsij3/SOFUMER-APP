@@ -41,9 +41,10 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 | `TELEGRAM_BOT_TOKEN` | Cloudflare Secret | Yes | Verifies Telegram `initData` HMAC-SHA256, resolves bot info via `getMe`, sends bot messages, and creates Telegram Stars (`XTR`) invoice links |
 | `TELEGRAM_WEBHOOK_SECRET` | Cloudflare Secret | Yes | Validates `X-Telegram-Bot-Api-Secret-Token` header on webhook (`pre_checkout_query` & `successful_payment`) |
 | `JWT_SECRET` | Cloudflare Secret | Yes | Signs & verifies HS256 JWT authentication tokens for Telegram users |
-| `ADMIN_TELEGRAM_IDS` | Cloudflare Secret | Yes | Comma-separated numeric Telegram user IDs authorized for the Admin Governance Console |
+| `ADMIN_TELEGRAM_IDS` (or `ADMIN_TELEGRAM_ID`) | Cloudflare Secret / Var | Yes | Comma-separated numeric Telegram user IDs authorized for the Admin Governance Console |
+| `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Cloudflare Secret / Var | Optional | Preserved automatically across deploys via `keep_vars: true` and `--keep-vars` |
 | `MINI_APP_URL` | Env Var (Optional) | No | Optional override for Mini App URL used in Telegram bot buttons |
-| `CLOUDFLARE_AI_MODEL` | `wrangler.jsonc` Var | Yes | Cloudflare Workers AI model (default: `@cf/meta/llama-3.1-8b-instruct`) |
+| `CLOUDFLARE_AI_MODEL` | `wrangler.jsonc` Var | Yes | Cloudflare Workers AI model (default: `@cf/meta/llama-3.1-8b-instruct-fast`) |
 | `CLOUDFLARE_ACCOUNT_ID` | Local Dev Only | Optional | Used only when running Node.js `server.ts` outside Cloudflare Workers |
 | `CLOUDFLARE_AI_API_TOKEN` | Local Dev Only | Optional | Workers AI REST token when testing AI from Node.js outside Wrangler |
 
@@ -61,18 +62,18 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 ## 5. Automatic Cloudflare D1 Provisioning, Workers AI & Deployment
 
-`wrangler.jsonc` binds `sofumer-db` (`database_id`: `37387526-bf6a-4a2d-bf61-70dece9eb2f5`) and excludes R2 (`MEDIA_BUCKET`) for now. Migrations `0001`–`0004` define all tables, indexes, and system seeds.
+`wrangler.jsonc` targets production Worker `sofumer-app`, sets `"keep_vars": true` to protect dashboard-managed Environment Variables, and binds `sofumer-db` (`DB`), Workers AI (`AI`), and static assets (`ASSETS`). Migrations `0001`–`0005` define all tables, indexes, and system seeds.
 
 1. **Deploy Worker**:
    - **Via Cloudflare Workers Builds / Cloudflare AI** (GitHub integration for Worker `sofumer-app`):
      - **Build command**: `npm run build`
-     - **Deploy command**: `npx wrangler deploy --x-provision`
+     - **Deploy command**: `npx wrangler deploy --x-provision --keep-vars`
      - On the first `/api/*` request, the Worker's built-in `ensureD1Schema(env.DB)` bootstrapper automatically creates any missing tables, indexes, and system configuration seeds if the database is empty.
    - **Via CLI**:
      ```bash
      npm run build
-     npx wrangler deploy --x-provision
-     npx wrangler d1 migrations apply sofumer-db --remote
+     npx wrangler deploy --name sofumer-app --keep-vars --x-provision
+     npx wrangler d1 migrations apply sofumer-db --remote -y
      ```
 2. **Configure Cloudflare Secrets** (Dashboard → Workers & Pages → `sofumer-app` → Settings → Variables and Secrets, or CLI):
    ```bash
@@ -82,6 +83,6 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
    npx wrangler secret put ADMIN_TELEGRAM_IDS
    ```
 3. **GitHub Actions CI/CD**:
-   Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` to your GitHub Repository Secrets. Pushing to `main` runs `npm run lint`, `npm run build`, `npm test`, deploys the Worker with `--x-provision`, and applies `migrations/`.
+   Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` to your GitHub Repository Secrets. Pushing to `main` runs `npm run lint`, `npm run build`, `npm test`, deploys `sofumer-app` with `--keep-vars --x-provision` (preserving all dashboard Environment Variables and Secrets), and applies `migrations/` with `-y`.
 
 

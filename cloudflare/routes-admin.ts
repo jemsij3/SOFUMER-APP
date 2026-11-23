@@ -96,7 +96,9 @@ async function validateAndNormalizeSetting(
 }
 
 function getEnvOwnerTelegramIds(env: Env): string[] {
-  return String(env.ADMIN_TELEGRAM_IDS || '')
+  return [env.ADMIN_TELEGRAM_IDS, env.ADMIN_TELEGRAM_ID]
+    .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+    .join(',')
     .split(',')
     .map((id) => id.trim())
     .filter((id) => /^\d+$/.test(id));

@@ -63,6 +63,10 @@ export interface Env {
   TELEGRAM_WEBHOOK_SECRET?: string;
   JWT_SECRET?: string;
   ADMIN_TELEGRAM_IDS?: string;
+  ADMIN_TELEGRAM_ID?: string;
+  CLOUDINARY_CLOUD_NAME?: string;
+  CLOUDINARY_API_KEY?: string;
+  CLOUDINARY_API_SECRET?: string;
   MINI_APP_URL?: string;
   CLOUDFLARE_AI_MODEL?: string;
 }
@@ -627,7 +631,10 @@ export async function resolveEdgeAdminContext(
   const tgId = String(telegramId || '').trim();
   if (!/^\d+$/.test(tgId)) return null;
 
-  if (isTelegramIdAdmin(tgId, env.ADMIN_TELEGRAM_IDS)) {
+  const configuredAdminIds = [env.ADMIN_TELEGRAM_IDS, env.ADMIN_TELEGRAM_ID]
+    .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+    .join(',');
+  if (isTelegramIdAdmin(tgId, configuredAdminIds)) {
     return {
       roleId: 'role_owner',
       roleCode: 'OWNER',

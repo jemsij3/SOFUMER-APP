@@ -93,7 +93,9 @@ function validateAndNormalizeSettingLocal(
 }
 
 function getEnvOwnerTelegramIds(): string[] {
-  return String(process.env.ADMIN_TELEGRAM_IDS || '')
+  return [process.env.ADMIN_TELEGRAM_IDS, process.env.ADMIN_TELEGRAM_ID]
+    .filter(Boolean)
+    .join(',')
     .split(',')
     .map((id) => id.trim())
     .filter((id) => /^\d+$/.test(id));

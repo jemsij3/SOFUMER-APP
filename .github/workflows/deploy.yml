@@ -42,21 +42,68 @@ jobs:
             echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID in GitHub Repository Secrets. Configure both secrets to deploy sofumer-app."
             exit 1
           fi
+          WORKER_NAME=$(node -e "const fs=require('fs');const raw=fs.readFileSync('wrangler.jsonc','utf8').replace(/^\s*\/\/.*$/gm,'');const cfg=JSON.parse(raw);if(cfg.name!=='sofumer-app'){console.error('Expected Worker name sofumer-app, got '+cfg.name);process.exit(1);}console.log(cfg.name);")
           DB_NAME=$(node -e "const fs=require('fs');const raw=fs.readFileSync('wrangler.jsonc','utf8').replace(/^\s*\/\/.*$/gm,'');const cfg=JSON.parse(raw);console.log(cfg.d1_databases?.[0]?.database_name || 'sofumer-db');")
+          echo "worker_name=$WORKER_NAME" >> "$GITHUB_OUTPUT"
           echo "db_name=$DB_NAME" >> "$GITHUB_OUTPUT"
-          if ! npx --no-install wrangler d1 list; then
-            echo "::error::Cloudflare D1 API access failed. Ensure CLOUDFLARE_API_TOKEN has 'Account > Workers Scripts: Edit' and 'Account > D1: Edit' permissions, and CLOUDFLARE_ACCOUNT_ID is correct."
-            tail -n 60 ~/.config/.wrangler/logs/*.log 2>/dev/null || true
+          if ! npx --no-install wrangler d1 list >/dev/null; then
+            echo "::error::Cloudflare D1 API access failed. Ensure CLOUDFLARE_API_TOKEN has 'Account > Workers Scripts: Edit' and 'Account > D1: Edit' permissions, and CLOUDFLARE_ACCOUNT_ID matches your account."
             exit 1
           fi
-      - name: Deploy Cloudflare Worker, Assets & Auto-Provision D1
+      - name: Deploy Worker sofumer-app (preserving dashboard vars & secrets)
         env:
           CI: 'true'
+          SECRET_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SECRET_TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          SECRET_JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          SECRET_ADMIN_TELEGRAM_IDS: ${{ secrets.ADMIN_TELEGRAM_IDS }}
+          SECRET_ADMIN_TELEGRAM_ID: ${{ secrets.ADMIN_TELEGRAM_ID }}
+          SECRET_CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          SECRET_CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          SECRET_CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          SECRET_MINI_APP_URL: ${{ secrets.MINI_APP_URL }}
         run: |
-          if ! npx --no-install wrangler deploy --x-provision; then
-            echo "::error::Cloudflare Worker deploy failed. Ensure CLOUDFLARE_API_TOKEN has 'Account > Workers Scripts: Edit' and 'Account > D1: Edit' permissions."
-            tail -n 60 ~/.config/.wrangler/logs/*.log 2>/dev/null || true
-            exit 1
+          SECRETS_FILE=".wrangler-ci-secrets.json"
+          cleanup() {
+            rm -f "$SECRETS_FILE"
+          }
+          trap cleanup EXIT
+
+          HAS_SECRETS=$(node -e "
+            const fs = require('fs');
+            const keys = [
+              'TELEGRAM_BOT_TOKEN',
+              'TELEGRAM_WEBHOOK_SECRET',
+              'JWT_SECRET',
+              'ADMIN_TELEGRAM_IDS',
+              'ADMIN_TELEGRAM_ID',
+              'CLOUDINARY_CLOUD_NAME',
+              'CLOUDINARY_API_KEY',
+              'CLOUDINARY_API_SECRET',
+              'MINI_APP_URL'
+            ];
+            const out = {};
+            for (const k of keys) {
+              const v = process.env['SECRET_' + k];
+              if (typeof v === 'string' && v.trim() !== '') {
+                out[k] = v;
+              }
+            }
+            const names = Object.keys(out);
+            if (names.length > 0) {
+              fs.writeFileSync('$SECRETS_FILE', JSON.stringify(out), { mode: 0o600 });
+              console.error('Syncing ' + names.length + ' non-empty GitHub secret(s) additively: ' + names.join(', '));
+              console.log('true');
+            } else {
+              console.error('No optional GitHub secrets set; preserving existing Cloudflare Dashboard variables and secrets.');
+              console.log('false');
+            }
+          ")
+
+          if [ "$HAS_SECRETS" = "true" ]; then
+            npx --no-install wrangler deploy --name "${{ steps.cf_ready.outputs.worker_name }}" --keep-vars --x-provision --secrets-file "$SECRETS_FILE"
+          else
+            npx --no-install wrangler deploy --name "${{ steps.cf_ready.outputs.worker_name }}" --keep-vars --x-provision
           fi
       - name: Apply D1 Migrations
         env:
@@ -67,12 +114,7 @@ jobs:
             echo "D1 database '$DB_NAME' not found yet; creating it now..."
             if ! npx --no-install wrangler d1 create "$DB_NAME"; then
               echo "::error::Failed to create D1 database '$DB_NAME'. Ensure CLOUDFLARE_API_TOKEN includes 'Account > D1: Edit'."
-              tail -n 60 ~/.config/.wrangler/logs/*.log 2>/dev/null || true
               exit 1
             fi
           fi
-          if ! npx --no-install wrangler d1 migrations apply "$DB_NAME" --remote -y; then
-            echo "::error::D1 migration failed for '$DB_NAME'."
-            tail -n 60 ~/.config/.wrangler/logs/*.log 2>/dev/null || true
-            exit 1
-          fi
+          npx --no-install wrangler d1 migrations apply "$DB_NAME" --remote -y
