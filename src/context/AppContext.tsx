@@ -27,14 +27,32 @@ interface ToastItem {
   message: string;
 }
 
+import type { TelegramInitDataSource } from '../lib/telegram';
+
+export interface AuthDiagnostics {
+  stageA_launchContext: 'mini_app' | 'telegram_in_app_browser' | 'external_browser';
+  stageB_webAppDetected: boolean;
+  platform: string;
+  version: string;
+  stageC_initDataPresent: boolean;
+  initDataSource: TelegramInitDataSource;
+  initDataLength: number;
+  stageD_sentToWorker: boolean;
+  stageE_workerReceivedInitData: boolean | null;
+  stageF_signatureVerified: boolean | null;
+  stageG_sessionEstablished: boolean;
+}
+
 interface AppContextValue {
   user: User | null;
   sellerProfile: SellerProfile | null;
   shop: Shop | null;
   authLoading: boolean;
   authError: string | null;
+  authDiagnostics: AuthDiagnostics;
   botName: string;
   botUsername: string;
+  launchUrl: string;
   telegramConfigured: boolean;
   jwtConfigured: boolean;
   configLoaded: boolean;
@@ -85,9 +103,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [authError, setAuthError] = useState<string | null>(null);
   const [botName, setBotName] = useState('');
   const [botUsername, setBotUsername] = useState('');
+  const [launchUrl, setLaunchUrl] = useState('');
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [jwtConfigured, setJwtConfigured] = useState(true);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [authDiagnostics, setAuthDiagnostics] = useState<AuthDiagnostics>({
+    stageA_launchContext: 'external_browser',
+    stageB_webAppDetected: false,
+    platform: '',
+    version: '',
+    stageC_initDataPresent: false,
+    initDataSource: 'none',
+    initDataLength: 0,
+    stageD_sentToWorker: false,
+    stageE_workerReceivedInitData: null,
+    stageF_signatureVerified: null,
+    stageG_sessionEstablished: false,
+  });
 
   const [categories, setCategories] = useState<Category[]>([]);
   const [subcategories, setSubcategories] = useState<Subcategory[]>([]);
@@ -223,6 +255,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const cfg = await apiFetch<{
         botName: string | null;
         botUsername: string | null;
+        launchUrl?: string | null;
         telegramConfigured: boolean;
         jwtConfigured?: boolean;
       }>('/api/auth/config');
@@ -231,6 +264,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       jwtCfgOk = cfg.jwtConfigured !== false;
       setBotName(cfg.botName || '');
       setBotUsername(cfg.botUsername || '');
+      setLaunchUrl(cfg.launchUrl || (cfg.botUsername ? `https://t.me/${cfg.botUsername}?startapp` : ''));
       setTelegramConfigured(tgConfigured);
       setJwtConfigured(jwtCfgOk);
       setConfigLoaded(true);
@@ -239,23 +273,71 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setConfigLoaded(false);
     }
 
-    const initData = await waitForTelegramInitData(700);
+    const { initData, source } = await waitForTelegramInitData(700);
+    const tgStatus = getTelegramClientStatus();
+
+    const diag: AuthDiagnostics = {
+      stageA_launchContext: tgStatus.hasTelegramWebApp
+        ? initData
+          ? 'mini_app'
+          : 'telegram_in_app_browser'
+        : 'external_browser',
+      stageB_webAppDetected: tgStatus.hasTelegramWebApp,
+      platform: tgStatus.platform || 'unknown',
+      version: tgStatus.version || '',
+      stageC_initDataPresent: initData.length > 0,
+      initDataSource: source,
+      initDataLength: initData.length,
+      stageD_sentToWorker: false,
+      stageE_workerReceivedInitData: null,
+      stageF_signatureVerified: null,
+      stageG_sessionEstablished: false,
+    };
+
     let postAuthError: string | null = null;
     if (initData) {
+      diag.stageD_sentToWorker = true;
       try {
-        const authRes = await apiFetch<{ token: string }>('/api/auth/telegram', {
+        const authRes = await apiFetch<{
+          token: string;
+          diagnostics?: {
+            receivedInitData?: boolean;
+            signatureVerified?: boolean;
+            sessionCreated?: boolean;
+          };
+        }>('/api/auth/telegram', {
           method: 'POST',
           body: JSON.stringify({ initData }),
         });
+        diag.stageE_workerReceivedInitData = authRes.diagnostics?.receivedInitData ?? true;
+        diag.stageF_signatureVerified = authRes.diagnostics?.signatureVerified ?? true;
         if (authRes.token) setUserToken(authRes.token);
       } catch (err) {
         clearCachedTelegramInitData();
         setUserToken(null);
+        diag.stageE_workerReceivedInitData = true;
+        diag.stageF_signatureVerified = false;
         postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
       }
     }
 
     const authenticated = await refreshSession();
+    diag.stageG_sessionEstablished = authenticated;
+    setAuthDiagnostics(diag);
+
+    console.info('[SOFUMER Auth Diagnostics]', {
+      stageA_launchContext: diag.stageA_launchContext,
+      stageB_webAppDetected: diag.stageB_webAppDetected,
+      platform: diag.platform,
+      stageC_initDataPresent: diag.stageC_initDataPresent,
+      initDataSource: diag.initDataSource,
+      initDataLength: diag.initDataLength,
+      stageD_sentToWorker: diag.stageD_sentToWorker,
+      stageE_workerReceivedInitData: diag.stageE_workerReceivedInitData,
+      stageF_signatureVerified: diag.stageF_signatureVerified,
+      stageG_sessionEstablished: diag.stageG_sessionEstablished,
+    });
+
     if (!authenticated) {
       if (postAuthError) {
         setAuthError(postAuthError);
@@ -263,15 +345,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAuthError(`Authentication service check failed: ${cfgErrorMsg}`);
       } else if (cfgOk && (!tgConfigured || !jwtCfgOk)) {
         setAuthError(
-          'SOFUMER server secrets (TELEGRAM_BOT_TOKEN or JWT_SECRET) are missing on Cloudflare Worker sofumer-app. Restore them in Cloudflare Dashboard → Variables and Secrets and ensure deploys use --keep-vars.'
+          'SOFUMER server secrets (TELEGRAM_BOT_TOKEN or JWT_SECRET) are missing on Cloudflare Worker sofumer-app.'
         );
-      } else {
-        const tgStatus = getTelegramClientStatus();
-        if (tgStatus.hasTelegramWebApp && !initData) {
-          setAuthError(
-            'Telegram opened SOFUMER without signed Mini App credentials (initData is empty). Launch SOFUMER from the bot Menu Button, Web App button, or t.me/<bot>/<app> instead of a plain chat link.'
-          );
-        }
+      } else if (diag.stageD_sentToWorker && diag.stageF_signatureVerified) {
+        setAuthError(
+          'Telegram signature verified, but your session check (/api/auth/me) failed. Tap Retry Verification or check JWT_SECRET configuration.'
+        );
+      } else if (tgStatus.hasTelegramWebApp && !initData) {
+        setAuthError(
+          `Telegram WebApp loaded (platform: ${diag.platform}), but initData is empty. This happens when SOFUMER is opened from a regular URL link instead of the bot's Menu Button or /start Web App button.`
+        );
       }
     }
     setAuthLoading(false);
@@ -331,8 +414,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         shop,
         authLoading,
         authError,
+        authDiagnostics,
         botName,
         botUsername,
+        launchUrl,
         telegramConfigured,
         jwtConfigured,
         configLoaded,

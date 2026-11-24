@@ -1,5 +1,6 @@
-import { Bot, Compass, ExternalLink, Home, Lock, MessageSquare, PlusCircle, RefreshCw, ShieldCheck, User as UserIcon } from 'lucide-react';
+import { Bot, CheckCircle2, Compass, ExternalLink, Home, Lock, MessageSquare, PlusCircle, RefreshCw, ShieldCheck, User as UserIcon, XCircle } from 'lucide-react';
 import { AppProvider, useApp } from './context/AppContext';
+import { closeTelegramMiniApp } from './lib/telegram';
 import { t } from './lib/i18n';
 import { AuthGateModal } from './components/AuthGateModal';
 import { HomePage } from './pages/HomePage';
@@ -19,12 +20,48 @@ import { AdminPage } from './pages/AdminPage';
 import type { NavTab } from './types';
 
 function TelegramOnlyGate() {
-  const { authError, botName, botUsername, telegramConfigured, jwtConfigured, configLoaded, retryTelegramAuth } = useApp();
+  const {
+    authError,
+    authDiagnostics,
+    botName,
+    botUsername,
+    launchUrl,
+    telegramConfigured,
+    jwtConfigured,
+    configLoaded,
+    retryTelegramAuth,
+  } = useApp();
   const missingServerSecrets = configLoaded && (!telegramConfigured || !jwtConfigured);
+  const insideTelegram = authDiagnostics.stageB_webAppDetected;
+  const inMiniAppSheet = insideTelegram && authDiagnostics.platform !== '' && authDiagnostics.platform !== 'unknown';
+  const miniAppLaunchHref = launchUrl || (botUsername ? `https://t.me/${botUsername}?startapp` : '');
+
+  const diagnosticSteps: Array<{ label: string; ok: boolean | null; detail?: string }> = [
+    {
+      label: 'Telegram WebApp SDK detected',
+      ok: authDiagnostics.stageB_webAppDetected,
+      detail: authDiagnostics.platform ? `platform: ${authDiagnostics.platform}` : undefined,
+    },
+    {
+      label: 'Signed Telegram initData present',
+      ok: authDiagnostics.stageC_initDataPresent,
+      detail: authDiagnostics.stageC_initDataPresent
+        ? `${authDiagnostics.initDataSource} (${authDiagnostics.initDataLength} chars)`
+        : 'empty',
+    },
+    {
+      label: 'Cloudflare Worker signature verified',
+      ok: authDiagnostics.stageF_signatureVerified,
+    },
+    {
+      label: 'Authenticated session active',
+      ok: authDiagnostics.stageG_sessionEstablished,
+    },
+  ];
 
   return (
     <div className="min-h-screen bg-[#070B14] text-slate-100 flex items-center justify-center p-4">
-      <div className="w-full max-w-md rounded-3xl bg-[#0E1525] border border-slate-800/90 p-7 shadow-2xl space-y-6">
+      <div className="w-full max-w-md rounded-3xl bg-[#0E1525] border border-slate-800/90 p-7 shadow-2xl space-y-5">
         <div className="flex items-center gap-3.5">
           <img
             src="/src/assets/images/sofumer_brand_mark_1795188643094.jpg"
@@ -43,7 +80,9 @@ function TelegramOnlyGate() {
             <span>Telegram Mini App Access Only</span>
           </div>
           <p className="text-xs text-slate-400 leading-relaxed">
-            SOFUMER runs exclusively inside Telegram. Standard browser access without verified Telegram Mini App authentication is disabled.
+            {insideTelegram
+              ? 'SOFUMER detected a Telegram WebView, but verified Mini App authentication could not complete.'
+              : 'SOFUMER runs exclusively inside Telegram. Standard browser access without verified Telegram Mini App authentication is disabled.'}
           </p>
           {authError && (
             <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-800/50 text-xs text-red-200 leading-relaxed">
@@ -52,24 +91,79 @@ function TelegramOnlyGate() {
           )}
         </div>
 
-        <div className="space-y-3">
-          {botUsername ? (
-            <a
-              href={`https://t.me/${botUsername}`}
-              target="_blank"
-              rel="noreferrer"
-              className="w-full h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
-            >
-              <span>Open {botName || 'SOFUMER'} (@{botUsername})</span>
-              <ExternalLink className="w-4 h-4" />
-            </a>
+        {/* Safe non-sensitive stage diagnostics */}
+        <div className="p-3.5 rounded-2xl bg-[#070B14]/70 border border-slate-800/80 space-y-2">
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+            Verification Checks
+          </p>
+          <div className="space-y-1.5">
+            {diagnosticSteps.map((step) => (
+              <div key={step.label} className="flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 text-slate-300 min-w-0">
+                  {step.ok === true ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  ) : step.ok === false ? (
+                    <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                  ) : (
+                    <ShieldCheck className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                  )}
+                  <span className="truncate">{step.label}</span>
+                </div>
+                {step.detail && (
+                  <span className="text-[11px] text-slate-400 font-mono-nums shrink-0">{step.detail}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-2.5">
+          {inMiniAppSheet ? (
+            <>
+              <div className="p-3 rounded-xl bg-[#131C31]/70 border border-slate-800 text-xs text-slate-300 leading-relaxed">
+                {botUsername
+                  ? `Return to @${botUsername} chat, send /start, and tap the "Launch SOFUMER Marketplace" Web App button or the bot Menu Button.`
+                  : 'Return to the official SOFUMER Telegram bot chat, send /start, and launch via the Web App button or Menu Button.'}
+              </div>
+              <button
+                type="button"
+                onClick={() => closeTelegramMiniApp()}
+                className="w-full h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+              >
+                <span>Return to @{botUsername || 'SOFUMER'} Chat</span>
+              </button>
+            </>
+          ) : miniAppLaunchHref ? (
+            <>
+              <a
+                href={miniAppLaunchHref}
+                target="_blank"
+                rel="noreferrer"
+                className="w-full h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+              >
+                <span>Launch {botName || 'SOFUMER'} Mini App (@{botUsername})</span>
+                <ExternalLink className="w-4 h-4" />
+              </a>
+              <p className="text-[11px] text-center text-slate-400">
+                Or open{' '}
+                <a
+                  href={`https://t.me/${botUsername}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-blue-400 hover:underline"
+                >
+                  @{botUsername}
+                </a>{' '}
+                in Telegram and send <span className="font-mono text-slate-300">/start</span>.
+              </p>
+            </>
           ) : (
             <div className="p-3.5 rounded-xl bg-[#131C31]/70 border border-slate-800 flex items-center gap-2.5 text-xs text-slate-300">
               <ShieldCheck className="w-4 h-4 text-blue-400 shrink-0" />
               <span>
                 {missingServerSecrets
-                  ? 'Bot link unavailable because TELEGRAM_BOT_TOKEN is not set on Worker sofumer-app.'
-                  : 'Launch this Mini App directly from the official SOFUMER Telegram bot.'}
+                  ? 'Bot launch link unavailable because TELEGRAM_BOT_TOKEN is not set on Worker sofumer-app.'
+                  : 'Launch this Mini App directly from the official SOFUMER Telegram bot Menu Button or /start command.'}
               </span>
             </div>
           )}

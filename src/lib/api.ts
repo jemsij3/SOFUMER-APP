@@ -1,14 +1,19 @@
 const USER_TOKEN_KEY = 'sofumer_session_token';
+let inMemoryToken: string | null = null;
 
 export function getUserToken(): string | null {
+  if (inMemoryToken) return inMemoryToken;
   try {
-    return sessionStorage.getItem(USER_TOKEN_KEY);
+    const stored = sessionStorage.getItem(USER_TOKEN_KEY);
+    if (stored) inMemoryToken = stored;
+    return stored;
   } catch {
-    return null;
+    return inMemoryToken;
   }
 }
 
 export function setUserToken(token: string | null) {
+  inMemoryToken = token || null;
   try {
     if (token) sessionStorage.setItem(USER_TOKEN_KEY, token);
     else sessionStorage.removeItem(USER_TOKEN_KEY);

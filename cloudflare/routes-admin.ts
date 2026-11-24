@@ -7,6 +7,8 @@ import {
   VALID_CF_MODELS,
   VALID_PERMISSION_KEYS,
   checkProhibitedKeywordsEdge,
+  ensureTelegramMenuButtonEdge,
+  getTelegramBotLaunchDiagnosticsEdge,
   hasEdgeAdminPermission,
   isAuditActionProtected,
   isTelegramIdAdmin,
@@ -17,6 +19,7 @@ import {
   parseJsonBody,
   recordEdgeAdminAudit,
   requireEdgeAdmin,
+  resolveSafeMiniAppUrlEdge,
   sanitizeText,
   slugify,
 } from './helpers.ts';
@@ -2206,6 +2209,32 @@ export async function handleAdminRoutes(
       true
     );
     return json({ deleted: true, deletedCount: 1, id: logId });
+  }
+
+  if (sub === '/telegram/diagnostics') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, 'settings.manage');
+    if ('error' in auth) return auth.error;
+    const diagnostics = await getTelegramBotLaunchDiagnosticsEdge(env, url.origin);
+    return json(diagnostics);
+  }
+
+  if (sub === '/telegram/configure-launch') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'settings.manage');
+    if ('error' in auth) return auth.error;
+    const body = await parseJsonBody<{ miniAppUrl?: string; menuText?: string }>(request);
+    if (!body.ok) return body.error;
+    const targetUrl =
+      (typeof body.data.miniAppUrl === 'string' && body.data.miniAppUrl.trim().startsWith('https://')
+        ? body.data.miniAppUrl.trim()
+        : '') || resolveSafeMiniAppUrlEdge(env, url.origin);
+    const result = await ensureTelegramMenuButtonEdge(env, targetUrl, true);
+    if (!result.ok) {
+      return json({ error: result.error || 'Failed to update Telegram chat Menu Button.' }, 502);
+    }
+    const diagnostics = await getTelegramBotLaunchDiagnosticsEdge(env, url.origin);
+    return json({ configured: true, targetUrl, diagnostics });
   }
 
   return json({ error: 'Admin API endpoint not found.' }, 404);

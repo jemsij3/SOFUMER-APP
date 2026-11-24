@@ -3239,6 +3239,9 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const validJson = await resValid.json();
     expect(validJson.authenticated).toBe(true);
     expect(typeof validJson.token).toBe('string');
+    expect(validJson.diagnostics?.receivedInitData).toBe(true);
+    expect(validJson.diagnostics?.signatureVerified).toBe(true);
+    expect(validJson.diagnostics?.sessionCreated).toBe(true);
 
     // 2. Android Telegram WebApp hash (#tgWebAppData=...&tgWebAppPlatform=android) extraction roundtrip matches exact initData
     const androidHash = `#tgWebAppData=${encodeURIComponent(officialInitData)}&tgWebAppVersion=8.0&tgWebAppPlatform=android`;
@@ -3254,7 +3257,7 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const androidJson = await resAndroid.json();
     expect(androidJson.authenticated).toBe(true);
 
-    // 3. Refreshing Mini App / existing session check via Bearer token
+    // 3. Refreshing Mini App / existing session check via Bearer token & protected marketplace access
     const meRes = await callAuth('/api/auth/me', {
       headers: { Authorization: `Bearer ${androidJson.token}` },
     });
@@ -3262,6 +3265,11 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const meJson = await meRes.json();
     expect(meJson.authenticated).toBe(true);
     expect(meJson.user.telegram_id).toBe('880101');
+
+    const homeRes = await callAuth('/api/marketplace/home', {
+      headers: { Authorization: `Bearer ${androidJson.token}` },
+    });
+    expect(homeRes.status).toBe(200);
 
     // 4. Tampered initData rejected with 401 and never exposes bot token
     const tamperedParams = new URLSearchParams(officialInitData);

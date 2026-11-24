@@ -1,6 +1,7 @@
 interface TelegramWebApp {
   initData: string;
   platform?: string;
+  version?: string;
   initDataUnsafe?: {
     user?: {
       id: number;
@@ -12,6 +13,7 @@ interface TelegramWebApp {
   };
   ready: () => void;
   expand: () => void;
+  close?: () => void;
   setHeaderColor?: (color: string) => void;
   setBackgroundColor?: (color: string) => void;
   BackButton?: {
@@ -37,6 +39,14 @@ declare global {
 
 const TG_INIT_DATA_CACHE_KEY = 'sofumer_tg_init_data';
 
+export type TelegramInitDataSource =
+  | 'Telegram.WebApp.initData'
+  | 'url_hash'
+  | 'url_search'
+  | 'telegram_session_params'
+  | 'cached_session'
+  | 'none';
+
 export function getTelegramWebApp(): TelegramWebApp | null {
   if (typeof window === 'undefined') return null;
   return window.Telegram?.WebApp || null;
@@ -55,10 +65,24 @@ export function initTelegramMiniApp() {
   }
 }
 
-function readHashOrQueryInitData(): string {
+export function closeTelegramMiniApp(): boolean {
+  const tg = getTelegramWebApp();
+  if (!tg || typeof tg.close !== 'function') return false;
+  try {
+    tg.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readHashInitData(): string {
   if (typeof window === 'undefined') return '';
   try {
-    const rawHash = (window.location.hash || '').replace(/^#/, '');
+    let rawHash = (window.location.hash || '').replace(/^#/, '');
+    if (rawHash.includes('?') && !rawHash.startsWith('tgWebAppData=')) {
+      rawHash = rawHash.slice(rawHash.indexOf('?') + 1);
+    }
     if (rawHash) {
       const hashParams = new URLSearchParams(rawHash);
       const fromHash = hashParams.get('tgWebAppData') || '';
@@ -69,6 +93,11 @@ function readHashOrQueryInitData(): string {
   } catch {
     // Ignore malformed hash
   }
+  return '';
+}
+
+function readSearchInitData(): string {
+  if (typeof window === 'undefined') return '';
   try {
     const searchParams = new URLSearchParams(window.location.search || '');
     const fromSearch = searchParams.get('tgWebAppData') || '';
@@ -106,59 +135,96 @@ export function clearCachedTelegramInitData(): void {
   }
 }
 
-export function getTelegramInitData(): string {
+export function getTelegramInitDataWithSource(): {
+  initData: string;
+  source: TelegramInitDataSource;
+} {
   const tg = getTelegramWebApp();
-  const sdkInitData = typeof tg?.initData === 'string' && tg.initData.length > 0 ? tg.initData : '';
-  const urlInitData = readHashOrQueryInitData();
-  const tgParamsInitData = readTelegramSessionInitParams();
-  const resolved = sdkInitData || urlInitData || tgParamsInitData;
-
-  if (resolved) {
+  if (typeof tg?.initData === 'string' && tg.initData.length > 0) {
     try {
-      sessionStorage.setItem(TG_INIT_DATA_CACHE_KEY, resolved);
+      sessionStorage.setItem(TG_INIT_DATA_CACHE_KEY, tg.initData);
     } catch {
       // Ignore storage errors
     }
-    return resolved;
+    return { initData: tg.initData, source: 'Telegram.WebApp.initData' };
+  }
+
+  const fromHash = readHashInitData();
+  if (fromHash) {
+    try {
+      sessionStorage.setItem(TG_INIT_DATA_CACHE_KEY, fromHash);
+    } catch {
+      // Ignore storage errors
+    }
+    return { initData: fromHash, source: 'url_hash' };
+  }
+
+  const fromSearch = readSearchInitData();
+  if (fromSearch) {
+    try {
+      sessionStorage.setItem(TG_INIT_DATA_CACHE_KEY, fromSearch);
+    } catch {
+      // Ignore storage errors
+    }
+    return { initData: fromSearch, source: 'url_search' };
+  }
+
+  const fromTgParams = readTelegramSessionInitParams();
+  if (fromTgParams) {
+    try {
+      sessionStorage.setItem(TG_INIT_DATA_CACHE_KEY, fromTgParams);
+    } catch {
+      // Ignore storage errors
+    }
+    return { initData: fromTgParams, source: 'telegram_session_params' };
   }
 
   try {
     const cached = sessionStorage.getItem(TG_INIT_DATA_CACHE_KEY) || '';
     if (cached && cached.includes('hash=')) {
-      return cached;
+      return { initData: cached, source: 'cached_session' };
     }
   } catch {
     // Ignore storage errors
   }
-  return '';
+
+  return { initData: '', source: 'none' };
 }
 
-export async function waitForTelegramInitData(maxWaitMs = 700): Promise<string> {
-  const immediate = getTelegramInitData();
-  if (immediate) return immediate;
-  if (typeof window === 'undefined' || maxWaitMs <= 0) return '';
+export function getTelegramInitData(): string {
+  return getTelegramInitDataWithSource().initData;
+}
 
-  return await new Promise<string>((resolve) => {
+export async function waitForTelegramInitData(
+  maxWaitMs = 700
+): Promise<{ initData: string; source: TelegramInitDataSource }> {
+  const immediate = getTelegramInitDataWithSource();
+  if (immediate.initData) return immediate;
+  if (typeof window === 'undefined' || maxWaitMs <= 0) {
+    return { initData: '', source: 'none' };
+  }
+
+  return await new Promise<{ initData: string; source: TelegramInitDataSource }>((resolve) => {
     let settled = false;
     const deadline = Date.now() + maxWaitMs;
 
-    const finish = (value: string) => {
+    const finish = (result: { initData: string; source: TelegramInitDataSource }) => {
       if (settled) return;
       settled = true;
       window.removeEventListener('hashchange', onHashChange);
       clearInterval(timer);
-      resolve(value);
+      resolve(result);
     };
 
     const check = () => {
       initTelegramMiniApp();
-      const found = getTelegramInitData();
-      if (found) {
+      const found = getTelegramInitDataWithSource();
+      if (found.initData) {
         finish(found);
         return;
       }
       if (Date.now() >= deadline) {
-        finish('');
+        finish({ initData: '', source: 'none' });
       }
     };
 
@@ -171,20 +237,27 @@ export async function waitForTelegramInitData(maxWaitMs = 700): Promise<string> 
 export interface TelegramClientStatus {
   hasTelegramWebApp: boolean;
   platform: string;
+  version: string;
   hasUnsafeUser: boolean;
   hasHashTgData: boolean;
   hasInitData: boolean;
+  initDataSource: TelegramInitDataSource;
+  initDataLength: number;
 }
 
 export function getTelegramClientStatus(): TelegramClientStatus {
   const tg = getTelegramWebApp();
   const rawHash = typeof window !== 'undefined' ? window.location.hash || '' : '';
+  const resolved = getTelegramInitDataWithSource();
   return {
     hasTelegramWebApp: Boolean(tg),
     platform: typeof tg?.platform === 'string' ? tg.platform : '',
+    version: typeof tg?.version === 'string' ? tg.version : '',
     hasUnsafeUser: Boolean(tg?.initDataUnsafe?.user?.id),
     hasHashTgData: rawHash.includes('tgWebAppData='),
-    hasInitData: Boolean(getTelegramInitData()),
+    hasInitData: Boolean(resolved.initData),
+    initDataSource: resolved.source,
+    initDataLength: resolved.initData.length,
   };
 }
 

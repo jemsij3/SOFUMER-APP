@@ -106,6 +106,7 @@ authRouter.get('/config', async (req, res) => {
     botName: botInfo.botName,
     botUsername: botInfo.botUsername,
     miniAppUrl: cfg.miniAppUrl || origin,
+    launchUrl: botInfo.botUsername ? `https://t.me/${botInfo.botUsername}?startapp` : null,
     telegramConfigured: Boolean(cfg.botToken),
     jwtConfigured: Boolean(getJwtSecret()),
     telegramOnly: true,
@@ -119,11 +120,13 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
   if (!botToken) {
     return res.status(503).json({
       error: 'TELEGRAM_BOT_TOKEN is not configured on the server.',
+      diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
     });
   }
   if (!getJwtSecret()) {
     return res.status(503).json({
       error: 'JWT_SECRET is not configured on the server.',
+      diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
     });
   }
 
@@ -143,11 +146,28 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ authenticated: true, token: jwtToken, expiresAt, isAdmin });
+    return res.json({
+      authenticated: true,
+      token: jwtToken,
+      expiresAt,
+      isAdmin,
+      diagnostics: {
+        receivedInitData: initData.length > 0,
+        initDataLength: initData.length,
+        signatureVerified: true,
+        sessionCreated: true,
+      },
+    });
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode || 401;
     return res.status(status).json({
       error: err instanceof Error ? err.message : 'Telegram authentication failed',
+      diagnostics: {
+        receivedInitData: initData.length > 0,
+        initDataLength: initData.length,
+        signatureVerified: false,
+        sessionCreated: false,
+      },
     });
   }
 });

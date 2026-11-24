@@ -10,6 +10,7 @@ import {
   DEFAULT_CF_AI_MODEL,
   VALID_CF_MODELS,
   checkEdgeRateLimit,
+  ensureTelegramMenuButtonEdge,
   fulfillStarsPreCheckoutEdge,
   fulfillStarsSuccessfulPaymentEdge,
   getTelegramBotInfoEdge,
@@ -22,6 +23,7 @@ import {
   requireEdgeUser,
   resolveEdgeAdminContext,
   resolveEdgeUserSession,
+  resolveSafeMiniAppUrlEdge,
   sanitizeSafeUrl,
   sanitizeText,
   sendTelegramBotMessageEdge,
@@ -160,10 +162,11 @@ async function handleTelegramWebhook(
           .bind(updateId, chatId, cmd)
           .run();
 
-        if (!chatId || !env.TELEGRAM_BOT_TOKEN) return;
+        if (!chatId || !(env.TELEGRAM_BOT_TOKEN || '').trim()) return;
 
-        const miniAppUrl = env.MINI_APP_URL || url.origin;
+        const miniAppUrl = resolveSafeMiniAppUrlEdge(env, url.origin) || url.origin;
         if (cmd === '/start') {
+          await ensureTelegramMenuButtonEdge(env, miniAppUrl);
           await sendTelegramBotMessageEdge(
             env,
             chatId,
@@ -217,10 +220,12 @@ async function handleAuthRoutes(
   if (url.pathname === '/api/auth/config') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const botInfo = await getTelegramBotInfoEdge(env);
+    const miniAppUrl = resolveSafeMiniAppUrlEdge(env, url.origin) || url.origin;
     return json({
       botName: botInfo.botName,
       botUsername: botInfo.botUsername,
-      miniAppUrl: env.MINI_APP_URL || url.origin,
+      miniAppUrl,
+      launchUrl: botInfo.botUsername ? `https://t.me/${botInfo.botUsername}?startapp` : null,
       telegramConfigured: Boolean((env.TELEGRAM_BOT_TOKEN || '').trim()),
       jwtConfigured: Boolean((env.JWT_SECRET || '').trim()),
       telegramOnly: true,
@@ -235,14 +240,20 @@ async function handleAuthRoutes(
     const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
     if (!botToken) {
       return json(
-        { error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.' },
+        {
+          error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.',
+          diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
+        },
         503
       );
     }
     const jwtSecret = (env.JWT_SECRET || '').trim();
     if (!jwtSecret) {
       return json(
-        { error: 'JWT_SECRET is not configured on the Worker.' },
+        {
+          error: 'JWT_SECRET is not configured on the Worker.',
+          diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
+        },
         503
       );
     }
@@ -253,11 +264,30 @@ async function handleAuthRoutes(
     const parsed = await parseJsonBody<{ initData?: string }>(request);
     if (!parsed.ok) return parsed.error;
 
+    const rawInitData = typeof parsed.data.initData === 'string' ? parsed.data.initData : '';
+    const receivedInitData = rawInitData.length > 0;
+    const paramKeys: string[] = [];
+    if (receivedInitData) {
+      try {
+        new URLSearchParams(rawInitData).forEach((_v, k) => {
+          paramKeys.push(k === 'hash' ? 'hash(present)' : k);
+        });
+      } catch {
+        // Ignore parse failure here; verifyTelegramInitDataEdge reports exact error
+      }
+    }
+    console.info(
+      '[SOFUMER Worker Auth]',
+      JSON.stringify({
+        stage: 'E_received',
+        receivedInitData,
+        initDataLength: rawInitData.length,
+        keys: paramKeys,
+      })
+    );
+
     try {
-      const verified = await verifyTelegramInitDataEdge(
-        typeof parsed.data.initData === 'string' ? parsed.data.initData : '',
-        botToken
-      );
+      const verified = await verifyTelegramInitDataEdge(rawInitData, botToken);
       const tgUser = verified.user;
       const tgId = String(tgUser.id);
       const adminCtx = await resolveEdgeAdminContext(env, tgId);
@@ -347,8 +377,30 @@ async function handleAuthRoutes(
         7 * 86400
       );
 
+      console.info(
+        '[SOFUMER Worker Auth]',
+        JSON.stringify({
+          stage: 'G_session_created',
+          receivedInitData: true,
+          signatureVerified: true,
+          sessionCreated: true,
+          isAdmin,
+        })
+      );
+
       return json(
-        { authenticated: true, token: jwtToken, expiresAt, isAdmin },
+        {
+          authenticated: true,
+          token: jwtToken,
+          expiresAt,
+          isAdmin,
+          diagnostics: {
+            receivedInitData: true,
+            initDataLength: rawInitData.length,
+            signatureVerified: true,
+            sessionCreated: true,
+          },
+        },
         200,
         {
           'Set-Cookie': `sofumer_session=${jwtToken}; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=604800`,
@@ -356,18 +408,46 @@ async function handleAuthRoutes(
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Telegram authentication failed';
+      console.warn(
+        '[SOFUMER Worker Auth]',
+        JSON.stringify({
+          stage: 'F_verification_failed',
+          receivedInitData,
+          initDataLength: rawInitData.length,
+          signatureVerified: false,
+          reason: msg,
+        })
+      );
       if (msg === 'Telegram initData signature mismatch') {
         const botInfo = await getTelegramBotInfoEdge(env);
         if (botInfo.botUsername) {
           return json(
             {
               error: `Telegram initData signature mismatch. Server bot token belongs to @${botInfo.botUsername} — verify the Mini App was launched from @${botInfo.botUsername}.`,
+              diagnostics: {
+                receivedInitData,
+                initDataLength: rawInitData.length,
+                signatureVerified: false,
+                sessionCreated: false,
+                botUsername: botInfo.botUsername,
+              },
             },
             401
           );
         }
       }
-      return json({ error: msg }, 401);
+      return json(
+        {
+          error: msg,
+          diagnostics: {
+            receivedInitData,
+            initDataLength: rawInitData.length,
+            signatureVerified: false,
+            sessionCreated: false,
+          },
+        },
+        401
+      );
     }
   }
 
