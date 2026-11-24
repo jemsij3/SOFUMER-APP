@@ -844,6 +844,29 @@ async function runTests() {
     assert.equal(legacySevenRes.status, 400);
   });
 
+  await test('Telegram official key-sort (chat vs chat_instance), trimmed botToken, wrong token & tamper rejection', async () => {
+    const cleanToken = '555666777:AA_LOCAL_OFFICIAL_SPEC_TOKEN';
+    const rawParams = new URLSearchParams();
+    rawParams.set('auth_date', String(Math.floor(Date.now() / 1000)));
+    rawParams.set('chat', JSON.stringify({ id: -100555, type: 'supergroup' }));
+    rawParams.set('chat_instance', '-444555666');
+    rawParams.set('signature', 'sig_bot_api_8');
+    rawParams.set('user', JSON.stringify({ id: 444333, first_name: 'Amina + Buyer' }));
+
+    const entries: Array<[string, string]> = [];
+    rawParams.forEach((v, k) => entries.push([k, v]));
+    entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const checkStr = entries.map(([k, v]) => `${k}=${v}`).join('\n');
+    const secret = crypto.createHmac('sha256', 'WebAppData').update(cleanToken).digest();
+    rawParams.set('hash', crypto.createHmac('sha256', secret).update(checkStr).digest('hex'));
+
+    const verified = verifyTelegramInitData(rawParams.toString(), `  ${cleanToken}\n`);
+    assert.equal(verified.user.id, 444333);
+    assert.equal(verified.user.first_name, 'Amina + Buyer');
+
+    assert.throws(() => verifyTelegramInitData(rawParams.toString(), '555666777:WRONG_TOKEN'));
+  });
+
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);
 }

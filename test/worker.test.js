@@ -3153,5 +3153,161 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     expect(Number(shopAfterRevDel.review_count)).toBe(0);
     expect(Number(shopAfterRevDel.rating_avg)).toBe(0);
   });
+
+  it('26. Telegram Mini App initData verification handles official key sorting, trimmed bot tokens, Android hash roundtrips, expiry, tampering, and refreshes', async () => {
+    const cleanBotToken = '987654321:AAH_OFFICIAL_BOT_TOKEN_TEST';
+    const tokenWithWhitespace = `  ${cleanBotToken}\n `;
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: tokenWithWhitespace,
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callAuth = async (path, init = {}, customEnv = testEnv) => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init),
+        customEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return res;
+    };
+
+    // Helper using official Telegram spec (ASCII key sort, NOT localeCompare) + optional extra fields (chat, chat_instance, signature)
+    async function signOfficialTelegramPayload(fields, signingToken = cleanBotToken) {
+      const enc = new TextEncoder();
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(fields)) {
+        params.set(k, v);
+      }
+      const entries = [];
+      params.forEach((v, k) => entries.push([k, v]));
+      entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join('\n');
+
+      const webAppKey = await crypto.subtle.importKey(
+        'raw',
+        enc.encode('WebAppData'),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+      const secretBuf = await crypto.subtle.sign('HMAC', webAppKey, enc.encode(signingToken));
+      const dataKey = await crypto.subtle.importKey(
+        'raw',
+        secretBuf,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+      const sigBuf = await crypto.subtle.sign('HMAC', dataKey, enc.encode(dataCheckString));
+      const hashHex = Array.from(new Uint8Array(sigBuf))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      params.set('hash', hashHex);
+      return params.toString();
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const officialInitData = await signOfficialTelegramPayload({
+      query_id: 'AAHdF6IQAAAAAN0XohDhrOrc',
+      user: JSON.stringify({
+        id: 880101,
+        first_name: 'Amina & Co',
+        last_name: 'Saleh',
+        username: 'amina_tg',
+        language_code: 'en',
+        allows_write_to_pm: true,
+      }),
+      chat_type: 'group',
+      chat_instance: '-81928371293',
+      chat: JSON.stringify({ id: -100123456, type: 'group', title: 'SOFUMER Group' }),
+      signature: 'ed25519_mock_sig_payload_base64url',
+      auth_date: String(nowSec),
+    });
+
+    // 1. Valid official payload (with chat + chat_instance + signature) & trimmed TELEGRAM_BOT_TOKEN succeeds
+    const resValid = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: officialInitData }),
+    });
+    expect(resValid.status).toBe(200);
+    const validJson = await resValid.json();
+    expect(validJson.authenticated).toBe(true);
+    expect(typeof validJson.token).toBe('string');
+
+    // 2. Android Telegram WebApp hash (#tgWebAppData=...&tgWebAppPlatform=android) extraction roundtrip matches exact initData
+    const androidHash = `#tgWebAppData=${encodeURIComponent(officialInitData)}&tgWebAppVersion=8.0&tgWebAppPlatform=android`;
+    const extractedFromAndroidHash = new URLSearchParams(androidHash.slice(1)).get('tgWebAppData');
+    expect(extractedFromAndroidHash).toBe(officialInitData);
+
+    const resAndroid = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: extractedFromAndroidHash }),
+    });
+    expect(resAndroid.status).toBe(200);
+    const androidJson = await resAndroid.json();
+    expect(androidJson.authenticated).toBe(true);
+
+    // 3. Refreshing Mini App / existing session check via Bearer token
+    const meRes = await callAuth('/api/auth/me', {
+      headers: { Authorization: `Bearer ${androidJson.token}` },
+    });
+    expect(meRes.status).toBe(200);
+    const meJson = await meRes.json();
+    expect(meJson.authenticated).toBe(true);
+    expect(meJson.user.telegram_id).toBe('880101');
+
+    // 4. Tampered initData rejected with 401 and never exposes bot token
+    const tamperedParams = new URLSearchParams(officialInitData);
+    tamperedParams.set('user', JSON.stringify({ id: 999001, first_name: 'Spoofed' }));
+    const resTampered = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: tamperedParams.toString() }),
+    });
+    expect(resTampered.status).toBe(401);
+    const tamperedBody = await resTampered.json();
+    expect(tamperedBody.error).toContain('Telegram initData signature mismatch');
+    expect(tamperedBody.error).not.toContain(cleanBotToken);
+
+    // 5. Wrong bot token rejected with 401 and never exposes token
+    const wrongBotInitData = await signOfficialTelegramPayload(
+      {
+        user: JSON.stringify({ id: 880102, first_name: 'OtherBotUser' }),
+        auth_date: String(nowSec),
+      },
+      '111111111:WRONG_BOT_TOKEN'
+    );
+    const resWrongBot = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: wrongBotInitData }),
+    });
+    expect(resWrongBot.status).toBe(401);
+    const wrongBotJson = await resWrongBot.json();
+    expect(wrongBotJson.error).toContain('Telegram initData signature mismatch');
+    expect(wrongBotJson.error).not.toContain(cleanBotToken);
+
+    // 6. Expired auth_date (> 24h) rejected with 401 even if validly signed
+    const expiredInitData = await signOfficialTelegramPayload({
+      user: JSON.stringify({ id: 880103, first_name: 'ExpiredUser' }),
+      auth_date: String(nowSec - 90000),
+    });
+    const resExpired = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: expiredInitData }),
+    });
+    expect(resExpired.status).toBe(401);
+    const expiredJson = await resExpired.json();
+    expect(expiredJson.error).toContain('expired');
+  });
 });
+
 

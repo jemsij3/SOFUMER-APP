@@ -108,9 +108,9 @@ export function clearCachedTelegramInitData(): void {
 
 export function getTelegramInitData(): string {
   const tg = getTelegramWebApp();
-  const sdkInitData = typeof tg?.initData === 'string' ? tg.initData.trim() : '';
-  const urlInitData = readHashOrQueryInitData().trim();
-  const tgParamsInitData = readTelegramSessionInitParams().trim();
+  const sdkInitData = typeof tg?.initData === 'string' && tg.initData.length > 0 ? tg.initData : '';
+  const urlInitData = readHashOrQueryInitData();
+  const tgParamsInitData = readTelegramSessionInitParams();
   const resolved = sdkInitData || urlInitData || tgParamsInitData;
 
   if (resolved) {

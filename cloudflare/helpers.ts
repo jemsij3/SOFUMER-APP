@@ -580,7 +580,8 @@ export async function verifyTelegramInitDataEdge(
   };
   authDate: number;
 }> {
-  if (!initDataRaw || !botToken) {
+  const cleanBotToken = typeof botToken === 'string' ? botToken.trim() : '';
+  if (typeof initDataRaw !== 'string' || !initDataRaw || !cleanBotToken) {
     throw new Error('Missing Telegram initData or bot token');
   }
 
@@ -590,14 +591,15 @@ export async function verifyTelegramInitDataEdge(
     throw new Error('Invalid Telegram signature format');
   }
 
-  const pairs: string[] = [];
+  const entries: Array<[string, string]> = [];
   params.forEach((v, k) => {
-    if (k !== 'hash') pairs.push(`${k}=${v}`);
+    if (k !== 'hash') entries.push([k, v]);
   });
-  pairs.sort((a, b) => a.localeCompare(b));
-  const dataCheckString = pairs.join('\n');
+  // Telegram official spec: sort keys alphabetically in byte/UTF-16 code-unit order (never localeCompare)
+  entries.sort(([keyA], [keyB]) => (keyA < keyB ? -1 : keyA > keyB ? 1 : 0));
+  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join('\n');
 
-  const secretKey = await hmacSha256('WebAppData', botToken);
+  const secretKey = await hmacSha256('WebAppData', cleanBotToken);
   const expected = toHex(await hmacSha256(secretKey, dataCheckString));
   if (!timingSafeEqualStr(expected, hash.toLowerCase())) {
     throw new Error('Telegram initData signature mismatch');
@@ -605,11 +607,21 @@ export async function verifyTelegramInitDataEdge(
 
   const authDate = Number(params.get('auth_date') || '0');
   const nowSec = Math.floor(Date.now() / 1000);
-  if (!authDate || nowSec - authDate > maxAgeSeconds || authDate - nowSec > 300) {
+  if (
+    !Number.isFinite(authDate) ||
+    authDate <= 0 ||
+    nowSec - authDate > maxAgeSeconds ||
+    authDate - nowSec > 300
+  ) {
     throw new Error('Telegram authentication timestamp expired');
   }
 
-  const user = JSON.parse(params.get('user') || '{}') as {
+  const userRaw = params.get('user');
+  if (!userRaw) {
+    throw new Error('Telegram user payload missing');
+  }
+
+  let user: {
     id?: number;
     first_name?: string;
     last_name?: string;
@@ -617,7 +629,13 @@ export async function verifyTelegramInitDataEdge(
     language_code?: string;
     photo_url?: string;
   };
-  if (typeof user.id !== 'number') {
+  try {
+    user = JSON.parse(userRaw) as typeof user;
+  } catch {
+    throw new Error('Invalid Telegram user identity');
+  }
+
+  if (!user || typeof user.id !== 'number') {
     throw new Error('Invalid Telegram user identity');
   }
 
@@ -703,11 +721,12 @@ export async function resolveEdgeUserSession(
   request: Request,
   env: Env
 ): Promise<EdgeAuthUser | null> {
-  if (!env.DB || !env.JWT_SECRET) return null;
+  const jwtSecret = (env.JWT_SECRET || '').trim();
+  if (!env.DB || !jwtSecret) return null;
   const token = extractBearerOrCookie(request, 'sofumer_session');
   if (!token) return null;
 
-  const claims = await verifyJwtEdge(token, env.JWT_SECRET);
+  const claims = await verifyJwtEdge(token, jwtSecret);
   if (!claims) return null;
 
   const row = await env.DB.prepare(

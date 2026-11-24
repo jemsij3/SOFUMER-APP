@@ -194,7 +194,8 @@ export function verifyTelegramInitData(
   botToken: string,
   maxAgeSeconds = 86400
 ): VerifiedTelegramInitData {
-  if (!initDataRaw || !botToken) {
+  const cleanBotToken = typeof botToken === 'string' ? botToken.trim() : '';
+  if (typeof initDataRaw !== 'string' || !initDataRaw || !cleanBotToken) {
     throw new Error('Missing Telegram initData or bot token');
   }
 
@@ -204,18 +205,18 @@ export function verifyTelegramInitData(
     throw new Error('Invalid Telegram signature format');
   }
 
-  const pairs: string[] = [];
+  const entries: Array<[string, string]> = [];
   params.forEach((value, key) => {
     if (key !== 'hash') {
-      pairs.push(`${key}=${value}`);
+      entries.push([key, value]);
     }
   });
-  pairs.sort((a, b) => a.localeCompare(b));
-  const dataCheckString = pairs.join('\n');
+  entries.sort(([keyA], [keyB]) => (keyA < keyB ? -1 : keyA > keyB ? 1 : 0));
+  const dataCheckString = entries.map(([key, value]) => `${key}=${value}`).join('\n');
 
   const secretKey = crypto
     .createHmac('sha256', 'WebAppData')
-    .update(botToken)
+    .update(cleanBotToken)
     .digest();
 
   const expectedHash = crypto
@@ -231,7 +232,12 @@ export function verifyTelegramInitData(
 
   const authDate = Number(params.get('auth_date') || '0');
   const nowSec = Math.floor(Date.now() / 1000);
-  if (!authDate || nowSec - authDate > maxAgeSeconds || authDate - nowSec > 300) {
+  if (
+    !Number.isFinite(authDate) ||
+    authDate <= 0 ||
+    nowSec - authDate > maxAgeSeconds ||
+    authDate - nowSec > 300
+  ) {
     throw new Error('Telegram authentication timestamp expired');
   }
 
@@ -240,7 +246,12 @@ export function verifyTelegramInitData(
     throw new Error('Telegram user payload missing');
   }
 
-  const user = JSON.parse(userJson) as TelegramInitUser;
+  let user: TelegramInitUser;
+  try {
+    user = JSON.parse(userJson) as TelegramInitUser;
+  } catch {
+    throw new Error('Invalid Telegram user identity');
+  }
   if (!user || typeof user.id !== 'number') {
     throw new Error('Invalid Telegram user identity');
   }
@@ -259,20 +270,21 @@ export function buildSignedTelegramInitData(
   tgUser: TelegramInitUser,
   botToken: string
 ): string {
+  const cleanBotToken = typeof botToken === 'string' ? botToken.trim() : '';
   const authDate = Math.floor(Date.now() / 1000);
   const params = new URLSearchParams();
   params.set('auth_date', String(authDate));
   params.set('query_id', `tg_${crypto.randomBytes(6).toString('hex')}`);
   params.set('user', JSON.stringify(tgUser));
 
-  const pairs: string[] = [];
-  params.forEach((value, key) => pairs.push(`${key}=${value}`));
-  pairs.sort((a, b) => a.localeCompare(b));
-  const dataCheckString = pairs.join('\n');
+  const entries: Array<[string, string]> = [];
+  params.forEach((value, key) => entries.push([key, value]));
+  entries.sort(([keyA], [keyB]) => (keyA < keyB ? -1 : keyA > keyB ? 1 : 0));
+  const dataCheckString = entries.map(([key, value]) => `${key}=${value}`).join('\n');
 
   const secretKey = crypto
     .createHmac('sha256', 'WebAppData')
-    .update(botToken)
+    .update(cleanBotToken)
     .digest();
   const hash = crypto
     .createHmac('sha256', secretKey)

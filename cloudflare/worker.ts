@@ -221,8 +221,8 @@ async function handleAuthRoutes(
       botName: botInfo.botName,
       botUsername: botInfo.botUsername,
       miniAppUrl: env.MINI_APP_URL || url.origin,
-      telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
-      jwtConfigured: Boolean(env.JWT_SECRET),
+      telegramConfigured: Boolean((env.TELEGRAM_BOT_TOKEN || '').trim()),
+      jwtConfigured: Boolean((env.JWT_SECRET || '').trim()),
       telegramOnly: true,
     });
   }
@@ -232,13 +232,15 @@ async function handleAuthRoutes(
     const rateRes = await checkEdgeRateLimit(request, env, 'auth', 60, 60);
     if (rateRes) return rateRes;
 
-    if (!env.TELEGRAM_BOT_TOKEN) {
+    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+    if (!botToken) {
       return json(
         { error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.' },
         503
       );
     }
-    if (!env.JWT_SECRET) {
+    const jwtSecret = (env.JWT_SECRET || '').trim();
+    if (!jwtSecret) {
       return json(
         { error: 'JWT_SECRET is not configured on the Worker.' },
         503
@@ -254,7 +256,7 @@ async function handleAuthRoutes(
     try {
       const verified = await verifyTelegramInitDataEdge(
         typeof parsed.data.initData === 'string' ? parsed.data.initData : '',
-        env.TELEGRAM_BOT_TOKEN
+        botToken
       );
       const tgUser = verified.user;
       const tgId = String(tgUser.id);
@@ -322,7 +324,7 @@ async function handleAuthRoutes(
       }
 
       const sessionId = newId('sess');
-      const tokenHash = await hashSessionIdentifier(sessionId, env.JWT_SECRET);
+      const tokenHash = await hashSessionIdentifier(sessionId, jwtSecret);
       const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
 
       await env.DB.prepare(
@@ -341,7 +343,7 @@ async function handleAuthRoutes(
 
       const jwtToken = await signJwtEdge(
         { sub: userId, tid: tgId, sid: sessionId, adm: isAdmin },
-        env.JWT_SECRET,
+        jwtSecret,
         7 * 86400
       );
 
@@ -353,10 +355,19 @@ async function handleAuthRoutes(
         }
       );
     } catch (err) {
-      return json(
-        { error: err instanceof Error ? err.message : 'Telegram authentication failed' },
-        401
-      );
+      const msg = err instanceof Error ? err.message : 'Telegram authentication failed';
+      if (msg === 'Telegram initData signature mismatch') {
+        const botInfo = await getTelegramBotInfoEdge(env);
+        if (botInfo.botUsername) {
+          return json(
+            {
+              error: `Telegram initData signature mismatch. Server bot token belongs to @${botInfo.botUsername} — verify the Mini App was launched from @${botInfo.botUsername}.`,
+            },
+            401
+          );
+        }
+      }
+      return json({ error: msg }, 401);
     }
   }
 
