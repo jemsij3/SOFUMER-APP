@@ -19,7 +19,8 @@ import { AdminPage } from './pages/AdminPage';
 import type { NavTab } from './types';
 
 function TelegramOnlyGate() {
-  const { authError, botName, botUsername, retryTelegramAuth } = useApp();
+  const { authError, botName, botUsername, telegramConfigured, jwtConfigured, configLoaded, retryTelegramAuth } = useApp();
+  const missingServerSecrets = configLoaded && (!telegramConfigured || !jwtConfigured);
 
   return (
     <div className="min-h-screen bg-[#070B14] text-slate-100 flex items-center justify-center p-4">
@@ -45,7 +46,7 @@ function TelegramOnlyGate() {
             SOFUMER runs exclusively inside Telegram. Standard browser access without verified Telegram Mini App authentication is disabled.
           </p>
           {authError && (
-            <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-800/50 text-xs text-red-200">
+            <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-800/50 text-xs text-red-200 leading-relaxed">
               {authError}
             </div>
           )}
@@ -65,7 +66,11 @@ function TelegramOnlyGate() {
           ) : (
             <div className="p-3.5 rounded-xl bg-[#131C31]/70 border border-slate-800 flex items-center gap-2.5 text-xs text-slate-300">
               <ShieldCheck className="w-4 h-4 text-blue-400 shrink-0" />
-              <span>Launch this Mini App directly from the official SOFUMER Telegram bot.</span>
+              <span>
+                {missingServerSecrets
+                  ? 'Bot link unavailable because TELEGRAM_BOT_TOKEN is not set on Worker sofumer-app.'
+                  : 'Launch this Mini App directly from the official SOFUMER Telegram bot.'}
+              </span>
             </div>
           )}
 

@@ -520,7 +520,7 @@ export async function getTelegramBotInfoEdge(env: Env): Promise<TelegramBotPubli
   try {
     const resp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
       method: 'GET',
-      signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(3500) : undefined,
+      signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(5000) : undefined,
     });
     if (!resp.ok) {
       return { botName: null, botUsername: null };

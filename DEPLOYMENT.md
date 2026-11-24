@@ -62,13 +62,13 @@ SOFUMER requires its own dedicated Telegram Bot (never reuse credentials from an
 
 ## 5. Automatic Cloudflare D1 Provisioning, Workers AI & Deployment
 
-`wrangler.jsonc` targets production Worker `sofumer-app`, sets `"keep_vars": true` to protect dashboard-managed Environment Variables, and binds `sofumer-db` (`DB`), Workers AI (`AI`), and static assets (`ASSETS`). Migrations `0001`–`0005` define all tables, indexes, and system seeds.
+`wrangler.jsonc` targets production Worker `sofumer-app`, sets `"keep_vars": true` to protect dashboard-managed Environment Variables, and binds `sofumer-db` (`DB`), Workers AI (`AI`), and static assets (`ASSETS`). Migrations `0001`–`0008` define all tables, indexes, and system seeds.
 
 1. **Deploy Worker**:
-   - **Via Cloudflare Workers Builds / Cloudflare AI** (GitHub integration for Worker `sofumer-app`):
+   - **Via Cloudflare Workers Builds** (Dashboard Git integration for Worker `sofumer-app`):
      - **Build command**: `npm run build`
-     - **Deploy command**: `npx wrangler deploy --x-provision --keep-vars`
-     - On the first `/api/*` request, the Worker's built-in `ensureD1Schema(env.DB)` bootstrapper automatically creates any missing tables, indexes, and system configuration seeds if the database is empty.
+     - **Deploy command**: `npx wrangler deploy --x-provision --keep-vars` (IMPORTANT: omitting `--keep-vars` causes Cloudflare Workers Builds to wipe dashboard Secrets/Vars such as `TELEGRAM_BOT_TOKEN` and `JWT_SECRET` on deploy)
+     - On the first `/api/*` request, the Worker's built-in `ensureD1Schema(env.DB)` bootstrapper automatically creates any missing tables, columns, indexes, and system configuration seeds.
    - **Via CLI**:
      ```bash
      npm run build

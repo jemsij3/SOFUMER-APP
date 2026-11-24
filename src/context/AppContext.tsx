@@ -1,6 +1,13 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { apiFetch, setUserToken } from '../lib/api';
-import { getTelegramInitData, initTelegramMiniApp, syncTelegramBackButton, triggerHaptic } from '../lib/telegram';
+import {
+  clearCachedTelegramInitData,
+  getTelegramClientStatus,
+  initTelegramMiniApp,
+  syncTelegramBackButton,
+  triggerHaptic,
+  waitForTelegramInitData,
+} from '../lib/telegram';
 import type {
   Category,
   Country,
@@ -29,6 +36,8 @@ interface AppContextValue {
   botName: string;
   botUsername: string;
   telegramConfigured: boolean;
+  jwtConfigured: boolean;
+  configLoaded: boolean;
   categories: Category[];
   subcategories: Subcategory[];
   countries: Country[];
@@ -77,6 +86,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [botName, setBotName] = useState('');
   const [botUsername, setBotUsername] = useState('');
   const [telegramConfigured, setTelegramConfigured] = useState(false);
+  const [jwtConfigured, setJwtConfigured] = useState(true);
+  const [configLoaded, setConfigLoaded] = useState(false);
 
   const [categories, setCategories] = useState<Category[]>([]);
   const [subcategories, setSubcategories] = useState<Subcategory[]>([]);
@@ -201,20 +212,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const authenticateTelegram = useCallback(async () => {
     setAuthLoading(true);
     setAuthError(null);
+    initTelegramMiniApp();
+
+    let cfgOk = false;
+    let tgConfigured = false;
+    let jwtCfgOk = true;
+    let cfgErrorMsg: string | null = null;
+
     try {
       const cfg = await apiFetch<{
         botName: string | null;
         botUsername: string | null;
         telegramConfigured: boolean;
+        jwtConfigured?: boolean;
       }>('/api/auth/config');
+      cfgOk = true;
+      tgConfigured = Boolean(cfg.telegramConfigured);
+      jwtCfgOk = cfg.jwtConfigured !== false;
       setBotName(cfg.botName || '');
       setBotUsername(cfg.botUsername || '');
-      setTelegramConfigured(Boolean(cfg.telegramConfigured));
-    } catch {
-      // Ignore config lookup errors
+      setTelegramConfigured(tgConfigured);
+      setJwtConfigured(jwtCfgOk);
+      setConfigLoaded(true);
+    } catch (err) {
+      cfgErrorMsg = err instanceof Error ? err.message : 'Unable to reach SOFUMER authentication service.';
+      setConfigLoaded(false);
     }
 
-    const initData = getTelegramInitData();
+    const initData = await waitForTelegramInitData(700);
+    let postAuthError: string | null = null;
     if (initData) {
       try {
         const authRes = await apiFetch<{ token: string }>('/api/auth/telegram', {
@@ -223,12 +249,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
         if (authRes.token) setUserToken(authRes.token);
       } catch (err) {
+        clearCachedTelegramInitData();
         setUserToken(null);
-        setAuthError(err instanceof Error ? err.message : 'Telegram Mini App verification failed.');
+        postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
       }
     }
 
-    await refreshSession();
+    const authenticated = await refreshSession();
+    if (!authenticated) {
+      if (postAuthError) {
+        setAuthError(postAuthError);
+      } else if (!cfgOk && cfgErrorMsg) {
+        setAuthError(`Authentication service check failed: ${cfgErrorMsg}`);
+      } else if (cfgOk && (!tgConfigured || !jwtCfgOk)) {
+        setAuthError(
+          'SOFUMER server secrets (TELEGRAM_BOT_TOKEN or JWT_SECRET) are missing on Cloudflare Worker sofumer-app. Restore them in Cloudflare Dashboard → Variables and Secrets and ensure deploys use --keep-vars.'
+        );
+      } else {
+        const tgStatus = getTelegramClientStatus();
+        if (tgStatus.hasTelegramWebApp && !initData) {
+          setAuthError(
+            'Telegram opened SOFUMER without signed Mini App credentials (initData is empty). Launch SOFUMER from the bot Menu Button, Web App button, or t.me/<bot>/<app> instead of a plain chat link.'
+          );
+        }
+      }
+    }
     setAuthLoading(false);
   }, [refreshSession]);
 
@@ -289,6 +334,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         botName,
         botUsername,
         telegramConfigured,
+        jwtConfigured,
+        configLoaded,
         categories,
         subcategories,
         countries,

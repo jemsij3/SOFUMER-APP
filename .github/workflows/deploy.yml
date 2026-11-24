@@ -117,4 +117,23 @@ jobs:
               exit 1
             fi
           fi
-          npx --no-install wrangler d1 migrations apply "$DB_NAME" --remote -y
+          set +e
+          MIG_OUT=$(npx --no-install wrangler d1 migrations apply "$DB_NAME" --remote -y 2>&1)
+          MIG_STATUS=$?
+          set -e
+          echo "$MIG_OUT"
+          if [ $MIG_STATUS -ne 0 ]; then
+            if echo "$MIG_OUT" | grep -qi "duplicate column name"; then
+              echo "::warning::D1 migration hit an already-applied column (added by runtime ensureD1Schema). Verifying 0008 schema objects..."
+              if npx --no-install wrangler d1 execute "$DB_NAME" --remote -y --command "SELECT deleted_at FROM shops LIMIT 1; SELECT is_protected, is_archived FROM admin_audit_logs LIMIT 1; SELECT is_hidden FROM conversation_participants LIMIT 1; SELECT log_id FROM admin_audit_log_archives LIMIT 1;" >/dev/null 2>&1; then
+                echo "Verified 0008 schema columns and tables already exist on $DB_NAME. Recording migration 0008 and re-checking pending migrations..."
+                npx --no-install wrangler d1 execute "$DB_NAME" --remote -y --command "INSERT OR IGNORE INTO d1_migrations (name) VALUES ('0008_shop_management_and_audit_archive.sql');"
+                npx --no-install wrangler d1 migrations apply "$DB_NAME" --remote -y
+              else
+                echo "::error::D1 migration failed with duplicate column name and verification of 0008 schema objects failed."
+                exit 1
+              fi
+            else
+              exit $MIG_STATUS
+            fi
+          fi
