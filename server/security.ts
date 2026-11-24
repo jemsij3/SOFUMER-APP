@@ -344,11 +344,21 @@ declare global {
   }
 }
 
-export function extractBearerOrCookie(req: Request, cookieName: string): string | null {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token) return token;
+export interface SessionTokenCandidate {
+  token: string;
+  source: 'bearer' | 'cookie';
+}
+
+export function extractAllSessionTokens(
+  req: Request,
+  cookieName: string
+): SessionTokenCandidate[] {
+  const candidates: SessionTokenCandidate[] = [];
+  const authHeader = req.headers.authorization || '';
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (bearerMatch && bearerMatch[1]) {
+    const token = bearerMatch[1].trim();
+    if (token) candidates.push({ token, source: 'bearer' });
   }
   const rawCookie = req.headers.cookie;
   if (rawCookie) {
@@ -358,13 +368,26 @@ export function extractBearerOrCookie(req: Request, cookieName: string): string 
       if (idx > 0) {
         const k = part.slice(0, idx).trim();
         const v = part.slice(idx + 1).trim();
-        if (k === cookieName) {
-          return decodeURIComponent(v);
+        if (k === cookieName && v) {
+          let decoded = v;
+          try {
+            decoded = decodeURIComponent(v);
+          } catch {
+            decoded = v;
+          }
+          if (decoded && !candidates.some((c) => c.token === decoded)) {
+            candidates.push({ token: decoded, source: 'cookie' });
+          }
         }
       }
     }
   }
-  return null;
+  return candidates;
+}
+
+export function extractBearerOrCookie(req: Request, cookieName: string): string | null {
+  const candidates = extractAllSessionTokens(req, cookieName);
+  return candidates.length > 0 ? candidates[0].token : null;
 }
 
 export function resolveAdminContext(telegramId: string): AdminContext | null {
@@ -422,60 +445,134 @@ export function hasAdminPermission(
   return list.some((perm) => admin.permissions.includes(perm));
 }
 
+export type SessionFailureReason =
+  | 'jwt_secret_missing'
+  | 'missing_token'
+  | 'invalid_jwt'
+  | 'session_not_found'
+  | 'session_revoked'
+  | 'session_expired'
+  | 'telegram_id_mismatch'
+  | 'user_suspended'
+  | 'db_error';
+
+export interface NodeSessionResolution {
+  user: AuthUser | null;
+  reason: SessionFailureReason | null;
+  tokenSource: 'bearer' | 'cookie' | 'none';
+  hasBearer: boolean;
+  hasCookie: boolean;
+}
+
+function parseTimestampMs(raw: string | null | undefined): number | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)
+    ? trimmed.replace(' ', 'T') + 'Z'
+    : trimmed;
+  const ms = new Date(normalized).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function resolveUserSessionDetailed(req: Request): NodeSessionResolution {
+  const candidates = extractAllSessionTokens(req, 'sofumer_session');
+  const hasBearer = candidates.some((c) => c.source === 'bearer');
+  const hasCookie = candidates.some((c) => c.source === 'cookie');
+
+  if (!getJwtSecret()) {
+    return { user: null, reason: 'jwt_secret_missing', tokenSource: 'none', hasBearer, hasCookie };
+  }
+  if (candidates.length === 0) {
+    return { user: null, reason: 'missing_token', tokenSource: 'none', hasBearer, hasCookie };
+  }
+
+  let lastReason: SessionFailureReason = 'invalid_jwt';
+  let lastSource: 'bearer' | 'cookie' | 'none' = candidates[0].source;
+
+  for (const candidate of candidates) {
+    lastSource = candidate.source;
+    const claims = verifyJwt(candidate.token);
+    if (!claims) {
+      lastReason = 'invalid_jwt';
+      continue;
+    }
+
+    let row: Record<string, string | null> | undefined;
+    try {
+      row = db
+        .prepare(
+          `SELECT s.id as session_id, s.session_type, s.expires_at, s.revoked_at,
+                  u.id, u.telegram_id, u.telegram_username, u.first_name, u.last_name,
+                  u.display_name, u.avatar_url, u.bio, u.phone, u.country_code,
+                  u.preferred_currency, u.preferred_language, u.status
+           FROM sessions s
+           JOIN users u ON u.id = s.user_id
+           WHERE s.id = ? AND s.user_id = ?`
+        )
+        .get(claims.sid, claims.sub) as Record<string, string | null> | undefined;
+    } catch {
+      return { user: null, reason: 'db_error', tokenSource: candidate.source, hasBearer, hasCookie };
+    }
+
+    if (!row) {
+      lastReason = 'session_not_found';
+      continue;
+    }
+    if (row.revoked_at) {
+      lastReason = 'session_revoked';
+      continue;
+    }
+    const expMs = parseTimestampMs(row.expires_at);
+    if (expMs !== null && expMs < Date.now()) {
+      lastReason = 'session_expired';
+      continue;
+    }
+    if (String(row.telegram_id) !== claims.tid) {
+      lastReason = 'telegram_id_mismatch';
+      continue;
+    }
+
+    const tgId = String(row.telegram_id);
+    const roleRows = db
+      .prepare('SELECT role FROM user_roles WHERE user_id = ?')
+      .all(row.id) as { role: string }[];
+    const adminCtx = resolveAdminContext(tgId);
+
+    const user: AuthUser = {
+      id: String(row.id),
+      telegram_id: tgId,
+      telegram_username: String(row.telegram_username || ''),
+      first_name: String(row.first_name || ''),
+      last_name: String(row.last_name || ''),
+      display_name: String(row.display_name || ''),
+      avatar_url: String(row.avatar_url || ''),
+      bio: String(row.bio || ''),
+      phone: String(row.phone || ''),
+      country_code: String(row.country_code || 'US'),
+      preferred_currency: String(row.preferred_currency || 'USD'),
+      preferred_language: String(row.preferred_language || 'en'),
+      status: String(row.status || 'active'),
+      isAdmin: Boolean(adminCtx),
+      adminRole: adminCtx?.roleCode,
+      adminPermissions: adminCtx?.permissions,
+      roles: roleRows.map((r) => r.role),
+      sessionType: String(row.session_type || 'telegram'),
+      sessionId: String(row.session_id),
+    };
+
+    if (user.status === 'suspended') {
+      return { user, reason: 'user_suspended', tokenSource: candidate.source, hasBearer, hasCookie };
+    }
+
+    return { user, reason: null, tokenSource: candidate.source, hasBearer, hasCookie };
+  }
+
+  return { user: null, reason: lastReason, tokenSource: lastSource, hasBearer, hasCookie };
+}
+
 export function resolveUserSession(req: Request): AuthUser | null {
-  const token = extractBearerOrCookie(req, 'sofumer_session');
-  if (!token) return null;
-
-  const claims = verifyJwt(token);
-  if (!claims) return null;
-
-  const row = db
-    .prepare(
-      `SELECT s.id as session_id, s.session_type, s.expires_at, s.revoked_at,
-              u.id, u.telegram_id, u.telegram_username, u.first_name, u.last_name,
-              u.display_name, u.avatar_url, u.bio, u.phone, u.country_code,
-              u.preferred_currency, u.preferred_language, u.status
-       FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.id = ? AND s.user_id = ?`
-    )
-    .get(claims.sid, claims.sub) as Record<string, string | null> | undefined;
-
-  if (!row || row.revoked_at) return null;
-  if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) {
-    return null;
-  }
-  if (String(row.telegram_id) !== claims.tid) {
-    return null;
-  }
-
-  const tgId = String(row.telegram_id);
-  const roleRows = db
-    .prepare('SELECT role FROM user_roles WHERE user_id = ?')
-    .all(row.id) as { role: string }[];
-  const adminCtx = resolveAdminContext(tgId);
-
-  return {
-    id: String(row.id),
-    telegram_id: tgId,
-    telegram_username: String(row.telegram_username || ''),
-    first_name: String(row.first_name || ''),
-    last_name: String(row.last_name || ''),
-    display_name: String(row.display_name || ''),
-    avatar_url: String(row.avatar_url || ''),
-    bio: String(row.bio || ''),
-    phone: String(row.phone || ''),
-    country_code: String(row.country_code || 'US'),
-    preferred_currency: String(row.preferred_currency || 'USD'),
-    preferred_language: String(row.preferred_language || 'en'),
-    status: String(row.status || 'active'),
-    isAdmin: Boolean(adminCtx),
-    adminRole: adminCtx?.roleCode,
-    adminPermissions: adminCtx?.permissions,
-    roles: roleRows.map((r) => r.role),
-    sessionType: String(row.session_type || 'telegram'),
-    sessionId: String(row.session_id),
-  };
+  return resolveUserSessionDetailed(req).user;
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction) {

@@ -56,6 +56,12 @@ function TelegramOnlyGate() {
     {
       label: 'Authenticated session active',
       ok: authDiagnostics.stageG_sessionEstablished,
+      detail:
+        !authDiagnostics.stageG_sessionEstablished && (authDiagnostics.meReason || authDiagnostics.meStatus)
+          ? `${authDiagnostics.meStatus ? `HTTP ${authDiagnostics.meStatus}` : ''}${
+              authDiagnostics.meStatus && authDiagnostics.meReason ? ' · ' : ''
+            }${authDiagnostics.meReason || ''}`
+          : undefined,
     },
   ];
 

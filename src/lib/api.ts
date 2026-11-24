@@ -1,25 +1,23 @@
-const USER_TOKEN_KEY = 'sofumer_session_token';
 let inMemoryToken: string | null = null;
 
-export function getUserToken(): string | null {
-  if (inMemoryToken) return inMemoryToken;
-  try {
-    const stored = sessionStorage.getItem(USER_TOKEN_KEY);
-    if (stored) inMemoryToken = stored;
-    return stored;
-  } catch {
-    return inMemoryToken;
+export class ApiError extends Error {
+  status: number;
+  data: Record<string, unknown>;
+
+  constructor(message: string, status: number, data: Record<string, unknown> = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.data = data;
   }
 }
 
+export function getUserToken(): string | null {
+  return inMemoryToken;
+}
+
 export function setUserToken(token: string | null) {
-  inMemoryToken = token || null;
-  try {
-    if (token) sessionStorage.setItem(USER_TOKEN_KEY, token);
-    else sessionStorage.removeItem(USER_TOKEN_KEY);
-  } catch {
-    // Ignore storage errors
-  }
+  inMemoryToken = token ? String(token).trim() || null : null;
 }
 
 export async function apiFetch<T>(
@@ -40,12 +38,17 @@ export async function apiFetch<T>(
     ...rest,
     body,
     credentials: 'include',
+    cache: 'no-store',
     headers: mergedHeaders,
   });
 
-  const data = await resp.json().catch(() => ({}));
+  const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
   if (!resp.ok) {
-    throw new Error((data as { error?: string }).error || `Request failed (${resp.status})`);
+    throw new ApiError(
+      typeof data.error === 'string' && data.error ? data.error : `Request failed (${resp.status})`,
+      resp.status,
+      data
+    );
   }
   return data as T;
 }
@@ -55,12 +58,13 @@ export async function apiDownload(url: string, fallbackFilename = 'download.bin'
   const resp = await fetch(url, {
     method: 'GET',
     credentials: 'include',
+    cache: 'no-store',
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
 
   if (!resp.ok) {
     const errJson = (await resp.json().catch(() => ({}))) as { error?: string };
-    throw new Error(errJson.error || `Download failed (${resp.status})`);
+    throw new ApiError(errJson.error || `Download failed (${resp.status})`, resp.status, errJson);
   }
 
   const blob = await resp.blob();

@@ -140,6 +140,18 @@ async function runTests() {
       body: JSON.stringify({ query: 'laptop' }),
     });
     assert.equal(aiRes.status, 401);
+
+    const meMissing = await req('/api/auth/me');
+    assert.equal(meMissing.status, 401);
+    assert.equal(meMissing.data.authenticated, false);
+    assert.equal(meMissing.data.reason, 'missing_token');
+
+    const meInvalid = await req('/api/auth/me', {
+      headers: { Authorization: 'Bearer invalid.jwt.token' },
+    });
+    assert.equal(meInvalid.status, 401);
+    assert.equal(meInvalid.data.authenticated, false);
+    assert.equal(meInvalid.data.reason, 'invalid_jwt');
   });
 
   await test('Telegram webhook rejects missing/invalid secret token', async () => {

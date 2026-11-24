@@ -3316,6 +3316,134 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const expiredJson = await resExpired.json();
     expect(expiredJson.error).toContain('expired');
   });
+
+  it('27. Full session lifecycle & /api/auth/me: new/existing user deduplication, retry session reuse, Bearer + Cookie, refresh, expired/invalid/missing tokens', async () => {
+    const botToken = '123456:SESSION_TEST_BOT_TOKEN';
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: botToken,
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'session-test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callAuth = async (path, init = {}, customEnv = testEnv) => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init),
+        customEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return res;
+    };
+
+    const userTgId = 880999;
+    const initData = await signTelegramInitData(
+      { id: userTgId, first_name: 'Session', last_name: 'Tester', username: 'session_tester' },
+      botToken
+    );
+    const androidUa = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Telegram-Android/11.0';
+
+    // 1. Missing token & cookie -> /api/auth/me returns 401 missing_token (never 200)
+    const missingMe = await callAuth('/api/auth/me');
+    expect(missingMe.status).toBe(401);
+    expect(missingMe.headers.get('Cache-Control')).toContain('no-store');
+    const missingJson = await missingMe.json();
+    expect(missingJson.authenticated).toBe(false);
+    expect(missingJson.reason).toBe('missing_token');
+
+    // 2. Invalid token -> /api/auth/me returns 401 invalid_jwt
+    const invalidMe = await callAuth('/api/auth/me', {
+      headers: { Authorization: 'Bearer invalid.jwt.token' },
+    });
+    expect(invalidMe.status).toBe(401);
+    const invalidJson = await invalidMe.json();
+    expect(invalidJson.authenticated).toBe(false);
+    expect(invalidJson.reason).toBe('invalid_jwt');
+
+    // 3. New Telegram user launch -> creates 1 user and 1 session, sets Cookie & returns Bearer JWT
+    const loginRes1 = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': androidUa },
+      body: JSON.stringify({ initData }),
+    });
+    expect(loginRes1.status).toBe(200);
+    expect(loginRes1.headers.get('Cache-Control')).toContain('no-store');
+    const setCookie = loginRes1.headers.get('Set-Cookie') || '';
+    expect(setCookie).toContain('sofumer_session=');
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('SameSite=None');
+    expect(setCookie).toContain('Partitioned');
+    const loginJson1 = await loginRes1.json();
+    expect(loginJson1.authenticated).toBe(true);
+    expect(typeof loginJson1.token).toBe('string');
+
+    // 4. Verify /api/auth/me via Bearer token AND marketplace access
+    const meBearer = await callAuth('/api/auth/me', {
+      headers: { Authorization: `Bearer ${loginJson1.token}` },
+    });
+    expect(meBearer.status).toBe(200);
+    expect(meBearer.headers.get('Cache-Control')).toContain('no-store');
+    const meBearerJson = await meBearer.json();
+    expect(meBearerJson.authenticated).toBe(true);
+    expect(meBearerJson.user.telegram_id).toBe(String(userTgId));
+    const userId = meBearerJson.user.id;
+    const firstSessionId = meBearerJson.user.sessionId;
+
+    const bootRes = await callAuth('/api/marketplace/bootstrap', {
+      headers: { Authorization: `Bearer ${loginJson1.token}` },
+    });
+    expect(bootRes.status).toBe(200);
+
+    // 5. Page refresh via Cookie only (no Authorization header) succeeds
+    const cookiePair = setCookie.split(';')[0];
+    const meCookie = await callAuth('/api/auth/me', {
+      headers: { Cookie: cookiePair },
+    });
+    expect(meCookie.status).toBe(200);
+    const meCookieJson = await meCookie.json();
+    expect(meCookieJson.authenticated).toBe(true);
+    expect(meCookieJson.user.id).toBe(userId);
+
+    // 6. Retry Telegram Verification (same user & User-Agent) reuses existing user & session without duplicates
+    const retryRes = await callAuth('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': androidUa },
+      body: JSON.stringify({ initData }),
+    });
+    expect(retryRes.status).toBe(200);
+    const retryJson = await retryRes.json();
+    const meRetry = await callAuth('/api/auth/me', {
+      headers: { Authorization: `Bearer ${retryJson.token}` },
+    });
+    expect(meRetry.status).toBe(200);
+    const meRetryJson = await meRetry.json();
+    expect(meRetryJson.user.id).toBe(userId);
+    expect(meRetryJson.user.sessionId).toBe(firstSessionId);
+
+    const userCount = await testEnv.DB.prepare('SELECT COUNT(*) as cnt FROM users WHERE telegram_id = ?')
+      .bind(String(userTgId))
+      .first();
+    const sessCount = await testEnv.DB.prepare('SELECT COUNT(*) as cnt FROM sessions WHERE user_id = ?')
+      .bind(userId)
+      .first();
+    expect(userCount.cnt).toBe(1);
+    expect(sessCount.cnt).toBe(1);
+
+    // 7. Expired DB session -> /api/auth/me rejects with 401 session_expired
+    await testEnv.DB.prepare("UPDATE sessions SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
+      .bind(firstSessionId)
+      .run();
+    const expiredMe = await callAuth('/api/auth/me', {
+      headers: { Authorization: `Bearer ${retryJson.token}` },
+    });
+    expect(expiredMe.status).toBe(401);
+    const expiredMeJson = await expiredMe.json();
+    expect(expiredMeJson.authenticated).toBe(false);
+    expect(expiredMeJson.reason).toBe('session_expired');
+  });
 });
 
 

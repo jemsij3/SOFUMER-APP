@@ -422,7 +422,7 @@ export function verifyCookieCsrfEdge(request: Request, env: Env, url: URL): Resp
   if (url.pathname === '/api/telegram/webhook' || url.pathname === '/api/auth/telegram') return null;
 
   const authHeader = request.headers.get('Authorization') || '';
-  if (authHeader.startsWith('Bearer ') && authHeader.slice(7).trim()) {
+  if (/^Bearer\s+\S+/i.test(authHeader)) {
     return null;
   }
 
@@ -543,11 +543,21 @@ export async function getTelegramBotInfoEdge(env: Env): Promise<TelegramBotPubli
   }
 }
 
-export function extractBearerOrCookie(request: Request, cookieName: string): string | null {
-  const authHeader = request.headers.get('Authorization');
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token) return token;
+export interface SessionTokenCandidate {
+  token: string;
+  source: 'bearer' | 'cookie';
+}
+
+export function extractAllSessionTokens(
+  request: Request,
+  cookieName: string
+): SessionTokenCandidate[] {
+  const candidates: SessionTokenCandidate[] = [];
+  const authHeader = request.headers.get('Authorization') || '';
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (bearerMatch && bearerMatch[1]) {
+    const token = bearerMatch[1].trim();
+    if (token) candidates.push({ token, source: 'bearer' });
   }
   const rawCookie = request.headers.get('Cookie');
   if (rawCookie) {
@@ -556,13 +566,26 @@ export function extractBearerOrCookie(request: Request, cookieName: string): str
       if (idx > 0) {
         const k = part.slice(0, idx).trim();
         const v = part.slice(idx + 1).trim();
-        if (k === cookieName) {
-          return decodeURIComponent(v);
+        if (k === cookieName && v) {
+          let decoded = v;
+          try {
+            decoded = decodeURIComponent(v);
+          } catch {
+            decoded = v;
+          }
+          if (decoded && !candidates.some((c) => c.token === decoded)) {
+            candidates.push({ token: decoded, source: 'cookie' });
+          }
         }
       }
     }
   }
-  return null;
+  return candidates;
+}
+
+export function extractBearerOrCookie(request: Request, cookieName: string): string | null {
+  const candidates = extractAllSessionTokens(request, cookieName);
+  return candidates.length > 0 ? candidates[0].token : null;
 }
 
 export async function verifyTelegramInitDataEdge(
@@ -717,57 +740,169 @@ export function hasEdgeAdminPermission(
   return list.some((perm) => admin.permissions.includes(perm));
 }
 
+export type SessionFailureReason =
+  | 'db_not_configured'
+  | 'jwt_secret_missing'
+  | 'missing_token'
+  | 'invalid_jwt'
+  | 'session_not_found'
+  | 'session_revoked'
+  | 'session_expired'
+  | 'telegram_id_mismatch'
+  | 'user_suspended'
+  | 'db_error';
+
+export interface EdgeSessionResolution {
+  user: EdgeAuthUser | null;
+  reason: SessionFailureReason | null;
+  tokenSource: 'bearer' | 'cookie' | 'none';
+  hasBearer: boolean;
+  hasCookie: boolean;
+}
+
+function parseTimestampMs(raw: string | null | undefined): number | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)
+    ? trimmed.replace(' ', 'T') + 'Z'
+    : trimmed;
+  const ms = new Date(normalized).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export async function resolveEdgeUserSessionDetailed(
+  request: Request,
+  env: Env
+): Promise<EdgeSessionResolution> {
+  const candidates = extractAllSessionTokens(request, 'sofumer_session');
+  const hasBearer = candidates.some((c) => c.source === 'bearer');
+  const hasCookie = candidates.some((c) => c.source === 'cookie');
+
+  if (!env.DB) {
+    return { user: null, reason: 'db_not_configured', tokenSource: 'none', hasBearer, hasCookie };
+  }
+  const jwtSecret = (env.JWT_SECRET || '').trim();
+  if (!jwtSecret) {
+    return { user: null, reason: 'jwt_secret_missing', tokenSource: 'none', hasBearer, hasCookie };
+  }
+  if (candidates.length === 0) {
+    return { user: null, reason: 'missing_token', tokenSource: 'none', hasBearer, hasCookie };
+  }
+
+  let lastReason: SessionFailureReason = 'invalid_jwt';
+  let lastSource: 'bearer' | 'cookie' | 'none' = candidates[0].source;
+
+  for (const candidate of candidates) {
+    lastSource = candidate.source;
+    const claims = await verifyJwtEdge(candidate.token, jwtSecret);
+    if (!claims) {
+      lastReason = 'invalid_jwt';
+      continue;
+    }
+
+    let row: Record<string, string | null> | null = null;
+    try {
+      row = await env.DB.prepare(
+        `SELECT s.id as session_id, s.session_type, s.expires_at, s.revoked_at,
+                u.id, u.telegram_id, u.telegram_username, u.first_name, u.last_name,
+                u.display_name, u.avatar_url, u.bio, u.phone, u.country_code,
+                u.preferred_currency, u.preferred_language, u.status
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.id = ? AND s.user_id = ?`
+      )
+        .bind(claims.sid, claims.sub)
+        .first<Record<string, string | null>>();
+    } catch (err) {
+      console.error(
+        '[SOFUMER Session Lookup Error]',
+        err instanceof Error ? err.message : 'D1 query failed'
+      );
+      return {
+        user: null,
+        reason: 'db_error',
+        tokenSource: candidate.source,
+        hasBearer,
+        hasCookie,
+      };
+    }
+
+    if (!row) {
+      lastReason = 'session_not_found';
+      continue;
+    }
+    if (row.revoked_at) {
+      lastReason = 'session_revoked';
+      continue;
+    }
+    const expMs = parseTimestampMs(row.expires_at);
+    if (expMs !== null && expMs < Date.now()) {
+      lastReason = 'session_expired';
+      continue;
+    }
+    if (String(row.telegram_id) !== claims.tid) {
+      lastReason = 'telegram_id_mismatch';
+      continue;
+    }
+
+    const tgId = String(row.telegram_id);
+    const adminCtx = await resolveEdgeAdminContext(env, tgId);
+    const user: EdgeAuthUser = {
+      id: String(row.id),
+      telegram_id: tgId,
+      telegram_username: String(row.telegram_username || ''),
+      first_name: String(row.first_name || ''),
+      last_name: String(row.last_name || ''),
+      display_name: String(row.display_name || ''),
+      avatar_url: sanitizeSafeUrl(row.avatar_url || '', 300),
+      bio: String(row.bio || ''),
+      phone: String(row.phone || ''),
+      country_code: String(row.country_code || 'US'),
+      preferred_currency: String(row.preferred_currency || 'USD'),
+      preferred_language: String(row.preferred_language || 'en'),
+      status: String(row.status || 'active'),
+      isAdmin: Boolean(adminCtx),
+      adminRole: adminCtx?.roleCode,
+      adminPermissions: adminCtx?.permissions,
+      sessionId: String(row.session_id),
+      sessionType: String(row.session_type || 'telegram'),
+    };
+
+    if (user.status === 'suspended') {
+      return {
+        user,
+        reason: 'user_suspended',
+        tokenSource: candidate.source,
+        hasBearer,
+        hasCookie,
+      };
+    }
+
+    return {
+      user,
+      reason: null,
+      tokenSource: candidate.source,
+      hasBearer,
+      hasCookie,
+    };
+  }
+
+  return {
+    user: null,
+    reason: lastReason,
+    tokenSource: lastSource,
+    hasBearer,
+    hasCookie,
+  };
+}
+
 export async function resolveEdgeUserSession(
   request: Request,
   env: Env
 ): Promise<EdgeAuthUser | null> {
-  const jwtSecret = (env.JWT_SECRET || '').trim();
-  if (!env.DB || !jwtSecret) return null;
-  const token = extractBearerOrCookie(request, 'sofumer_session');
-  if (!token) return null;
-
-  const claims = await verifyJwtEdge(token, jwtSecret);
-  if (!claims) return null;
-
-  const row = await env.DB.prepare(
-    `SELECT s.id as session_id, s.session_type, s.expires_at, s.revoked_at,
-            u.id, u.telegram_id, u.telegram_username, u.first_name, u.last_name,
-            u.display_name, u.avatar_url, u.bio, u.phone, u.country_code,
-            u.preferred_currency, u.preferred_language, u.status
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     WHERE s.id = ? AND s.user_id = ?`
-  )
-    .bind(claims.sid, claims.sub)
-    .first<Record<string, string | null>>();
-
-  if (!row || row.revoked_at) return null;
-  if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
-  if (String(row.telegram_id) !== claims.tid) return null;
-
-  const tgId = String(row.telegram_id);
-  const adminCtx = await resolveEdgeAdminContext(env, tgId);
-
-  return {
-    id: String(row.id),
-    telegram_id: tgId,
-    telegram_username: String(row.telegram_username || ''),
-    first_name: String(row.first_name || ''),
-    last_name: String(row.last_name || ''),
-    display_name: String(row.display_name || ''),
-    avatar_url: sanitizeSafeUrl(row.avatar_url || '', 300),
-    bio: String(row.bio || ''),
-    phone: String(row.phone || ''),
-    country_code: String(row.country_code || 'US'),
-    preferred_currency: String(row.preferred_currency || 'USD'),
-    preferred_language: String(row.preferred_language || 'en'),
-    status: String(row.status || 'active'),
-    isAdmin: Boolean(adminCtx),
-    adminRole: adminCtx?.roleCode,
-    adminPermissions: adminCtx?.permissions,
-    sessionId: String(row.session_id),
-    sessionType: String(row.session_type || 'telegram'),
-  };
+  const res = await resolveEdgeUserSessionDetailed(request, env);
+  return res.user;
 }
 
 export async function requireEdgeUser(
@@ -777,19 +912,23 @@ export async function requireEdgeUser(
   if (!env.DB) {
     return { error: json({ error: 'Database binding (DB) is not configured.' }, 503) };
   }
-  const user = await resolveEdgeUserSession(request, env);
-  if (!user) {
+  const res = await resolveEdgeUserSessionDetailed(request, env);
+  if (!res.user) {
+    const status = res.reason === 'db_error' ? 500 : 401;
     return {
       error: json(
-        { error: 'Telegram authentication required. Open SOFUMER inside its official Telegram Mini App.' },
-        401
+        {
+          error: 'Telegram authentication required. Open SOFUMER inside its official Telegram Mini App.',
+          reason: res.reason,
+        },
+        status
       ),
     };
   }
-  if (user.status === 'suspended') {
+  if (res.user.status === 'suspended' || res.reason === 'user_suspended') {
     return { error: json({ error: 'Your account is currently suspended.' }, 403) };
   }
-  return { user };
+  return { user: res.user };
 }
 
 export async function requireEdgeSeller(

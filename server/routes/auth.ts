@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { db, newId } from '../db.ts';
 import {
   getJwtSecret,
@@ -6,7 +6,7 @@ import {
   rateLimit,
   requireAuth,
   resolveAdminContext,
-  resolveUserSession,
+  resolveUserSessionDetailed,
   sanitizeSafeUrl,
   sanitizeText,
   signJwt,
@@ -16,7 +16,14 @@ import { getTelegramBotConfig, getTelegramBotInfo } from '../telegram.ts';
 
 export const authRouter = Router();
 
+const AUTH_NO_STORE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+  Pragma: 'no-cache',
+  Vary: 'Authorization, Cookie',
+};
+
 function createSessionForTelegramUser(
+  req: Request,
   tgUser: {
     id: number;
     first_name: string;
@@ -83,14 +90,39 @@ function createSessionForTelegramUser(
     );
   }
 
-  const sessionId = newId('sess');
-  const tokenHash = hashSessionId(sessionId);
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const existingSess = resolveUserSessionDetailed(req);
+  let sessionId: string | null = null;
+  if (existingSess.user && existingSess.user.id === userId && existingSess.user.sessionType === 'telegram') {
+    sessionId = existingSess.user.sessionId;
+  } else {
+    const recentRow = db
+      .prepare(
+        `SELECT id, expires_at FROM sessions
+         WHERE user_id = ? AND session_type = 'telegram' AND revoked_at IS NULL
+           AND user_agent = ? AND created_at >= datetime('now', '-10 minutes')
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(userId, userAgent.slice(0, 200)) as { id: string; expires_at: string } | undefined;
+    if (recentRow && new Date(recentRow.expires_at).getTime() > Date.now()) {
+      sessionId = recentRow.id;
+    }
+  }
 
-  db.prepare(
-    `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
-     VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
-  ).run(sessionId, userId, tokenHash, ipAddress, userAgent.slice(0, 200), expiresAt);
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  if (sessionId) {
+    db.prepare('UPDATE sessions SET expires_at = ?, ip_address = ? WHERE id = ?').run(
+      expiresAt,
+      ipAddress,
+      sessionId
+    );
+  } else {
+    sessionId = newId('sess');
+    const tokenHash = hashSessionId(sessionId);
+    db.prepare(
+      `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
+       VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
+    ).run(sessionId, userId, tokenHash, ipAddress, userAgent.slice(0, 200), expiresAt);
+  }
 
   const isAdmin = Boolean(resolveAdminContext(tgId));
   const jwtToken = signJwt({ sub: userId, tid: tgId, sid: sessionId, adm: isAdmin }, 7 * 86400);
@@ -99,6 +131,7 @@ function createSessionForTelegramUser(
 }
 
 authRouter.get('/config', async (req, res) => {
+  res.set(AUTH_NO_STORE_HEADERS);
   const cfg = getTelegramBotConfig();
   const botInfo = await getTelegramBotInfo();
   const origin = `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
@@ -115,6 +148,7 @@ authRouter.get('/config', async (req, res) => {
 
 // Official Telegram Mini App authentication
 authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
+  res.set(AUTH_NO_STORE_HEADERS);
   const initData = typeof req.body?.initData === 'string' ? req.body.initData : '';
   const botToken = getTelegramBotConfig().botToken;
   if (!botToken) {
@@ -133,16 +167,18 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
   try {
     const verified = verifyTelegramInitData(initData, botToken);
     const { jwtToken, expiresAt, isAdmin } = createSessionForTelegramUser(
+      req,
       verified.user,
       req.ip || '',
       String(req.headers['user-agent'] || '')
     );
 
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
     res.cookie('sofumer_session', jwtToken, {
       httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      partitioned: true,
+      sameSite: isHttps ? 'none' : 'lax',
+      secure: isHttps,
+      ...(isHttps ? { partitioned: true } : {}),
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -173,10 +209,35 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
 });
 
 authRouter.get('/me', (req, res) => {
-  const user = resolveUserSession(req);
-  if (!user) {
-    return res.json({ authenticated: false, user: null });
+  res.set(AUTH_NO_STORE_HEADERS);
+  const sessionRes = resolveUserSessionDetailed(req);
+  if (!sessionRes.user || sessionRes.reason === 'user_suspended') {
+    const reason = sessionRes.reason || 'missing_token';
+    const status =
+      reason === 'jwt_secret_missing'
+        ? 503
+        : reason === 'db_error'
+        ? 500
+        : reason === 'user_suspended'
+        ? 403
+        : 401;
+    return res.status(status).json({
+      authenticated: false,
+      user: null,
+      reason,
+      error:
+        reason === 'user_suspended'
+          ? 'Your account is currently suspended.'
+          : 'Authentication session could not be verified.',
+      diagnostics: {
+        tokenSource: sessionRes.tokenSource,
+        hasBearer: sessionRes.hasBearer,
+        hasCookie: sessionRes.hasCookie,
+        jwtConfigured: Boolean(getJwtSecret()),
+      },
+    });
   }
+  const user = sessionRes.user;
 
   const sellerProfile = db
     .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')

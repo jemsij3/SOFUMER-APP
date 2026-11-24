@@ -1,5 +1,5 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { apiFetch, setUserToken } from '../lib/api';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { ApiError, apiFetch, setUserToken } from '../lib/api';
 import {
   clearCachedTelegramInitData,
   getTelegramClientStatus,
@@ -41,6 +41,8 @@ export interface AuthDiagnostics {
   stageE_workerReceivedInitData: boolean | null;
   stageF_signatureVerified: boolean | null;
   stageG_sessionEstablished: boolean;
+  meStatus?: number;
+  meReason?: string | null;
 }
 
 interface AppContextValue {
@@ -107,6 +109,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [jwtConfigured, setJwtConfigured] = useState(true);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const authInFlightRef = useRef<Promise<void> | null>(null);
   const [authDiagnostics, setAuthDiagnostics] = useState<AuthDiagnostics>({
     stageA_launchContext: 'external_browser',
     stageB_webAppDetected: false,
@@ -203,11 +206,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const refreshSession = useCallback(async (): Promise<boolean> => {
+  const performSessionCheck = useCallback(async (): Promise<{
+    authenticated: boolean;
+    status: number;
+    reason?: string | null;
+    error?: string | null;
+  }> => {
     try {
       const me = await apiFetch<{
         authenticated: boolean;
         user: User | null;
+        reason?: string;
+        error?: string;
         sellerProfile?: SellerProfile | null;
         shop?: Shop | null;
         unreadMessages?: number;
@@ -225,140 +235,200 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (me.user.preferred_currency) setDisplayCurrency(me.user.preferred_currency);
         if (me.user.preferred_language) setLanguage(me.user.preferred_language);
         await refreshBootstrap();
-        return true;
-      } else {
-        setUser(null);
-        setSellerProfile(null);
-        setShop(null);
-        setUnreadMessages(0);
-        setUnreadNotifications(0);
-        setFavoriteIds(new Set());
-        return false;
+        return { authenticated: true, status: 200 };
       }
-    } catch {
+
       setUser(null);
-      return false;
+      setSellerProfile(null);
+      setShop(null);
+      setUnreadMessages(0);
+      setUnreadNotifications(0);
+      setFavoriteIds(new Set());
+      return {
+        authenticated: false,
+        status: 200,
+        reason: me.reason || 'unauthenticated',
+        error: me.error || null,
+      };
+    } catch (err) {
+      setUser(null);
+      setSellerProfile(null);
+      setShop(null);
+      setUnreadMessages(0);
+      setUnreadNotifications(0);
+      setFavoriteIds(new Set());
+      if (err instanceof ApiError) {
+        const reason = typeof err.data.reason === 'string' ? err.data.reason : null;
+        return {
+          authenticated: false,
+          status: err.status,
+          reason,
+          error: err.message,
+        };
+      }
+      return {
+        authenticated: false,
+        status: 0,
+        reason: 'network_error',
+        error: err instanceof Error ? err.message : 'Unable to reach /api/auth/me',
+      };
     }
   }, [refreshBootstrap]);
 
+  const refreshSession = useCallback(async (): Promise<boolean> => {
+    const res = await performSessionCheck();
+    return res.authenticated;
+  }, [performSessionCheck]);
+
   const authenticateTelegram = useCallback(async () => {
-    setAuthLoading(true);
-    setAuthError(null);
-    initTelegramMiniApp();
-
-    let cfgOk = false;
-    let tgConfigured = false;
-    let jwtCfgOk = true;
-    let cfgErrorMsg: string | null = null;
-
-    try {
-      const cfg = await apiFetch<{
-        botName: string | null;
-        botUsername: string | null;
-        launchUrl?: string | null;
-        telegramConfigured: boolean;
-        jwtConfigured?: boolean;
-      }>('/api/auth/config');
-      cfgOk = true;
-      tgConfigured = Boolean(cfg.telegramConfigured);
-      jwtCfgOk = cfg.jwtConfigured !== false;
-      setBotName(cfg.botName || '');
-      setBotUsername(cfg.botUsername || '');
-      setLaunchUrl(cfg.launchUrl || (cfg.botUsername ? `https://t.me/${cfg.botUsername}?startapp` : ''));
-      setTelegramConfigured(tgConfigured);
-      setJwtConfigured(jwtCfgOk);
-      setConfigLoaded(true);
-    } catch (err) {
-      cfgErrorMsg = err instanceof Error ? err.message : 'Unable to reach SOFUMER authentication service.';
-      setConfigLoaded(false);
+    if (authInFlightRef.current) {
+      return authInFlightRef.current;
     }
 
-    const { initData, source } = await waitForTelegramInitData(700);
-    const tgStatus = getTelegramClientStatus();
+    const run = (async () => {
+      setAuthLoading(true);
+      setAuthError(null);
+      initTelegramMiniApp();
 
-    const diag: AuthDiagnostics = {
-      stageA_launchContext: tgStatus.hasTelegramWebApp
-        ? initData
-          ? 'mini_app'
-          : 'telegram_in_app_browser'
-        : 'external_browser',
-      stageB_webAppDetected: tgStatus.hasTelegramWebApp,
-      platform: tgStatus.platform || 'unknown',
-      version: tgStatus.version || '',
-      stageC_initDataPresent: initData.length > 0,
-      initDataSource: source,
-      initDataLength: initData.length,
-      stageD_sentToWorker: false,
-      stageE_workerReceivedInitData: null,
-      stageF_signatureVerified: null,
-      stageG_sessionEstablished: false,
-    };
+      let cfgOk = false;
+      let tgConfigured = false;
+      let jwtCfgOk = true;
+      let cfgErrorMsg: string | null = null;
 
-    let postAuthError: string | null = null;
-    if (initData) {
-      diag.stageD_sentToWorker = true;
       try {
-        const authRes = await apiFetch<{
-          token: string;
-          diagnostics?: {
-            receivedInitData?: boolean;
-            signatureVerified?: boolean;
-            sessionCreated?: boolean;
-          };
-        }>('/api/auth/telegram', {
-          method: 'POST',
-          body: JSON.stringify({ initData }),
-        });
-        diag.stageE_workerReceivedInitData = authRes.diagnostics?.receivedInitData ?? true;
-        diag.stageF_signatureVerified = authRes.diagnostics?.signatureVerified ?? true;
-        if (authRes.token) setUserToken(authRes.token);
+        const cfg = await apiFetch<{
+          botName: string | null;
+          botUsername: string | null;
+          launchUrl?: string | null;
+          telegramConfigured: boolean;
+          jwtConfigured?: boolean;
+        }>('/api/auth/config');
+        cfgOk = true;
+        tgConfigured = Boolean(cfg.telegramConfigured);
+        jwtCfgOk = cfg.jwtConfigured !== false;
+        setBotName(cfg.botName || '');
+        setBotUsername(cfg.botUsername || '');
+        setLaunchUrl(cfg.launchUrl || (cfg.botUsername ? `https://t.me/${cfg.botUsername}?startapp` : ''));
+        setTelegramConfigured(tgConfigured);
+        setJwtConfigured(jwtCfgOk);
+        setConfigLoaded(true);
       } catch (err) {
-        clearCachedTelegramInitData();
-        setUserToken(null);
-        diag.stageE_workerReceivedInitData = true;
-        diag.stageF_signatureVerified = false;
-        postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
+        cfgErrorMsg = err instanceof Error ? err.message : 'Unable to reach SOFUMER authentication service.';
+        setConfigLoaded(false);
       }
-    }
 
-    const authenticated = await refreshSession();
-    diag.stageG_sessionEstablished = authenticated;
-    setAuthDiagnostics(diag);
+      const { initData, source } = await waitForTelegramInitData(700);
+      const tgStatus = getTelegramClientStatus();
 
-    console.info('[SOFUMER Auth Diagnostics]', {
-      stageA_launchContext: diag.stageA_launchContext,
-      stageB_webAppDetected: diag.stageB_webAppDetected,
-      platform: diag.platform,
-      stageC_initDataPresent: diag.stageC_initDataPresent,
-      initDataSource: diag.initDataSource,
-      initDataLength: diag.initDataLength,
-      stageD_sentToWorker: diag.stageD_sentToWorker,
-      stageE_workerReceivedInitData: diag.stageE_workerReceivedInitData,
-      stageF_signatureVerified: diag.stageF_signatureVerified,
-      stageG_sessionEstablished: diag.stageG_sessionEstablished,
-    });
+      const diag: AuthDiagnostics = {
+        stageA_launchContext: tgStatus.hasTelegramWebApp
+          ? initData
+            ? 'mini_app'
+            : 'telegram_in_app_browser'
+          : 'external_browser',
+        stageB_webAppDetected: tgStatus.hasTelegramWebApp,
+        platform: tgStatus.platform || 'unknown',
+        version: tgStatus.version || '',
+        stageC_initDataPresent: initData.length > 0,
+        initDataSource: source,
+        initDataLength: initData.length,
+        stageD_sentToWorker: false,
+        stageE_workerReceivedInitData: null,
+        stageF_signatureVerified: null,
+        stageG_sessionEstablished: false,
+      };
 
-    if (!authenticated) {
-      if (postAuthError) {
-        setAuthError(postAuthError);
-      } else if (!cfgOk && cfgErrorMsg) {
-        setAuthError(`Authentication service check failed: ${cfgErrorMsg}`);
-      } else if (cfgOk && (!tgConfigured || !jwtCfgOk)) {
-        setAuthError(
-          'SOFUMER server secrets (TELEGRAM_BOT_TOKEN or JWT_SECRET) are missing on Cloudflare Worker sofumer-app.'
-        );
-      } else if (diag.stageD_sentToWorker && diag.stageF_signatureVerified) {
-        setAuthError(
-          'Telegram signature verified, but your session check (/api/auth/me) failed. Tap Retry Verification or check JWT_SECRET configuration.'
-        );
-      } else if (tgStatus.hasTelegramWebApp && !initData) {
-        setAuthError(
-          `Telegram WebApp loaded (platform: ${diag.platform}), but initData is empty. This happens when SOFUMER is opened from a regular URL link instead of the bot's Menu Button or /start Web App button.`
-        );
+      let postAuthError: string | null = null;
+      if (initData) {
+        diag.stageD_sentToWorker = true;
+        try {
+          const authRes = await apiFetch<{
+            authenticated?: boolean;
+            token?: string;
+            diagnostics?: {
+              receivedInitData?: boolean;
+              signatureVerified?: boolean;
+              sessionCreated?: boolean;
+            };
+          }>('/api/auth/telegram', {
+            method: 'POST',
+            body: JSON.stringify({ initData }),
+          });
+          diag.stageE_workerReceivedInitData = authRes.diagnostics?.receivedInitData ?? true;
+          const sigOk = Boolean(authRes.authenticated && authRes.token && (authRes.diagnostics?.signatureVerified ?? true));
+          diag.stageF_signatureVerified = sigOk;
+          if (authRes.authenticated && authRes.token) {
+            setUserToken(authRes.token);
+          } else {
+            setUserToken(null);
+            postAuthError = 'Telegram verification succeeded, but no session token was issued.';
+          }
+        } catch (err) {
+          clearCachedTelegramInitData();
+          setUserToken(null);
+          diag.stageE_workerReceivedInitData = true;
+          diag.stageF_signatureVerified = false;
+          postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
+        }
       }
+
+      const sessionCheck = await performSessionCheck();
+      diag.stageG_sessionEstablished = sessionCheck.authenticated;
+      diag.meStatus = sessionCheck.status;
+      diag.meReason = sessionCheck.reason || null;
+      setAuthDiagnostics(diag);
+
+      console.info('[SOFUMER Auth Diagnostics]', {
+        stageA_launchContext: diag.stageA_launchContext,
+        stageB_webAppDetected: diag.stageB_webAppDetected,
+        platform: diag.platform,
+        stageC_initDataPresent: diag.stageC_initDataPresent,
+        initDataSource: diag.initDataSource,
+        initDataLength: diag.initDataLength,
+        stageD_sentToWorker: diag.stageD_sentToWorker,
+        stageE_workerReceivedInitData: diag.stageE_workerReceivedInitData,
+        stageF_signatureVerified: diag.stageF_signatureVerified,
+        stageG_sessionEstablished: diag.stageG_sessionEstablished,
+        meStatus: diag.meStatus,
+        meReason: diag.meReason,
+      });
+
+      if (!sessionCheck.authenticated) {
+        if (postAuthError) {
+          setAuthError(postAuthError);
+        } else if (!cfgOk && cfgErrorMsg) {
+          setAuthError(`Authentication service check failed: ${cfgErrorMsg}`);
+        } else if (cfgOk && (!tgConfigured || !jwtCfgOk)) {
+          setAuthError(
+            'SOFUMER server secrets (TELEGRAM_BOT_TOKEN or JWT_SECRET) are missing on Cloudflare Worker sofumer-app.'
+          );
+        } else if (diag.stageD_sentToWorker && diag.stageF_signatureVerified) {
+          const detail = sessionCheck.reason
+            ? ` (${sessionCheck.status ? `HTTP ${sessionCheck.status}: ` : ''}${sessionCheck.reason})`
+            : sessionCheck.status
+            ? ` (HTTP ${sessionCheck.status})`
+            : '';
+          setAuthError(
+            `Telegram signature verified, but your session check (/api/auth/me) failed${detail}. ${
+              sessionCheck.error || 'Tap Retry Telegram Verification.'
+            }`
+          );
+        } else if (tgStatus.hasTelegramWebApp && !initData) {
+          setAuthError(
+            `Telegram WebApp loaded (platform: ${diag.platform}), but initData is empty. This happens when SOFUMER is opened from a regular URL link instead of the bot's Menu Button or /start Web App button.`
+          );
+        }
+      }
+      setAuthLoading(false);
+    })();
+
+    authInFlightRef.current = run;
+    try {
+      await run;
+    } finally {
+      authInFlightRef.current = null;
     }
-    setAuthLoading(false);
-  }, [refreshSession]);
+  }, [performSessionCheck]);
 
   useEffect(() => {
     initTelegramMiniApp();

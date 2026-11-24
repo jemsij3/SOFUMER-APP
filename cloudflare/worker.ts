@@ -22,7 +22,7 @@ import {
   parseJsonBody,
   requireEdgeUser,
   resolveEdgeAdminContext,
-  resolveEdgeUserSession,
+  resolveEdgeUserSessionDetailed,
   resolveSafeMiniAppUrlEdge,
   sanitizeSafeUrl,
   sanitizeText,
@@ -210,6 +210,19 @@ async function handleTelegramWebhook(
   return json({ status: 'accepted', updateId }, 200);
 }
 
+const AUTH_NO_STORE_HEADERS: Record<string, string> = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+  Pragma: 'no-cache',
+  Vary: 'Authorization, Cookie',
+};
+
+function buildSessionCookie(token: string, isHttps: boolean, maxAgeSeconds: number): string {
+  if (isHttps) {
+    return `sofumer_session=${token}; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=${maxAgeSeconds}`;
+  }
+  return `sofumer_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}`;
+}
+
 async function handleAuthRoutes(
   request: Request,
   env: Env,
@@ -217,19 +230,25 @@ async function handleAuthRoutes(
 ): Promise<Response | null> {
   if (!url.pathname.startsWith('/api/auth/')) return null;
 
+  const isHttps = url.protocol === 'https:' || request.headers.get('X-Forwarded-Proto') === 'https';
+
   if (url.pathname === '/api/auth/config') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const botInfo = await getTelegramBotInfoEdge(env);
     const miniAppUrl = resolveSafeMiniAppUrlEdge(env, url.origin) || url.origin;
-    return json({
-      botName: botInfo.botName,
-      botUsername: botInfo.botUsername,
-      miniAppUrl,
-      launchUrl: botInfo.botUsername ? `https://t.me/${botInfo.botUsername}?startapp` : null,
-      telegramConfigured: Boolean((env.TELEGRAM_BOT_TOKEN || '').trim()),
-      jwtConfigured: Boolean((env.JWT_SECRET || '').trim()),
-      telegramOnly: true,
-    });
+    return json(
+      {
+        botName: botInfo.botName,
+        botUsername: botInfo.botUsername,
+        miniAppUrl,
+        launchUrl: botInfo.botUsername ? `https://t.me/${botInfo.botUsername}?startapp` : null,
+        telegramConfigured: Boolean((env.TELEGRAM_BOT_TOKEN || '').trim()),
+        jwtConfigured: Boolean((env.JWT_SECRET || '').trim()),
+        telegramOnly: true,
+      },
+      200,
+      AUTH_NO_STORE_HEADERS
+    );
   }
 
   if (url.pathname === '/api/auth/telegram') {
@@ -244,7 +263,8 @@ async function handleAuthRoutes(
           error: 'TELEGRAM_BOT_TOKEN is not configured on the Worker.',
           diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
         },
-        503
+        503,
+        AUTH_NO_STORE_HEADERS
       );
     }
     const jwtSecret = (env.JWT_SECRET || '').trim();
@@ -254,11 +274,12 @@ async function handleAuthRoutes(
           error: 'JWT_SECRET is not configured on the Worker.',
           diagnostics: { receivedInitData: false, signatureVerified: false, sessionCreated: false },
         },
-        503
+        503,
+        AUTH_NO_STORE_HEADERS
       );
     }
     if (!env.DB) {
-      return json({ error: 'Database binding (DB) is not configured.' }, 503);
+      return json({ error: 'Database binding (DB) is not configured.' }, 503, AUTH_NO_STORE_HEADERS);
     }
 
     const parsed = await parseJsonBody<{ initData?: string }>(request);
@@ -293,7 +314,7 @@ async function handleAuthRoutes(
       const adminCtx = await resolveEdgeAdminContext(env, tgId);
       const isAdmin = Boolean(adminCtx);
 
-      const existing = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?')
+      let existing = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?')
         .bind(tgId)
         .first<Record<string, unknown>>();
 
@@ -307,21 +328,31 @@ async function handleAuthRoutes(
       let userId: string;
       if (!existing) {
         userId = newId('usr');
-        await env.DB.prepare(
-          `INSERT INTO users (id, telegram_id, telegram_username, first_name, last_name, display_name, avatar_url, preferred_language, last_login_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
-        )
-          .bind(
-            userId,
-            tgId,
-            sanitizeText(tgUser.username || '', 64),
-            sanitizeText(tgUser.first_name || 'Member', 64),
-            sanitizeText(tgUser.last_name || '', 64),
-            sanitizeText(displayName, 80),
-            safePhotoUrl,
-            sanitizeText(tgUser.language_code || 'en', 10)
+        try {
+          await env.DB.prepare(
+            `INSERT INTO users (id, telegram_id, telegram_username, first_name, last_name, display_name, avatar_url, preferred_language, last_login_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
           )
-          .run();
+            .bind(
+              userId,
+              tgId,
+              sanitizeText(tgUser.username || '', 64),
+              sanitizeText(tgUser.first_name || 'Member', 64),
+              sanitizeText(tgUser.last_name || '', 64),
+              sanitizeText(displayName, 80),
+              safePhotoUrl,
+              sanitizeText(tgUser.language_code || 'en', 10)
+            )
+            .run();
+        } catch {
+          existing = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?')
+            .bind(tgId)
+            .first<Record<string, unknown>>();
+          if (!existing) {
+            throw new Error('Failed to create or retrieve user account.');
+          }
+          userId = String(existing.id);
+        }
 
         await env.DB.prepare(
           `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
@@ -335,7 +366,11 @@ async function handleAuthRoutes(
       } else {
         userId = String(existing.id);
         if (existing.status === 'suspended') {
-          return json({ error: 'This account has been suspended by platform moderation.' }, 403);
+          return json(
+            { error: 'This account has been suspended by platform moderation.' },
+            403,
+            AUTH_NO_STORE_HEADERS
+          );
         }
         await env.DB.prepare(
           `UPDATE users
@@ -353,23 +388,47 @@ async function handleAuthRoutes(
           .run();
       }
 
-      const sessionId = newId('sess');
-      const tokenHash = await hashSessionIdentifier(sessionId, jwtSecret);
+      const clientIp = request.headers.get('CF-Connecting-IP') || '';
+      const userAgent = (request.headers.get('User-Agent') || '').slice(0, 200);
       const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
 
-      await env.DB.prepare(
-        `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
-         VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
-      )
-        .bind(
-          sessionId,
-          userId,
-          tokenHash,
-          request.headers.get('CF-Connecting-IP') || '',
-          (request.headers.get('User-Agent') || '').slice(0, 200),
-          expiresAt
+      // Reuse an active session for the same user on Retry / reload instead of creating duplicates
+      let sessionId: string | null = null;
+      const currentSess = await resolveEdgeUserSessionDetailed(request, env);
+      if (currentSess.user && currentSess.user.id === userId && currentSess.user.sessionType === 'telegram') {
+        sessionId = currentSess.user.sessionId;
+      } else {
+        const recentRow = await env.DB.prepare(
+          `SELECT id, expires_at FROM sessions
+           WHERE user_id = ?
+             AND session_type = 'telegram'
+             AND revoked_at IS NULL
+             AND user_agent = ?
+             AND created_at >= datetime('now', '-10 minutes')
+           ORDER BY created_at DESC
+           LIMIT 1`
         )
-        .run();
+          .bind(userId, userAgent)
+          .first<{ id: string; expires_at: string }>();
+        if (recentRow && new Date(recentRow.expires_at).getTime() > Date.now()) {
+          sessionId = recentRow.id;
+        }
+      }
+
+      if (sessionId) {
+        await env.DB.prepare('UPDATE sessions SET expires_at = ?, ip_address = ? WHERE id = ?')
+          .bind(expiresAt, clientIp, sessionId)
+          .run();
+      } else {
+        sessionId = newId('sess');
+        const tokenHash = await hashSessionIdentifier(sessionId, jwtSecret);
+        await env.DB.prepare(
+          `INSERT INTO sessions (id, user_id, token_hash, session_type, ip_address, user_agent, expires_at)
+           VALUES (?, ?, ?, 'telegram', ?, ?, ?)`
+        )
+          .bind(sessionId, userId, tokenHash, clientIp, userAgent, expiresAt)
+          .run();
+      }
 
       const jwtToken = await signJwtEdge(
         { sub: userId, tid: tgId, sid: sessionId, adm: isAdmin },
@@ -403,7 +462,8 @@ async function handleAuthRoutes(
         },
         200,
         {
-          'Set-Cookie': `sofumer_session=${jwtToken}; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=604800`,
+          ...AUTH_NO_STORE_HEADERS,
+          'Set-Cookie': buildSessionCookie(jwtToken, isHttps, 604800),
         }
       );
     } catch (err) {
@@ -432,7 +492,8 @@ async function handleAuthRoutes(
                 botUsername: botInfo.botUsername,
               },
             },
-            401
+            401,
+            AUTH_NO_STORE_HEADERS
           );
         }
       }
@@ -446,60 +507,164 @@ async function handleAuthRoutes(
             sessionCreated: false,
           },
         },
-        401
+        401,
+        AUTH_NO_STORE_HEADERS
       );
     }
   }
 
   if (url.pathname === '/api/auth/me') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const user = await resolveEdgeUserSession(request, env);
-    if (!user || !env.DB) {
-      return json({ authenticated: false, user: null });
+    const sessionRes = await resolveEdgeUserSessionDetailed(request, env);
+
+    if (!sessionRes.user || sessionRes.reason === 'user_suspended' || !env.DB) {
+      const reason = !env.DB ? 'db_not_configured' : sessionRes.reason || 'missing_token';
+      const status =
+        reason === 'db_not_configured' || reason === 'jwt_secret_missing'
+          ? 503
+          : reason === 'db_error'
+          ? 500
+          : reason === 'user_suspended'
+          ? 403
+          : 401;
+
+      const errorMessages: Record<string, string> = {
+        db_not_configured: 'Database binding (DB) is not configured.',
+        jwt_secret_missing: 'JWT_SECRET is not configured on the Worker.',
+        missing_token: 'No active session token or cookie was received.',
+        invalid_jwt: 'Session token signature or expiration check failed.',
+        session_not_found: 'Session record was not found in the database.',
+        session_revoked: 'Session has been revoked.',
+        session_expired: 'Session has expired.',
+        telegram_id_mismatch: 'Session identity mismatch.',
+        user_suspended: 'Your account is currently suspended.',
+        db_error: 'Database lookup failed while checking your session.',
+      };
+
+      console.warn(
+        '[SOFUMER Worker /api/auth/me]',
+        JSON.stringify({
+          authenticated: false,
+          status,
+          reason,
+          tokenSource: sessionRes.tokenSource,
+          hasBearer: sessionRes.hasBearer,
+          hasCookie: sessionRes.hasCookie,
+        })
+      );
+
+      return json(
+        {
+          authenticated: false,
+          user: null,
+          reason,
+          error: errorMessages[reason] || 'Authentication session could not be verified.',
+          diagnostics: {
+            tokenSource: sessionRes.tokenSource,
+            hasBearer: sessionRes.hasBearer,
+            hasCookie: sessionRes.hasCookie,
+            jwtConfigured: Boolean((env.JWT_SECRET || '').trim()),
+          },
+        },
+        status,
+        AUTH_NO_STORE_HEADERS
+      );
     }
 
-    const sellerProfile = await env.DB.prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
-      .bind(user.id)
-      .first<Record<string, unknown>>();
+    const user = sessionRes.user;
+    const db = env.DB;
+
+    const safeQuery = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
+      try {
+        return await fn();
+      } catch {
+        return fallback;
+      }
+    };
+
+    const sellerProfile = await safeQuery(
+      () =>
+        db
+          .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
+          .bind(user.id)
+          .first<Record<string, unknown>>(),
+      null
+    );
     const shop = sellerProfile
-      ? await env.DB.prepare(
-          "SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1"
+      ? await safeQuery(
+          () =>
+            db
+              .prepare(
+                "SELECT * FROM shops WHERE seller_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1"
+              )
+              .bind(sellerProfile.id)
+              .first(),
+          null
         )
-          .bind(sellerProfile.id)
-          .first()
       : null;
 
     const [unreadMsgs, unreadNotifs, favorites, aiPerm] = await Promise.all([
-      env.DB.prepare(
-        'SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ? AND is_hidden = 0'
-      )
-        .bind(user.id)
-        .first<{ cnt: number }>(),
-      env.DB.prepare(
-        "SELECT COUNT(*) as cnt FROM notifications WHERE (user_id = ? OR scope = 'global') AND is_read = 0"
-      )
-        .bind(user.id)
-        .first<{ cnt: number }>(),
-      env.DB.prepare('SELECT product_id FROM product_favorites WHERE user_id = ?')
-        .bind(user.id)
-        .all<{ product_id: string }>(),
-      env.DB.prepare('SELECT ai_enabled FROM ai_permissions WHERE user_id = ?')
-        .bind(user.id)
-        .first<{ ai_enabled: number }>(),
+      safeQuery(async () => {
+        try {
+          return await db
+            .prepare(
+              'SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ? AND is_hidden = 0'
+            )
+            .bind(user.id)
+            .first<{ cnt: number }>();
+        } catch {
+          return await db
+            .prepare(
+              'SELECT COALESCE(SUM(unread_count), 0) as cnt FROM conversation_participants WHERE user_id = ?'
+            )
+            .bind(user.id)
+            .first<{ cnt: number }>();
+        }
+      }, { cnt: 0 }),
+      safeQuery(
+        () =>
+          db
+            .prepare(
+              "SELECT COUNT(*) as cnt FROM notifications WHERE (user_id = ? OR scope = 'global') AND is_read = 0"
+            )
+            .bind(user.id)
+            .first<{ cnt: number }>(),
+        { cnt: 0 }
+      ),
+      safeQuery(
+        () =>
+          db
+            .prepare('SELECT product_id FROM product_favorites WHERE user_id = ?')
+            .bind(user.id)
+            .all<{ product_id: string }>(),
+        { results: [] as Array<{ product_id: string }> }
+      ),
+      safeQuery(
+        () =>
+          db
+            .prepare('SELECT ai_enabled FROM ai_permissions WHERE user_id = ?')
+            .bind(user.id)
+            .first<{ ai_enabled: number }>(),
+        null
+      ),
     ]);
 
-    return json({
-      authenticated: true,
-      user: {
-        ...user,
-        aiEnabled: aiPerm ? Boolean(aiPerm.ai_enabled) : true,
+    return json(
+      {
+        authenticated: true,
+        user: {
+          ...user,
+          aiEnabled: aiPerm ? Boolean(aiPerm.ai_enabled) : true,
+        },
+        sellerProfile: sellerProfile || null,
+        shop: shop || null,
+        unreadMessages: unreadMsgs?.cnt || 0,
+        unreadNotifications: unreadNotifs?.cnt || 0,
+        favoriteProductIds: (favorites?.results || []).map((f) => f.product_id),
       },
-      sellerProfile: sellerProfile || null,
-      shop: shop || null,
-      unreadMessages: unreadMsgs?.cnt || 0,
-      unreadNotifications: unreadNotifs?.cnt || 0,
-      favoriteProductIds: favorites.results.map((f) => f.product_id),
-    });
+      200,
+      AUTH_NO_STORE_HEADERS
+    );
   }
 
   if (url.pathname === '/api/auth/logout') {
@@ -512,11 +677,14 @@ async function handleAuthRoutes(
     return json(
       { loggedOut: true },
       200,
-      { 'Set-Cookie': 'sofumer_session=; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=0' }
+      {
+        ...AUTH_NO_STORE_HEADERS,
+        'Set-Cookie': buildSessionCookie('', isHttps, 0),
+      }
     );
   }
 
-  return json({ error: 'Auth API endpoint not found.' }, 404);
+  return json({ error: 'Auth API endpoint not found.' }, 404, AUTH_NO_STORE_HEADERS);
 }
 
 async function handleMediaRoutes(
