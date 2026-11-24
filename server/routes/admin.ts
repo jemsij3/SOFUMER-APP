@@ -1,7 +1,10 @@
+import fs from 'fs';
 import { Router } from 'express';
-import { db, newId, slugify } from '../db.ts';
+import { db, newId, resolveConfinedDigitalPath, slugify } from '../db.ts';
 import { invokeCloudflareWorkersAiJson, logAiUsage } from '../ai.ts';
 import { coerceAiString, resolveActiveCfAiModel, sanitizeAiErrorForUser } from '../../cloudflare/ai-normalizer.ts';
+import { destroyUnreferencedCloudinaryAssetsLocal } from '../cloudinary.ts';
+import { executeLocalShopSoftDelete } from './seller.ts';
 import {
   ADMIN_PERMISSION_CATALOG,
   DEFAULT_CF_AI_MODEL,
@@ -10,6 +13,7 @@ import {
   VALID_PERMISSION_KEYS,
   checkProhibitedKeywords,
   hasAdminPermission,
+  isAuditActionProtected,
   isTelegramIdAdmin,
   recordAdminAudit,
   requireAdmin,
@@ -69,6 +73,30 @@ function validateAndNormalizeSettingLocal(
         return { ok: false, error: `${key} must be between 1 and 10,000 USD.`, status: 400 };
       }
       return { ok: true, value: String(Number(num.toFixed(2))) };
+    }
+    if (key === 'max_product_videos') {
+      if (!Number.isInteger(num) || num < 1 || num > 5) {
+        return { ok: false, error: 'max_product_videos must be a whole number between 1 and 5.', status: 400 };
+      }
+      return { ok: true, value: String(num) };
+    }
+    if (key === 'max_product_image_mb') {
+      if (num < 1 || num > 20) {
+        return { ok: false, error: 'max_product_image_mb must be between 1 and 20 MB.', status: 400 };
+      }
+      return { ok: true, value: String(Number(num.toFixed(1))) };
+    }
+    if (key === 'max_product_video_mb') {
+      if (num < 5 || num > 100) {
+        return { ok: false, error: 'max_product_video_mb must be between 5 and 100 MB.', status: 400 };
+      }
+      return { ok: true, value: String(Number(num.toFixed(1))) };
+    }
+    if (key === 'audit_retention_days') {
+      if (!Number.isInteger(num) || num < 7 || num > 3650) {
+        return { ok: false, error: 'audit_retention_days must be a whole number between 7 and 3,650 days.', status: 400 };
+      }
+      return { ok: true, value: String(num) };
     }
     if (num < 0) {
       return { ok: false, error: `${key} must be a non-negative number.`, status: 400 };
@@ -139,7 +167,9 @@ adminRouter.get('/overview', requireAdminPermission('overview.view'), (_req, res
       `SELECT
          (SELECT COUNT(*) FROM users) as total_users,
          (SELECT COUNT(*) FROM seller_profiles) as total_sellers,
-         (SELECT COUNT(*) FROM shops) as total_shops,
+         (SELECT COUNT(*) FROM shops WHERE status != 'closed') as total_shops,
+         (SELECT COUNT(*) FROM shops WHERE status = 'active') as active_shops,
+         (SELECT COUNT(*) FROM shops WHERE status = 'closed') as closed_shops,
          (SELECT COUNT(*) FROM products) as total_products,
          (SELECT COUNT(*) FROM products WHERE status = 'pending_review') as pending_products,
          (SELECT COUNT(*) FROM orders) as total_orders,
@@ -196,7 +226,7 @@ adminRouter.get('/analytics', requireAdminPermission('analytics.view'), (_req, r
     )
     .get();
   const verificationBreakdown = db
-    .prepare('SELECT verification_status, COUNT(*) as cnt FROM shops GROUP BY verification_status')
+    .prepare("SELECT verification_status, COUNT(*) as cnt FROM shops WHERE status != 'closed' GROUP BY verification_status")
     .all();
 
   res.json({
@@ -288,7 +318,9 @@ adminRouter.get('/sellers', requireAdminPermission(['sellers.manage', 'sellers.s
               s.slug as shop_slug, s.status as shop_status, s.is_featured, s.verification_status as shop_verification_status
        FROM seller_profiles sp
        JOIN users u ON u.id = sp.user_id
-       LEFT JOIN shops s ON s.seller_id = sp.id
+       LEFT JOIN shops s ON s.id = (
+         SELECT s2.id FROM shops s2 WHERE s2.seller_id = sp.id AND s2.status != 'closed' ORDER BY s2.created_at DESC LIMIT 1
+       )
        ORDER BY sp.created_at DESC`
     )
     .all();
@@ -311,11 +343,11 @@ adminRouter.patch('/sellers/:id/status', requireAdminPermission(['sellers.manage
 
   if (['active', 'suspended'].includes(status)) {
     db.prepare("UPDATE seller_profiles SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, seller.id);
-    db.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE seller_id = ?").run(status, seller.id);
+    db.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE seller_id = ? AND status != 'closed'").run(status, seller.id);
   }
   if (verificationStatus && ['unverified', 'pending', 'verified', 'rejected'].includes(verificationStatus)) {
     db.prepare('UPDATE seller_profiles SET verification_status = ? WHERE id = ?').run(verificationStatus, seller.id);
-    db.prepare('UPDATE shops SET verification_status = ? WHERE seller_id = ?').run(verificationStatus, seller.id);
+    db.prepare("UPDATE shops SET verification_status = ? WHERE seller_id = ? AND status != 'closed'").run(verificationStatus, seller.id);
     await notifyUserAndTelegram(
       String(seller.user_id),
       'verification',
@@ -324,7 +356,7 @@ adminRouter.patch('/sellers/:id/status', requireAdminPermission(['sellers.manage
     );
   }
   if (typeof isFeatured === 'boolean') {
-    db.prepare('UPDATE shops SET is_featured = ? WHERE seller_id = ?').run(isFeatured ? 1 : 0, seller.id);
+    db.prepare("UPDATE shops SET is_featured = ? WHERE seller_id = ? AND status != 'closed'").run(isFeatured ? 1 : 0, seller.id);
   }
 
   recordAdminAudit(
@@ -336,6 +368,127 @@ adminRouter.patch('/sellers/:id/status', requireAdminPermission(['sellers.manage
     req.ip || ''
   );
   res.json({ updated: true });
+});
+
+adminRouter.get('/shops', requireAdminPermission(['shops.manage', 'sellers.manage', 'sellers.suspend']), (req, res) => {
+  const statusFilter = String(req.query.status || 'all').toLowerCase();
+  const q = sanitizeText(String(req.query.q || ''), 120).toLowerCase();
+
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (['active', 'suspended', 'closed'].includes(statusFilter)) {
+    where.push('s.status = ?');
+    params.push(statusFilter);
+  }
+  if (q) {
+    where.push('(LOWER(s.name) LIKE ? OR LOWER(s.slug) LIKE ? OR LOWER(u.display_name) LIKE ? OR LOWER(u.telegram_username) LIKE ?)');
+    const pat = `%${q}%`;
+    params.push(pat, pat, pat, pat);
+  }
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const shops = db
+    .prepare(
+      `SELECT s.*, u.display_name as owner_name, u.telegram_username as owner_telegram_username,
+              u.telegram_id as owner_telegram_id, sp.seller_type, sp.legal_name,
+              (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status != 'archived') as product_count,
+              (SELECT COUNT(*) FROM orders o WHERE o.shop_id = s.id) as order_count
+       FROM shops s
+       JOIN users u ON u.id = s.user_id
+       JOIN seller_profiles sp ON sp.id = s.seller_id
+       ${whereClause}
+       ORDER BY CASE WHEN s.status = 'active' THEN 0 WHEN s.status = 'suspended' THEN 1 ELSE 2 END, s.created_at DESC`
+    )
+    .all(...params);
+  res.json({ shops });
+});
+
+adminRouter.patch('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage', 'sellers.suspend']), async (req, res) => {
+  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+  if (!shop) return res.status(404).json({ error: 'Shop not found.' });
+  if (String(shop.status) === 'closed') {
+    return res.status(409).json({ error: 'Closed or deleted shops cannot be modified.' });
+  }
+
+  const status = req.body?.status ? String(req.body.status) : null;
+  const verificationStatus = req.body?.verificationStatus ? String(req.body.verificationStatus) : null;
+  const isFeatured = req.body?.isFeatured;
+
+  if ((verificationStatus || typeof isFeatured === 'boolean') && !hasAdminPermission(req.adminSession!, ['shops.manage', 'sellers.manage'])) {
+    return res.status(403).json({ error: 'Insufficient administrative permissions to change shop verification or featured status.' });
+  }
+
+  if (status && ['active', 'suspended'].includes(status)) {
+    db.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, req.params.id);
+  }
+  if (verificationStatus && ['unverified', 'pending', 'verified', 'rejected'].includes(verificationStatus)) {
+    db.prepare("UPDATE shops SET verification_status = ?, updated_at = datetime('now') WHERE id = ?").run(verificationStatus, req.params.id);
+    db.prepare('UPDATE seller_profiles SET verification_status = ? WHERE id = ?').run(verificationStatus, shop.seller_id);
+    await notifyUserAndTelegram(
+      String(shop.user_id),
+      'verification',
+      `Shop Verification: ${verificationStatus.toUpperCase()}`,
+      `Verification status for "${String(shop.name)}" is now ${verificationStatus}.`
+    );
+  }
+  if (typeof isFeatured === 'boolean') {
+    db.prepare("UPDATE shops SET is_featured = ?, updated_at = datetime('now') WHERE id = ?").run(isFeatured ? 1 : 0, req.params.id);
+  }
+
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'shop.updated', 'shop', req.params.id, { status, verificationStatus, isFeatured }, req.ip || '');
+  res.json({ updated: true });
+});
+
+adminRouter.delete('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage']), async (req, res) => {
+  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+  if (!shop) return res.status(404).json({ error: 'Shop not found.' });
+  if (String(shop.status) === 'closed') {
+    return res.status(409).json({ error: 'Shop has already been deleted/closed.' });
+  }
+
+  const confirmFlag = req.body?.confirm === true;
+  const confirmName = sanitizeText(req.body?.confirmShopName || '', 120);
+  const reason = sanitizeText(req.body?.reason || '', 300);
+
+  if (!confirmFlag && confirmName !== String(shop.name)) {
+    return res.status(400).json({ error: 'Explicit shop deletion confirmation is required.' });
+  }
+
+  const result = await executeLocalShopSoftDelete(shop, req.adminSession!.adminIdentifier, reason);
+  if (result.ok === false) {
+    return res.status(result.status).json({ error: result.error });
+  }
+
+  await notifyUserAndTelegram(
+    String(shop.user_id),
+    'moderation',
+    `Shop Removed: ${String(shop.name)}`,
+    reason
+      ? `Your shop "${String(shop.name)}" was closed by SOFUMER Administration. Reason: ${reason}`
+      : `Your shop "${String(shop.name)}" was closed by SOFUMER Administration. Historical orders remain accessible in your account.`
+  );
+
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'shop.deleted',
+    'shop',
+    req.params.id,
+    {
+      shopName: shop.name,
+      ownerUserId: shop.user_id,
+      reason,
+      archivedProductsCount: result.archivedProductsCount,
+      deletedProductsCount: result.deletedProductsCount,
+    },
+    req.ip || '',
+    true
+  );
+
+  res.json({
+    deleted: true,
+    shopId: result.shopId,
+    archivedProductsCount: result.archivedProductsCount,
+    deletedProductsCount: result.deletedProductsCount,
+  });
 });
 
 // ============================================================================
@@ -354,6 +507,73 @@ adminRouter.get('/products', requireAdminPermission(['moderation.manage', 'catal
     )
     .all();
   res.json({ products });
+});
+
+adminRouter.delete('/products/:id', requireAdminPermission('moderation.manage'), async (req, res) => {
+  const prodId = req.params.id;
+  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(prodId) as Record<string, unknown> | undefined;
+  if (!product) return res.status(404).json({ error: 'Product not found.' });
+
+  const reason = sanitizeText(req.body?.reason || '', 300);
+  const hasOrder = db.prepare('SELECT id FROM order_items WHERE product_id = ? LIMIT 1').get(prodId);
+  const hasReview = db.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').get(prodId);
+
+  let mode: 'archived' | 'deleted' = 'deleted';
+  if (hasOrder || hasReview) {
+    mode = 'archived';
+    db.transaction(() => {
+      db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(prodId);
+      db.prepare(
+        "UPDATE products SET status = 'archived', is_featured = 0, is_sponsored = 0, moderation_notes = ?, updated_at = datetime('now') WHERE id = ?"
+      ).run(reason || String(product.moderation_notes || ''), prodId);
+    })();
+  } else {
+    const mediaRows = db
+      .prepare('SELECT public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+      .all(prodId) as Array<Record<string, unknown>>;
+    const digitalAsset = db
+      .prepare('SELECT storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?')
+      .get(prodId) as { storage_provider: string; storage_key: string } | undefined;
+
+    if (digitalAsset?.storage_provider === 'local' && digitalAsset.storage_key) {
+      const fp = resolveConfinedDigitalPath(digitalAsset.storage_key);
+      if (fp && fs.existsSync(fp)) fs.unlinkSync(fp);
+    }
+
+    db.transaction(() => {
+      db.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').run(prodId);
+      db.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM inquiries WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_images WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_media WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM products WHERE id = ?').run(prodId);
+    })();
+
+    await destroyUnreferencedCloudinaryAssetsLocal(mediaRows);
+  }
+
+  await notifyUserAndTelegram(
+    String(product.seller_user_id),
+    'moderation',
+    `Listing ${mode === 'archived' ? 'Archived' : 'Removed'}: ${String(product.title)}`,
+    reason || `Your listing "${String(product.title)}" was ${mode} by an administrator.`
+  );
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'product.deleted',
+    'product',
+    prodId,
+    { title: product.title, mode, reason },
+    req.ip || '',
+    true
+  );
+  res.json({ deleted: true, mode, productId: prodId });
 });
 
 adminRouter.patch('/products/:id/moderate', requireAdminPermission('moderation.manage'), async (req, res) => {
@@ -543,6 +763,29 @@ adminRouter.patch('/categories/:id', requireAdminPermission('catalog.manage'), (
   res.json({ updated: true });
 });
 
+adminRouter.delete('/categories/:id', requireAdminPermission('catalog.manage'), (req, res) => {
+  const existing = db.prepare('SELECT id, name FROM categories WHERE id = ?').get(req.params.id) as
+    | { id: string; name: string }
+    | undefined;
+  if (!existing) return res.status(404).json({ error: 'Category not found.' });
+
+  const subCnt = db.prepare('SELECT COUNT(*) as cnt FROM subcategories WHERE category_id = ?').get(req.params.id) as {
+    cnt: number;
+  };
+  const prodCnt = db.prepare('SELECT COUNT(*) as cnt FROM products WHERE category_id = ?').get(req.params.id) as {
+    cnt: number;
+  };
+  if (subCnt.cnt > 0 || prodCnt.cnt > 0) {
+    return res
+      .status(409)
+      .json({ error: 'Category is referenced by existing subcategories or listings and cannot be deleted. Deactivate it instead.' });
+  }
+
+  db.prepare('DELETE FROM categories WHERE id = ?').run(req.params.id);
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'category.deleted', 'category', req.params.id, { name: existing.name }, req.ip || '');
+  res.json({ deleted: true, id: req.params.id });
+});
+
 adminRouter.post('/subcategories', requireAdminPermission('catalog.manage'), (req, res) => {
   const categoryId = sanitizeText(req.body?.categoryId || '', 64);
   const name = sanitizeText(req.body?.name || '', 80);
@@ -576,6 +819,22 @@ adminRouter.patch('/subcategories/:id', requireAdminPermission('catalog.manage')
   db.prepare('UPDATE subcategories SET name = ?, is_active = ? WHERE id = ?').run(name, isActive, req.params.id);
   recordAdminAudit(req.adminSession!.adminIdentifier, 'subcategory.updated', 'subcategory', req.params.id, { name, isActive: Boolean(isActive) }, req.ip || '');
   res.json({ updated: true });
+});
+
+adminRouter.delete('/subcategories/:id', requireAdminPermission('catalog.manage'), (req, res) => {
+  const existing = db.prepare('SELECT id, name FROM subcategories WHERE id = ?').get(req.params.id) as
+    | { id: string; name: string }
+    | undefined;
+  if (!existing) return res.status(404).json({ error: 'Subcategory not found.' });
+  const prodCnt = db.prepare('SELECT COUNT(*) as cnt FROM products WHERE subcategory_id = ?').get(req.params.id) as {
+    cnt: number;
+  };
+  if (prodCnt.cnt > 0) {
+    return res.status(409).json({ error: 'Subcategory is referenced by existing listings and cannot be deleted.' });
+  }
+  db.prepare('DELETE FROM subcategories WHERE id = ?').run(req.params.id);
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'subcategory.deleted', 'subcategory', req.params.id, { name: existing.name }, req.ip || '');
+  res.json({ deleted: true, id: req.params.id });
 });
 
 // ============================================================================
@@ -690,6 +949,38 @@ adminRouter.patch('/reviews/:id', requireAdminPermission('reviews.manage'), (req
 
   recordAdminAudit(req.adminSession!.adminIdentifier, 'review.moderated', 'review', req.params.id, { status }, req.ip || '');
   res.json({ updated: true });
+});
+
+adminRouter.delete('/reviews/:id', requireAdminPermission('reviews.manage'), (req, res) => {
+  const review = db
+    .prepare('SELECT id, product_id, shop_id FROM reviews WHERE id = ?')
+    .get(req.params.id) as { id: string; product_id: string; shop_id: string } | undefined;
+  if (!review) return res.status(404).json({ error: 'Review not found.' });
+
+  db.transaction(() => {
+    db.prepare("UPDATE reviews SET status = 'removed' WHERE id = ?").run(review.id);
+
+    const prodAgg = db
+      .prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE product_id = ? AND status = 'published'")
+      .get(review.product_id) as { avg_r: number; cnt: number };
+    db.prepare('UPDATE products SET rating_avg = ?, review_count = ? WHERE id = ?').run(
+      Number((prodAgg.avg_r || 0).toFixed(2)),
+      prodAgg.cnt,
+      review.product_id
+    );
+
+    const shopAgg = db
+      .prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE shop_id = ? AND status = 'published'")
+      .get(review.shop_id) as { avg_r: number; cnt: number };
+    db.prepare('UPDATE shops SET rating_avg = ?, review_count = ? WHERE id = ?').run(
+      Number((shopAgg.avg_r || 0).toFixed(2)),
+      shopAgg.cnt,
+      review.shop_id
+    );
+  })();
+
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'review.removed', 'review', req.params.id, { status: 'removed' }, req.ip || '');
+  res.json({ deleted: true, id: req.params.id });
 });
 
 // ============================================================================
@@ -968,6 +1259,19 @@ adminRouter.patch('/support/:id', requireAdminPermission('support.manage'), asyn
   res.json({ updated: true });
 });
 
+adminRouter.delete('/support/:id', requireAdminPermission('support.manage'), (req, res) => {
+  const ticket = db
+    .prepare('SELECT id, subject, status FROM support_tickets WHERE id = ?')
+    .get(req.params.id) as { id: string; subject: string; status: string } | undefined;
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found.' });
+  if (!['resolved', 'closed'].includes(ticket.status)) {
+    return res.status(409).json({ error: 'Only resolved or closed support tickets can be deleted.' });
+  }
+  db.prepare('DELETE FROM support_tickets WHERE id = ?').run(req.params.id);
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'support.deleted', 'support_ticket', req.params.id, { subject: ticket.subject }, req.ip || '');
+  res.json({ deleted: true, id: req.params.id });
+});
+
 adminRouter.get('/notifications', requireAdminPermission('notifications.manage'), (_req, res) => {
   const notifications = db
     .prepare(
@@ -998,6 +1302,35 @@ adminRouter.post('/notifications/broadcast', requireAdminPermission('notificatio
 
   recordAdminAudit(req.adminSession!.adminIdentifier, 'notification.broadcast', 'global', id, { title }, req.ip || '');
   res.status(201).json({ broadcast: true, id });
+});
+
+adminRouter.delete('/notifications/:id', requireAdminPermission('notifications.manage'), (req, res) => {
+  const notif = db
+    .prepare('SELECT id, title, body, scope FROM notifications WHERE id = ?')
+    .get(req.params.id) as { id: string; title: string; body: string; scope: string } | undefined;
+  if (!notif) return res.status(404).json({ error: 'Notification not found.' });
+
+  db.prepare('DELETE FROM notifications WHERE id = ?').run(req.params.id);
+
+  const bannerRow = db.prepare("SELECT value FROM platform_settings WHERE key = 'marketplace_announcement'").get() as
+    | { value: string }
+    | undefined;
+  if (bannerRow && bannerRow.value === `${notif.title} — ${notif.body}`) {
+    db.prepare("UPDATE platform_settings SET value = '', updated_by = ?, updated_at = datetime('now') WHERE key = 'marketplace_announcement'").run(
+      req.adminSession!.adminIdentifier
+    );
+  }
+
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'notification.deleted',
+    notif.scope || 'global',
+    req.params.id,
+    { title: notif.title },
+    req.ip || '',
+    true
+  );
+  res.json({ deleted: true, id: req.params.id });
 });
 
 adminRouter.get('/settings', requireAdminPermission(['settings.manage', 'rbac.manage']), (_req, res) => {
@@ -1360,9 +1693,241 @@ adminRouter.delete('/role-assignments/:id', requireAdminPermission('rbac.manage'
   res.json({ deleted: true });
 });
 
-adminRouter.get('/audit-logs', requireAdminPermission('audit.view'), (_req, res) => {
+adminRouter.get('/audit-logs', requireAdminPermission('audit.view'), (req, res) => {
+  const scope = String(req.query.scope || 'active').toLowerCase();
+  const q = sanitizeText(String(req.query.q || ''), 120).toLowerCase();
+
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (scope === 'archived') {
+    where.push('a.is_archived = 1');
+  } else if (scope === 'active') {
+    where.push('a.is_archived = 0');
+  }
+  if (q) {
+    where.push(
+      '(LOWER(a.admin_identifier) LIKE ? OR LOWER(a.action) LIKE ? OR LOWER(a.target_type) LIKE ? OR LOWER(a.target_id) LIKE ? OR LOWER(a.details_json) LIKE ?)'
+    );
+    const pat = `%${q}%`;
+    params.push(pat, pat, pat, pat, pat);
+  }
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
   const logs = db
-    .prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 150')
-    .all();
-  res.json({ logs });
+    .prepare(
+      `SELECT a.*, COALESCE(NULLIF(a.archived_by, ''), arch.archived_by, '') as archive_actor,
+              COALESCE(arch.reason, '') as archive_reason
+       FROM admin_audit_logs a
+       LEFT JOIN admin_audit_log_archives arch ON arch.log_id = a.id
+       ${whereClause}
+       ORDER BY a.created_at DESC LIMIT 200`
+    )
+    .all(...params) as Array<Record<string, unknown>>;
+
+  const summaryRow = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN is_archived = 0 THEN 1 ELSE 0 END) as active_count,
+         SUM(CASE WHEN is_archived = 1 THEN 1 ELSE 0 END) as archived_count,
+         SUM(CASE WHEN is_protected = 1 THEN 1 ELSE 0 END) as protected_count
+       FROM admin_audit_logs`
+    )
+    .get() as { active_count: number; archived_count: number; protected_count: number };
+
+  const retRow = db.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").get() as
+    | { value: string }
+    | undefined;
+  const retentionDays = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+
+  res.json({
+    logs: logs.map((r) => ({
+      ...r,
+      is_protected: Number(r.is_protected || 0) === 1 || isAuditActionProtected(String(r.action || '')) ? 1 : 0,
+    })),
+    retentionDays,
+    summary: {
+      activeCount: Number(summaryRow?.active_count || 0),
+      archivedCount: Number(summaryRow?.archived_count || 0),
+      protectedCount: Number(summaryRow?.protected_count || 0),
+    },
+  });
+});
+
+adminRouter.post('/audit-logs/archive', requireAdminPermission('audit.manage'), (req, res) => {
+  const admin = req.adminSession!;
+  const ids = Array.isArray(req.body?.ids)
+    ? (req.body.ids as unknown[]).map((id) => sanitizeText(String(id || ''), 80)).filter(Boolean)
+    : [];
+  const reason = sanitizeText(req.body?.reason || 'Archived per audit retention policy', 300);
+
+  const retRow = db.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").get() as
+    | { value: string }
+    | undefined;
+  const defaultRetention = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+  const olderThanDaysRaw = Number(req.body?.olderThanDays ?? defaultRetention);
+  const olderThanDays = Number.isFinite(olderThanDaysRaw)
+    ? Math.min(3650, Math.max(7, Math.floor(olderThanDaysRaw)))
+    : defaultRetention;
+
+  let targetIds: string[] = [];
+  if (ids.length > 0) {
+    const ph = ids.map(() => '?').join(', ');
+    const rows = db
+      .prepare(`SELECT id FROM admin_audit_logs WHERE is_archived = 0 AND id IN (${ph})`)
+      .all(...ids) as Array<{ id: string }>;
+    targetIds = rows.map((r) => r.id);
+  } else {
+    const rows = db
+      .prepare(
+        `SELECT id FROM admin_audit_logs WHERE is_archived = 0 AND datetime(created_at) <= datetime('now', '-' || ? || ' days')`
+      )
+      .all(olderThanDays) as Array<{ id: string }>;
+    targetIds = rows.map((r) => r.id);
+  }
+
+  db.transaction(() => {
+    const insArch = db.prepare(
+      `INSERT OR REPLACE INTO admin_audit_log_archives (log_id, archived_by, reason, archived_at)
+       VALUES (?, ?, ?, datetime('now'))`
+    );
+    const updLog = db.prepare(
+      `UPDATE admin_audit_logs SET is_archived = 1, archived_at = datetime('now'), archived_by = ? WHERE id = ?`
+    );
+    for (const logId of targetIds) {
+      updLog.run(admin.adminIdentifier, logId);
+      insArch.run(logId, admin.adminIdentifier, reason);
+    }
+  })();
+
+  recordAdminAudit(
+    admin.adminIdentifier,
+    'audit.logs_archived',
+    'audit_logs',
+    ids.length ? 'selected' : 'retention',
+    {
+      archivedCount: targetIds.length,
+      mode: ids.length ? 'ids' : 'older_than_days',
+      olderThanDays,
+      reason,
+    },
+    req.ip || '',
+    true
+  );
+
+  res.json({ archivedCount: targetIds.length, olderThanDays });
+});
+
+adminRouter.delete('/audit-logs', requireAdminPermission('audit.manage'), (req, res) => {
+  const admin = req.adminSession!;
+  const ids = Array.isArray(req.body?.ids)
+    ? (req.body.ids as unknown[]).map((id) => sanitizeText(String(id || ''), 80)).filter(Boolean)
+    : [];
+  const scope = String(req.body?.scope || 'eligible').toLowerCase();
+
+  const retRow = db.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").get() as
+    | { value: string }
+    | undefined;
+  const defaultRetention = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+  const olderThanDaysRaw = Number(req.body?.olderThanDays ?? defaultRetention);
+  const olderThanDays = Number.isFinite(olderThanDaysRaw)
+    ? Math.min(3650, Math.max(7, Math.floor(olderThanDaysRaw)))
+    : defaultRetention;
+
+  let candidates: Array<{ id: string; admin_identifier: string; action: string; is_protected: number }> = [];
+  if (ids.length > 0) {
+    const ph = ids.map(() => '?').join(', ');
+    candidates = db
+      .prepare(`SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE id IN (${ph})`)
+      .all(...ids) as Array<{ id: string; admin_identifier: string; action: string; is_protected: number }>;
+  } else if (scope === 'archived') {
+    candidates = db
+      .prepare('SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE is_archived = 1')
+      .all() as Array<{ id: string; admin_identifier: string; action: string; is_protected: number }>;
+  } else {
+    candidates = db
+      .prepare(
+        `SELECT id, admin_identifier, action, is_protected
+         FROM admin_audit_logs
+         WHERE datetime(created_at) <= datetime('now', '-' || ? || ' days')`
+      )
+      .all(olderThanDays) as Array<{ id: string; admin_identifier: string; action: string; is_protected: number }>;
+  }
+
+  const deletableIds: string[] = [];
+  let skippedProtectedCount = 0;
+
+  for (const row of candidates) {
+    const act = String(row.action || '');
+    const isProtectedRow = Number(row.is_protected || 0) === 1 || isAuditActionProtected(act);
+    const isSelfSensitive =
+      String(row.admin_identifier || '') === admin.adminIdentifier &&
+      (act.startsWith('audit.') || act.startsWith('rbac.') || isProtectedRow);
+    if (isProtectedRow || isSelfSensitive) {
+      skippedProtectedCount++;
+      continue;
+    }
+    deletableIds.push(row.id);
+  }
+
+  if (deletableIds.length > 0) {
+    db.transaction(() => {
+      const delArch = db.prepare('DELETE FROM admin_audit_log_archives WHERE log_id = ?');
+      const delLog = db.prepare('DELETE FROM admin_audit_logs WHERE id = ?');
+      for (const id of deletableIds) {
+        delArch.run(id);
+        delLog.run(id);
+      }
+    })();
+  }
+
+  recordAdminAudit(
+    admin.adminIdentifier,
+    'audit.logs_deleted',
+    'audit_logs',
+    ids.length ? 'selected' : scope,
+    {
+      deletedCount: deletableIds.length,
+      skippedProtectedCount,
+      mode: ids.length ? 'ids' : scope,
+      olderThanDays,
+    },
+    req.ip || '',
+    true
+  );
+
+  res.json({ deletedCount: deletableIds.length, skippedProtectedCount });
+});
+
+adminRouter.delete('/audit-logs/:id', requireAdminPermission('audit.manage'), (req, res) => {
+  const admin = req.adminSession!;
+  const logId = req.params.id;
+  const row = db
+    .prepare('SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE id = ?')
+    .get(logId) as { id: string; admin_identifier: string; action: string; is_protected: number } | undefined;
+  if (!row) return res.status(404).json({ error: 'Audit log entry not found.' });
+
+  const act = String(row.action || '');
+  const isProtectedRow = Number(row.is_protected || 0) === 1 || isAuditActionProtected(act);
+  const isSelfSensitive =
+    String(row.admin_identifier || '') === admin.adminIdentifier &&
+    (act.startsWith('audit.') || act.startsWith('rbac.') || isProtectedRow);
+  if (isProtectedRow || isSelfSensitive) {
+    return res.status(403).json({ error: 'Protected audit and critical security logs cannot be deleted.' });
+  }
+
+  db.transaction(() => {
+    db.prepare('DELETE FROM admin_audit_log_archives WHERE log_id = ?').run(logId);
+    db.prepare('DELETE FROM admin_audit_logs WHERE id = ?').run(logId);
+  })();
+
+  recordAdminAudit(
+    admin.adminIdentifier,
+    'audit.logs_deleted',
+    'audit_log',
+    logId,
+    { deletedCount: 1, deletedAction: act, mode: 'single' },
+    req.ip || '',
+    true
+  );
+  res.json({ deleted: true, deletedCount: 1, id: logId });
 });

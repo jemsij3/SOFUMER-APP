@@ -2350,5 +2350,808 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const refreshedRow = await env.DB.prepare("SELECT model_name FROM ai_feature_settings WHERE feature_key = 'global_ai'").first();
     expect(refreshedRow?.model_name).toBe('@cf/meta/llama-3.1-8b-instruct-fast');
   });
+
+  it('23. Admin & Seller Shop Deletion soft-closes shop, archives ordered products, deletes clean products, destroys exclusive Cloudinary shop logo, preserves orders, and allows re-registration', async () => {
+    const destroyCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const targetUrl = typeof input === 'string' ? input : input.url;
+      if (targetUrl.includes('api.cloudinary.com') && targetUrl.includes('/destroy')) {
+        destroyCalls.push({ url: targetUrl, body: String(init?.body || '') });
+        return new Response(JSON.stringify({ result: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      const testEnv = {
+        ...env,
+        TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+        TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+        JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+        ADMIN_TELEGRAM_IDS: '999001',
+        CLOUDINARY_CLOUD_NAME: 'sofumer-test-cloud',
+        CLOUDINARY_API_KEY: 'test-cld-key',
+        CLOUDINARY_API_SECRET: 'test-cld-secret',
+      };
+
+      const callWorker = async (path, init = {}, customEnv = testEnv) => {
+        const ctx = createExecutionContext();
+        const res = await worker.fetch(
+          new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init),
+          customEnv,
+          ctx
+        );
+        await waitOnExecutionContext(ctx);
+        return res;
+      };
+
+      const login = async (id, username) => {
+        const initData = await signTelegramInitData({ id, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+        const res = await callWorker('/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        });
+        const authData = await res.json();
+        const meRes = await callWorker('/api/auth/me', {
+          headers: { Authorization: `Bearer ${authData.token}` },
+        });
+        const meData = await meRes.json();
+        return { ...authData, user: meData.user };
+      };
+
+      const seller = await login(910001, 'shop_del_seller');
+      const buyer = await login(910002, 'shop_del_buyer');
+      const admin = await login(999001, 'shop_del_admin');
+
+      const shopLogoUrl = `https://res.cloudinary.com/${testEnv.CLOUDINARY_CLOUD_NAME}/image/upload/v1/sofumer/shops/${seller.user.id}/shop_logo_test.jpg`;
+      const regRes = await callWorker('/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Closure Test Merchant',
+          shopName: 'Closure Boutique',
+          countryCode: 'US',
+          logoUrl: shopLogoUrl,
+        }),
+      });
+      expect(regRes.status).toBe(201);
+      const { shop } = await regRes.json();
+
+      // Product without orders (cleanly removed)
+      const cleanProdRes = await callWorker('/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Unordered Clean Widget',
+          description: 'No orders yet.',
+          categoryId: 'cat_electronics',
+          price: 15,
+          currency: 'USD',
+          status: 'published',
+        }),
+      });
+      const { product: cleanProd } = await cleanProdRes.json();
+
+      // Product with an order (must be archived, not hard-deleted)
+      const ordProdRes = await callWorker('/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Ordered Historical Gadget',
+          description: 'Has real order history.',
+          categoryId: 'cat_electronics',
+          price: 80,
+          currency: 'USD',
+          status: 'published',
+        }),
+      });
+      const { product: orderedProd } = await ordProdRes.json();
+
+      const ordRes = await callWorker('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          productId: orderedProd.id,
+          buyerUserId: buyer.user.id,
+          quantity: 1,
+          agreedTotal: 80,
+          currency: 'USD',
+        }),
+      });
+      expect(ordRes.status).toBe(201);
+      const { orderId } = await ordRes.json();
+
+      // Missing confirmation rejected
+      const badConfirmRes = await callWorker(`/api/admin/shops/${shop.id}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+        body: JSON.stringify({ confirm: false, reason: 'missing confirm' }),
+      });
+      expect(badConfirmRes.status).toBe(400);
+
+      // Valid Admin Delete Shop
+      const delRes = await callWorker(`/api/admin/shops/${shop.id}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+        body: JSON.stringify({
+          confirm: true,
+          confirmShopName: 'Closure Boutique',
+          reason: 'Policy enforcement test',
+        }),
+      });
+      expect(delRes.status).toBe(200);
+      const delJson = await delRes.json();
+      expect(delJson.deleted).toBe(true);
+      expect(delJson.archivedProductsCount).toBe(1);
+      expect(delJson.deletedProductsCount).toBe(1);
+
+      // Exclusive shop logo destroyed on Cloudinary
+      expect(destroyCalls.some((c) => decodeURIComponent(c.body).includes(`sofumer/shops/${seller.user.id}/shop_logo_test`))).toBe(true);
+
+      // Public shop & ordered product hidden; clean product deleted
+      const pubShopRes = await callWorker(`/api/marketplace/shops/${shop.slug}`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      });
+      expect(pubShopRes.status).toBe(404);
+
+      const pubProdRes = await callWorker(`/api/marketplace/products/${orderedProd.id}`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      });
+      expect(pubProdRes.status).toBe(404);
+
+      const cleanRow = await env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(cleanProd.id).first();
+      expect(cleanRow).toBeNull();
+
+      // Historical order preserved & accessible
+      const histOrdRes = await callWorker(`/api/orders/${orderId}`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      });
+      expect(histOrdRes.status).toBe(200);
+
+      // Admin shops filter & PATCH protection on closed shop
+      const closedListRes = await callWorker('/api/admin/shops?status=closed', {
+        headers: { Authorization: `Bearer ${admin.token}` },
+      });
+      expect(closedListRes.status).toBe(200);
+      const closedListJson = await closedListRes.json();
+      expect(closedListJson.shops.some((s) => s.id === shop.id && s.status === 'closed')).toBe(true);
+
+      const patchClosedRes = await callWorker(`/api/admin/shops/${shop.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+        body: JSON.stringify({ status: 'active' }),
+      });
+      expect(patchClosedRes.status).toBe(409);
+
+      // Protected audit log created
+      const auditRow = await env.DB.prepare("SELECT * FROM admin_audit_logs WHERE action = 'shop.deleted' AND target_id = ?")
+        .bind(shop.id)
+        .first();
+      expect(auditRow).not.toBeNull();
+      expect(Number(auditRow.is_protected)).toBe(1);
+
+      // Owner can re-register a new shop, then self-delete it via DELETE /api/seller/shop
+      const reRegRes = await callWorker('/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Second Act Merchant',
+          shopName: 'Second Act Studio',
+          countryCode: 'US',
+        }),
+      });
+      expect(reRegRes.status).toBe(201);
+      const { shop: secondShop } = await reRegRes.json();
+
+      const wrongSelfRes = await callWorker('/api/seller/shop', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ confirmShopName: 'Wrong Shop Name' }),
+      });
+      expect(wrongSelfRes.status).toBe(400);
+
+      const selfDelRes = await callWorker('/api/seller/shop', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+        body: JSON.stringify({ confirmShopName: 'Second Act Studio', reason: 'Closing voluntarily' }),
+      });
+      expect(selfDelRes.status).toBe(200);
+      const selfDelJson = await selfDelRes.json();
+      expect(selfDelJson.deleted).toBe(true);
+      expect(selfDelJson.shopId).toBe(secondShop.id);
+
+      const pubSecondRes = await callWorker(`/api/marketplace/shops/${secondShop.slug}`, {
+        headers: { Authorization: `Bearer ${buyer.token}` },
+      });
+      expect(pubSecondRes.status).toBe(404);
+
+      const ownerAudit = await env.DB.prepare("SELECT * FROM admin_audit_logs WHERE action = 'shop.deleted_by_owner' AND target_id = ?")
+        .bind(secondShop.id)
+        .first();
+      expect(ownerAudit).not.toBeNull();
+      expect(Number(ownerAudit.is_protected)).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('24. Audit Logs Governance enforces audit.view vs audit.manage separation, archiving, protected-log preservation, and retention validation', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callWorker = async (path, init = {}) => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return res;
+    };
+
+    const login = async (id, username) => {
+      const initData = await signTelegramInitData({ id, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const res = await callWorker('/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData }),
+      });
+      return await res.json();
+    };
+
+    const ownerAdmin = await login(999001, 'audit_owner');
+    const auditViewerTgId = '910050';
+    await login(910050, 'audit_viewer');
+
+    // Create view-only audit role & assign to 910050
+    const roleRes = await callWorker('/api/admin/roles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({
+        code: `AUD_VIEW_${Date.now().toString().slice(-4)}`,
+        name: 'Audit Viewer',
+        permissions: ['overview.view', 'audit.view'],
+      }),
+    });
+    expect(roleRes.status).toBe(201);
+    const { id: viewerRoleId } = await roleRes.json();
+
+    const assignRes = await callWorker('/api/admin/role-assignments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ telegramId: auditViewerTgId, roleId: viewerRoleId, displayLabel: 'Audit Reader' }),
+    });
+    expect(assignRes.status).toBe(201);
+    const { id: assignId } = await assignRes.json();
+
+    const viewerSession = await login(910050, 'audit_viewer');
+
+    // Create two routine unprotected logs and one protected log
+    const catRes = await callWorker('/api/admin/categories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ name: 'Audit Temp Cat', description: 'Routine log generator' }),
+    });
+    expect(catRes.status).toBe(201);
+    const { id: tempCatId } = await catRes.json();
+
+    await callWorker(`/api/admin/categories/${tempCatId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ description: 'Updated routine log generator' }),
+    });
+
+    // Viewer can read audit logs (200)
+    const viewRes = await callWorker('/api/admin/audit-logs?scope=active', {
+      headers: { Authorization: `Bearer ${viewerSession.token}` },
+    });
+    expect(viewRes.status).toBe(200);
+    const viewJson = await viewRes.json();
+    expect(Array.isArray(viewJson.logs)).toBe(true);
+    expect(typeof viewJson.retentionDays).toBe('number');
+    expect(viewJson.summary).toBeDefined();
+
+    const routineLog = viewJson.logs.find((l) => l.action === 'category.created' && l.target_id === tempCatId);
+    const routineUpdateLog = viewJson.logs.find((l) => l.action === 'category.updated' && l.target_id === tempCatId);
+    const protectedLog = viewJson.logs.find((l) => Number(l.is_protected) === 1);
+    expect(routineLog).toBeDefined();
+    expect(routineUpdateLog).toBeDefined();
+    expect(protectedLog).toBeDefined();
+
+    // Viewer CANNOT archive or delete audit logs (403)
+    const viewerArchRes = await callWorker('/api/admin/audit-logs/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${viewerSession.token}` },
+      body: JSON.stringify({ ids: [routineLog.id] }),
+    });
+    expect(viewerArchRes.status).toBe(403);
+
+    const viewerBulkDelRes = await callWorker('/api/admin/audit-logs', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${viewerSession.token}` },
+      body: JSON.stringify({ ids: [routineLog.id] }),
+    });
+    expect(viewerBulkDelRes.status).toBe(403);
+
+    const viewerSingleDelRes = await callWorker(`/api/admin/audit-logs/${routineLog.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${viewerSession.token}` },
+    });
+    expect(viewerSingleDelRes.status).toBe(403);
+
+    // Owner archives the routine log
+    const archiveRes = await callWorker('/api/admin/audit-logs/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ ids: [routineLog.id], reason: 'Quarterly archive rotation' }),
+    });
+    expect(archiveRes.status).toBe(200);
+    const archiveJson = await archiveRes.json();
+    expect(archiveJson.archivedCount).toBe(1);
+
+    const archivedListRes = await callWorker('/api/admin/audit-logs?scope=archived', {
+      headers: { Authorization: `Bearer ${ownerAdmin.token}` },
+    });
+    expect(archivedListRes.status).toBe(200);
+    const archivedListJson = await archivedListRes.json();
+    const archivedEntry = archivedListJson.logs.find((l) => l.id === routineLog.id);
+    expect(archivedEntry).toBeDefined();
+    expect(archivedEntry.archive_reason).toBe('Quarterly archive rotation');
+
+    // Protected log single deletion rejected (403)
+    const protDelRes = await callWorker(`/api/admin/audit-logs/${protectedLog.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${ownerAdmin.token}` },
+    });
+    expect(protDelRes.status).toBe(403);
+
+    // Bulk delete deletes routine/unprotected log while skipping protected log
+    const bulkDelRes = await callWorker('/api/admin/audit-logs', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ ids: [routineUpdateLog.id, protectedLog.id] }),
+    });
+    expect(bulkDelRes.status).toBe(200);
+    const bulkDelJson = await bulkDelRes.json();
+    expect(bulkDelJson.deletedCount).toBe(1);
+    expect(bulkDelJson.skippedProtectedCount).toBe(1);
+
+    // Confirm protected log still exists and audit.logs_deleted entry was created
+    const stillThere = await env.DB.prepare('SELECT id FROM admin_audit_logs WHERE id = ?').bind(protectedLog.id).first();
+    expect(stillThere).not.toBeNull();
+    const auditDelEntry = await env.DB.prepare("SELECT id FROM admin_audit_logs WHERE action = 'audit.logs_deleted'").first();
+    expect(auditDelEntry).not.toBeNull();
+
+    // Retention window validation (2 days invalid -> 400, 120 days valid -> 200)
+    const badRetRes = await callWorker('/api/admin/settings/audit_retention_days', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ value: '2' }),
+    });
+    expect(badRetRes.status).toBe(400);
+
+    const goodRetRes = await callWorker('/api/admin/settings/audit_retention_days', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerAdmin.token}` },
+      body: JSON.stringify({ value: '120' }),
+    });
+    expect(goodRetRes.status).toBe(200);
+
+    // Cleanup temp role assignment and category
+    await callWorker(`/api/admin/role-assignments/${assignId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${ownerAdmin.token}` },
+    });
+    await callWorker(`/api/admin/categories/${tempCatId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${ownerAdmin.token}` },
+    });
+  });
+
+  it('25. Application-wide Delete endpoints enforce ownership, historical guards, global announcement safety, and review rating recalculation', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callWorker = async (path, init = {}) => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init),
+        testEnv,
+        ctx
+      );
+      await waitOnExecutionContext(ctx);
+      return res;
+    };
+
+    const login = async (id, username) => {
+      const initData = await signTelegramInitData({ id, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const res = await callWorker('/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData }),
+      });
+      const authData = await res.json();
+      const meRes = await callWorker('/api/auth/me', {
+        headers: { Authorization: `Bearer ${authData.token}` },
+      });
+      const meData = await meRes.json();
+      return { ...authData, user: meData.user };
+    };
+
+    const seller = await login(920001, 'appdel_seller');
+    const buyer = await login(920002, 'appdel_buyer');
+    const admin = await login(999001, 'appdel_admin');
+
+    const regRes = await callWorker('/api/seller/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({
+        sellerType: 'individual',
+        legalName: 'AppDel Seller',
+        shopName: 'AppDel Store',
+        countryCode: 'US',
+      }),
+    });
+    const { shop } = await regRes.json();
+
+    // Create physical & digital products
+    const physRes = await callWorker('/api/seller/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({
+        listingType: 'physical',
+        title: 'AppDel Acoustic Headphones',
+        description: 'Testing conversations and reviews.',
+        categoryId: 'cat_electronics',
+        price: 120,
+        currency: 'USD',
+        status: 'published',
+      }),
+    });
+    const { product: physProd } = await physRes.json();
+
+    const digRes = await callWorker('/api/seller/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({
+        listingType: 'digital',
+        title: 'AppDel Digital Pack',
+        description: 'Testing digital asset deletion.',
+        categoryId: 'cat_electronics',
+        price: 35,
+        currency: 'USD',
+        status: 'published',
+      }),
+    });
+    const { product: digProd } = await digRes.json();
+
+    // 1. Messaging: Conversation hide/unhide + per-message delete rules
+    const convCreateRes = await callWorker('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ productId: physProd.id, message: 'First buyer message' }),
+    });
+    expect(convCreateRes.status).toBe(201);
+    const { conversationId } = await convCreateRes.json();
+
+    const msgSendRes = await callWorker(`/api/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ body: 'Second removable message' }),
+    });
+    const { message: secondMsg } = await msgSendRes.json();
+
+    // Seller cannot delete buyer's message (403)
+    const stealDelRes = await callWorker(`/api/conversations/${conversationId}/messages/${secondMsg.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    expect(stealDelRes.status).toBe(403);
+
+    // Buyer deletes own message (200)
+    const ownMsgDelRes = await callWorker(`/api/conversations/${conversationId}/messages/${secondMsg.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(ownMsgDelRes.status).toBe(200);
+
+    // Order generates order_proposal message which cannot be deleted
+    const ordRes = await callWorker('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({
+        productId: physProd.id,
+        buyerUserId: buyer.user.id,
+        conversationId,
+        quantity: 1,
+        agreedTotal: 120,
+        currency: 'USD',
+      }),
+    });
+    const { orderId } = await ordRes.json();
+
+    const msgsRes = await callWorker(`/api/conversations/${conversationId}/messages`, {
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    const msgsJson = await msgsRes.json();
+    const proposalMsg = msgsJson.messages.find((m) => m.message_type === 'order_proposal');
+    expect(proposalMsg).toBeDefined();
+
+    const delProposalRes = await callWorker(`/api/conversations/${conversationId}/messages/${proposalMsg.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    expect(delProposalRes.status).toBe(403);
+
+    // Buyer hides conversation -> disappears for buyer, remains for seller, new seller msg unhides
+    const hideConvRes = await callWorker(`/api/conversations/${conversationId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(hideConvRes.status).toBe(200);
+
+    const buyerConvsAfterHide = await (
+      await callWorker('/api/conversations', { headers: { Authorization: `Bearer ${buyer.token}` } })
+    ).json();
+    expect(buyerConvsAfterHide.conversations.some((c) => c.id === conversationId)).toBe(false);
+
+    const sellerConvsAfterHide = await (
+      await callWorker('/api/conversations', { headers: { Authorization: `Bearer ${seller.token}` } })
+    ).json();
+    expect(sellerConvsAfterHide.conversations.some((c) => c.id === conversationId)).toBe(true);
+
+    await callWorker(`/api/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ body: 'Follow-up unhiding thread' }),
+    });
+    const buyerConvsUnhidden = await (
+      await callWorker('/api/conversations', { headers: { Authorization: `Bearer ${buyer.token}` } })
+    ).json();
+    expect(buyerConvsUnhidden.conversations.some((c) => c.id === conversationId)).toBe(true);
+
+    // 2. Account Notifications & Support Ticket cancellation
+    const bcastRes = await callWorker('/api/admin/notifications/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+      body: JSON.stringify({ title: 'System Maintenance Notice', body: 'Window starts at 02:00 UTC' }),
+    });
+    expect(bcastRes.status).toBe(201);
+    const { id: globalNotifId } = await bcastRes.json();
+
+    // User cannot delete global broadcast notification (403)
+    const userDelGlobalRes = await callWorker(`/api/account/notifications/${globalNotifId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(userDelGlobalRes.status).toBe(403);
+
+    // Insert personal user notification (one read, one unread) and verify clear read + single delete
+    const personalUnreadId = `notif_u_${Date.now()}`;
+    const personalReadId = `notif_r_${Date.now()}`;
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO notifications (id, user_id, scope, type, title, body, is_read) VALUES (?, ?, 'user', 'order', 'Unread Alert', 'Body', 0)"
+      ).bind(personalUnreadId, buyer.user.id),
+      env.DB.prepare(
+        "INSERT INTO notifications (id, user_id, scope, type, title, body, is_read) VALUES (?, ?, 'user', 'order', 'Read Alert', 'Body', 1)"
+      ).bind(personalReadId, buyer.user.id),
+    ]);
+
+    const clearReadRes = await callWorker('/api/account/notifications/read', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(clearReadRes.status).toBe(200);
+    const clearReadJson = await clearReadRes.json();
+    expect(clearReadJson.deletedCount).toBeGreaterThanOrEqual(1);
+
+    const delUnreadRes = await callWorker(`/api/account/notifications/${personalUnreadId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(delUnreadRes.status).toBe(200);
+
+    // Admin deletes broadcast and clears matching marketplace_announcement
+    const adminDelBcastRes = await callWorker(`/api/admin/notifications/${globalNotifId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(adminDelBcastRes.status).toBe(200);
+    const bannerSetting = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'marketplace_announcement'").first();
+    expect(bannerSetting?.value).toBe('');
+
+    // Account open ticket cancel vs resolved ticket guard + Admin delete ticket
+    const openTktRes = await callWorker('/api/account/support', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ category: 'order', subject: 'Cancelable Ticket', message: 'Opened by mistake' }),
+    });
+    const { ticketId: openTktId } = await openTktRes.json();
+    const buyerCancelTktRes = await callWorker(`/api/account/support/${openTktId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(buyerCancelTktRes.status).toBe(200);
+
+    const resTktCreate = await callWorker('/api/account/support', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ category: 'general', subject: 'Resolved Ticket', message: 'Need admin reply' }),
+    });
+    const { ticketId: resTktId } = await resTktCreate.json();
+
+    // Admin cannot delete still-open ticket (409)
+    const adminDelOpenTktRes = await callWorker(`/api/admin/support/${resTktId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(adminDelOpenTktRes.status).toBe(409);
+
+    await callWorker(`/api/admin/support/${resTktId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+      body: JSON.stringify({ status: 'resolved', adminResponse: 'Handled cleanly' }),
+    });
+
+    // User cannot cancel resolved ticket (409), Admin can delete resolved ticket (200)
+    const userDelResolvedTktRes = await callWorker(`/api/account/support/${resTktId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${buyer.token}` },
+    });
+    expect(userDelResolvedTktRes.status).toBe(409);
+
+    const adminDelResolvedTktRes = await callWorker(`/api/admin/support/${resTktId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(adminDelResolvedTktRes.status).toBe(200);
+
+    // 3. Seller: Pending Promotion delete & Digital Asset delete pre-paid vs paid-order block
+    const promoRes = await callWorker('/api/seller/promotions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ promoType: 'featured_product', productId: physProd.id, durationDays: 7, title: 'Pending Campaign' }),
+    });
+    expect(promoRes.status).toBe(201);
+    const { promotionId } = await promoRes.json();
+
+    const delPromoRes = await callWorker(`/api/seller/promotions/${promotionId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    expect(delPromoRes.status).toBe(200);
+
+    await callWorker(`/api/seller/products/${digProd.id}/digital-asset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ fileName: 'readme.txt', deliveryInstructions: 'Key follows', downloadLimit: 3 }),
+    });
+    const delAssetPreOrdRes = await callWorker(`/api/seller/products/${digProd.id}/digital-asset`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    expect(delAssetPreOrdRes.status).toBe(200);
+
+    // Re-add digital asset, create & confirm digital order -> DELETE digital-asset blocked (409)
+    await callWorker(`/api/seller/products/${digProd.id}/digital-asset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ fileName: 'package.txt', deliveryInstructions: 'Download active', downloadLimit: 5 }),
+    });
+    const digOrdRes = await callWorker('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ productId: digProd.id, buyerUserId: buyer.user.id, quantity: 1, agreedTotal: 35, currency: 'USD' }),
+    });
+    const { orderId: digOrderId } = await digOrdRes.json();
+    await callWorker(`/api/orders/${digOrderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ status: 'Confirmed' }),
+    });
+    const delAssetPaidRes = await callWorker(`/api/seller/products/${digProd.id}/digital-asset`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${seller.token}` },
+    });
+    expect(delAssetPaidRes.status).toBe(409);
+
+    // 4. Admin: Categories & Subcategories referenced vs unused deletion, + Review removal rating recalculation
+    const newCatRes = await callWorker('/api/admin/categories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+      body: JSON.stringify({ name: 'Governance Test Cat', description: 'Check FK guard' }),
+    });
+    const { id: newCatId } = await newCatRes.json();
+
+    const newSubRes = await callWorker('/api/admin/subcategories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` },
+      body: JSON.stringify({ categoryId: newCatId, name: 'Governance Test Sub' }),
+    });
+    const { id: newSubId } = await newSubRes.json();
+
+    // Parent category has subcategory -> 409
+    const delParentWithSubRes = await callWorker(`/api/admin/categories/${newCatId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(delParentWithSubRes.status).toBe(409);
+
+    // Delete unused subcategory -> 200, then delete empty parent category -> 200
+    const delSubRes = await callWorker(`/api/admin/subcategories/${newSubId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(delSubRes.status).toBe(200);
+
+    const delCatRes = await callWorker(`/api/admin/categories/${newCatId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(delCatRes.status).toBe(200);
+
+    // Complete order, submit 5-star review, then Admin removes review -> rating recalculates back to 0
+    await callWorker(`/api/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ status: 'Confirmed' }),
+    });
+    await callWorker(`/api/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` },
+      body: JSON.stringify({ status: 'Delivered' }),
+    });
+    await callWorker(`/api/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ status: 'Completed' }),
+    });
+    const revRes = await callWorker(`/api/orders/${orderId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` },
+      body: JSON.stringify({ rating: 5, comment: 'Great product before moderation removal' }),
+    });
+    expect(revRes.status).toBe(201);
+    const { reviewId } = await revRes.json();
+
+    const prodBeforeRevDel = await env.DB.prepare('SELECT rating_avg, review_count FROM products WHERE id = ?').bind(physProd.id).first();
+    expect(Number(prodBeforeRevDel.review_count)).toBe(1);
+    expect(Number(prodBeforeRevDel.rating_avg)).toBe(5);
+
+    const adminDelRevRes = await callWorker(`/api/admin/reviews/${reviewId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(adminDelRevRes.status).toBe(200);
+
+    const prodAfterRevDel = await env.DB.prepare('SELECT rating_avg, review_count FROM products WHERE id = ?').bind(physProd.id).first();
+    expect(Number(prodAfterRevDel.review_count)).toBe(0);
+    expect(Number(prodAfterRevDel.rating_avg)).toBe(0);
+
+    const shopAfterRevDel = await env.DB.prepare('SELECT rating_avg, review_count FROM shops WHERE id = ?').bind(shop.id).first();
+    expect(Number(shopAfterRevDel.review_count)).toBe(0);
+    expect(Number(shopAfterRevDel.rating_avg)).toBe(0);
+  });
 });
 

@@ -1000,6 +1000,13 @@ const UPGRADE_STATEMENTS: string[] = [
     ('max_product_image_mb', '10', 'number', 'Maximum file size in MB per product photo (JPG, JPEG, PNG, WebP)'),
     ('max_product_video_mb', '30', 'number', 'Maximum file size in MB per product short video (MP4, MOV, max 10 seconds)'),
     ('audit_retention_days', '90', 'number', 'Retention period (days) before non-critical audit logs are eligible for archiving or cleanup')`,
+  `CREATE TABLE IF NOT EXISTS admin_audit_log_archives (
+    log_id TEXT PRIMARY KEY,
+    archived_by TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_audit_log_archives_archived_at ON admin_audit_log_archives(archived_at)`,
 ];
 
 let schemaVerified = false;
@@ -1026,10 +1033,10 @@ export async function isD1Initialized(db?: D1Database): Promise<boolean> {
   try {
     const tablesRow = await db
       .prepare(
-        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'categories', 'platform_settings', 'ai_feature_settings', 'subscription_plan_stars', 'telegram_stars_payments', 'product_digital_assets', 'edge_rate_limits', 'admin_role_assignments', 'product_media')"
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'categories', 'platform_settings', 'ai_feature_settings', 'subscription_plan_stars', 'telegram_stars_payments', 'product_digital_assets', 'edge_rate_limits', 'admin_role_assignments', 'product_media', 'admin_audit_log_archives')"
       )
       .first<{ cnt: number }>();
-    if ((tablesRow?.cnt ?? 0) < 10) return false;
+    if ((tablesRow?.cnt ?? 0) < 11) return false;
     const catRow = await db.prepare('SELECT COUNT(*) as cnt FROM categories').first<{ cnt: number }>();
     if ((catRow?.cnt ?? 0) === 0) return false;
     const staleModel = await db

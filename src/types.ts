@@ -104,6 +104,9 @@ export interface Shop {
   verification_status: 'unverified' | 'pending' | 'verified' | 'rejected';
   is_featured: number;
   status: 'active' | 'suspended' | 'closed';
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  deletion_reason?: string | null;
   rating_avg: number;
   review_count: number;
   product_count?: number;
@@ -258,6 +261,7 @@ export interface Message {
   attachment_url: string;
   attachment_type: string;
   message_type: 'text' | 'image' | 'order_proposal' | 'system';
+  is_deleted?: number;
   created_at: string;
 }
 

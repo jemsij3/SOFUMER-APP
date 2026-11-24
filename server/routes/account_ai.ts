@@ -103,6 +103,31 @@ accountAiRouter.patch('/account/notifications/read', requireAuth, (req, res) => 
   res.json({ read: true });
 });
 
+accountAiRouter.delete('/account/notifications/read', requireAuth, (req, res) => {
+  const del = db
+    .prepare("DELETE FROM notifications WHERE user_id = ? AND is_read = 1 AND scope = 'user'")
+    .run(req.authUser!.id);
+  res.json({ deletedCount: del.changes });
+});
+
+accountAiRouter.delete('/account/notifications/:id', requireAuth, (req, res) => {
+  const notif = db
+    .prepare('SELECT id, user_id, scope FROM notifications WHERE id = ?')
+    .get(req.params.id) as { id: string; user_id: string | null; scope: string } | undefined;
+  if (!notif) return res.status(404).json({ error: 'Notification not found.' });
+  if (notif.scope === 'global') {
+    return res.status(403).json({ error: 'Global marketplace announcements cannot be deleted by users.' });
+  }
+  if (notif.user_id !== req.authUser!.id) {
+    return res.status(404).json({ error: 'Notification not found.' });
+  }
+  db.prepare("DELETE FROM notifications WHERE id = ? AND user_id = ? AND scope = 'user'").run(
+    req.params.id,
+    req.authUser!.id
+  );
+  res.json({ deleted: true, id: req.params.id });
+});
+
 accountAiRouter.get('/account/support', requireAuth, (req, res) => {
   const tickets = db
     .prepare('SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC')
@@ -122,6 +147,18 @@ accountAiRouter.post('/account/support', requireAuth, (req, res) => {
     `INSERT INTO support_tickets (id, user_id, category, subject, message) VALUES (?, ?, ?, ?, ?)`
   ).run(ticketId, req.authUser!.id, category, subject, message);
   res.status(201).json({ ticketId, status: 'open' });
+});
+
+accountAiRouter.delete('/account/support/:id', requireAuth, (req, res) => {
+  const ticket = db
+    .prepare('SELECT id, user_id, status FROM support_tickets WHERE id = ? AND user_id = ?')
+    .get(req.params.id, req.authUser!.id) as { id: string; user_id: string; status: string } | undefined;
+  if (!ticket) return res.status(404).json({ error: 'Support ticket not found.' });
+  if (ticket.status !== 'open') {
+    return res.status(409).json({ error: 'Only open support tickets can be cancelled.' });
+  }
+  db.prepare('DELETE FROM support_tickets WHERE id = ? AND user_id = ?').run(req.params.id, req.authUser!.id);
+  res.json({ deleted: true, cancelled: true, id: req.params.id });
 });
 
 // ============================================================================

@@ -33,7 +33,7 @@ messagingOrdersRouter.get('/conversations', requireAuth, (req, res) => {
        JOIN users other_u ON other_u.id = other_cp.user_id
        LEFT JOIN products p ON p.id = c.product_id
        LEFT JOIN shops s ON s.id = c.shop_id
-       WHERE cp.user_id = ?
+       WHERE cp.user_id = ? AND cp.is_hidden = 0
        ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`
     )
     .all(userId);
@@ -154,28 +154,34 @@ messagingOrdersRouter.post('/conversations', requireAuth, rateLimit(20, 60_000, 
         `${req.authUser!.display_name}: ${initialMessage.slice(0, 120)}`
       );
     }
-  } else if (initialMessage) {
-    db.transaction(() => {
-      db.prepare(
-        `INSERT INTO messages (id, conversation_id, sender_user_id, body, message_type)
-         VALUES (?, ?, ?, ?, 'text')`
-      ).run(newId('msg'), conversationId, buyerId, initialMessage);
-
-      db.prepare(
-        `UPDATE conversations SET last_message_at = datetime('now'), last_message_preview = ? WHERE id = ?`
-      ).run(initialMessage.slice(0, 120), conversationId);
-
-      db.prepare(
-        `UPDATE conversation_participants SET unread_count = unread_count + 1 WHERE conversation_id = ? AND user_id = ?`
-      ).run(conversationId, sellerUserId);
-    })();
-
-    await notifyUserAndTelegram(
-      sellerUserId,
-      'message',
-      `New Message: ${subject}`,
-      `${req.authUser!.display_name}: ${initialMessage.slice(0, 120)}`
+  } else {
+    db.prepare(`UPDATE conversation_participants SET is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`).run(
+      conversationId,
+      buyerId
     );
+    if (initialMessage) {
+      db.transaction(() => {
+        db.prepare(
+          `INSERT INTO messages (id, conversation_id, sender_user_id, body, message_type)
+           VALUES (?, ?, ?, ?, 'text')`
+        ).run(newId('msg'), conversationId, buyerId, initialMessage);
+
+        db.prepare(
+          `UPDATE conversations SET last_message_at = datetime('now'), last_message_preview = ? WHERE id = ?`
+        ).run(initialMessage.slice(0, 120), conversationId);
+
+        db.prepare(
+          `UPDATE conversation_participants SET unread_count = unread_count + 1, is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
+        ).run(conversationId, sellerUserId);
+      })();
+
+      await notifyUserAndTelegram(
+        sellerUserId,
+        'message',
+        `New Message: ${subject}`,
+        `${req.authUser!.display_name}: ${initialMessage.slice(0, 120)}`
+      );
+    }
   }
 
   res.status(201).json({ conversationId });
@@ -263,9 +269,14 @@ messagingOrdersRouter.post('/conversations/:id/messages', requireAuth, rateLimit
       `UPDATE conversations SET last_message_at = datetime('now'), last_message_preview = ? WHERE id = ?`
     ).run(preview.slice(0, 120), convId);
 
+    db.prepare(`UPDATE conversation_participants SET is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`).run(
+      convId,
+      userId
+    );
+
     if (otherPart) {
       db.prepare(
-        `UPDATE conversation_participants SET unread_count = unread_count + 1 WHERE conversation_id = ? AND user_id = ?`
+        `UPDATE conversation_participants SET unread_count = unread_count + 1, is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
       ).run(convId, otherPart.user_id);
     }
   })();
@@ -287,6 +298,76 @@ messagingOrdersRouter.post('/conversations/:id/messages', requireAuth, rateLimit
     .get(msgId);
 
   res.status(201).json({ message: created });
+});
+
+messagingOrdersRouter.delete('/conversations/:id/messages/:messageId', requireAuth, (req, res) => {
+  const userId = req.authUser!.id;
+  const { id: convId, messageId } = req.params;
+
+  const part = db
+    .prepare('SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?')
+    .get(convId, userId);
+  if (!part) {
+    return res.status(403).json({ error: 'Not authorized to modify this conversation.' });
+  }
+
+  const msg = db
+    .prepare('SELECT id, sender_user_id, message_type, is_deleted FROM messages WHERE id = ? AND conversation_id = ?')
+    .get(messageId, convId) as
+    | { id: string; sender_user_id: string; message_type: string; is_deleted: number }
+    | undefined;
+  if (!msg) return res.status(404).json({ error: 'Message not found.' });
+  if (msg.sender_user_id !== userId) {
+    return res.status(403).json({ error: 'You can only delete messages you sent.' });
+  }
+  if (msg.message_type === 'order_proposal' || msg.message_type === 'system') {
+    return res.status(403).json({ error: 'System and order proposal messages cannot be deleted.' });
+  }
+  if (msg.is_deleted) {
+    return res.json({ deleted: true, messageId });
+  }
+
+  db.transaction(() => {
+    db.prepare("UPDATE messages SET is_deleted = 1, body = '', attachment_url = '' WHERE id = ?").run(messageId);
+    const latest = db
+      .prepare(
+        `SELECT body, attachment_url, created_at
+         FROM messages
+         WHERE conversation_id = ? AND is_deleted = 0
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`
+      )
+      .get(convId) as { body: string; attachment_url: string; created_at: string } | undefined;
+
+    if (latest) {
+      const nextPreview = (latest.body || (latest.attachment_url ? '[Image attachment]' : '')).slice(0, 120);
+      db.prepare('UPDATE conversations SET last_message_preview = ?, last_message_at = ? WHERE id = ?').run(
+        nextPreview,
+        latest.created_at,
+        convId
+      );
+    } else {
+      db.prepare("UPDATE conversations SET last_message_preview = '' WHERE id = ?").run(convId);
+    }
+  })();
+
+  res.json({ deleted: true, messageId });
+});
+
+messagingOrdersRouter.delete('/conversations/:id', requireAuth, (req, res) => {
+  const userId = req.authUser!.id;
+  const convId = req.params.id;
+  const part = db
+    .prepare('SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?')
+    .get(convId, userId);
+  if (!part) {
+    return res.status(403).json({ error: 'Not authorized to hide this conversation.' });
+  }
+
+  db.prepare(
+    'UPDATE conversation_participants SET is_hidden = 1, unread_count = 0 WHERE conversation_id = ? AND user_id = ?'
+  ).run(convId, userId);
+  res.json({ hidden: true, deleted: true, conversationId: convId });
 });
 
 messagingOrdersRouter.get('/users/blocks', requireAuth, (req, res) => {

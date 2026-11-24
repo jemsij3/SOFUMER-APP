@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, Bot, Lock, ShieldCheck } from 'lucide-react';
+import { Archive, ArrowLeft, Bot, Lock, RefreshCw, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
 import { safeStringArray, safeText } from '../lib/aiFormat';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 type AdminTab =
   | 'overview'
@@ -57,7 +58,7 @@ const ADMIN_TABS: AdminTabMeta[] = [
   { key: 'analytics', label: 'Analytics', required: ['analytics.view'] },
   { key: 'users', label: 'Users', required: ['users.manage'] },
   { key: 'sellers', label: 'Sellers', required: ['sellers.manage', 'sellers.suspend'] },
-  { key: 'shops', label: 'Shops', required: ['shops.manage', 'sellers.manage'] },
+  { key: 'shops', label: 'Shops', required: ['shops.manage', 'sellers.manage', 'sellers.suspend'] },
   { key: 'products', label: 'Products', required: ['moderation.manage', 'catalog.manage'] },
   { key: 'categories', label: 'Categories', required: ['catalog.manage', 'moderation.manage'] },
   { key: 'orders', label: 'Orders', required: ['orders.manage'] },
@@ -187,6 +188,16 @@ const SETTING_METADATA: Record<string, SettingUiMeta> = {
     step: '1',
     unit: 'MB',
   },
+  audit_retention_days: {
+    label: 'Audit Log Retention Window',
+    group: 'Audit & Governance',
+    description: 'Default age in days before non-protected administrative audit logs become eligible for retention archival or cleanup (7–3,650 days).',
+    kind: 'integer',
+    min: 7,
+    max: 3650,
+    step: '1',
+    unit: 'days',
+  },
 };
 
 interface AiScanResult {
@@ -241,6 +252,12 @@ export function AdminPage() {
 
   const [sellers, setSellers] = useState<Array<Record<string, unknown>>>([]);
   const [sellerStatusFilter, setSellerStatusFilter] = useState('all');
+
+  const [shopsList, setShopsList] = useState<Array<Record<string, unknown>>>([]);
+  const [shopStatusFilter, setShopStatusFilter] = useState('all');
+  const [shopSearch, setShopSearch] = useState('');
+  const [deleteShopTarget, setDeleteShopTarget] = useState<Record<string, unknown> | null>(null);
+  const [deleteShopReason, setDeleteShopReason] = useState('');
 
   const [products, setProducts] = useState<Array<Record<string, unknown>>>([]);
   const [productStatusFilter, setProductStatusFilter] = useState('all');
@@ -328,6 +345,30 @@ export function AdminPage() {
 
   const [auditLogs, setAuditLogs] = useState<Array<Record<string, unknown>>>([]);
   const [auditFilter, setAuditFilter] = useState('');
+  const [auditScope, setAuditScope] = useState<'active' | 'archived' | 'all'>('active');
+  const [auditRetentionDays, setAuditRetentionDays] = useState(90);
+  const [auditRetentionInput, setAuditRetentionInput] = useState('90');
+  const [auditSummary, setAuditSummary] = useState({ activeCount: 0, archivedCount: 0, protectedCount: 0 });
+  const [selectedAuditIds, setSelectedAuditIds] = useState<string[]>([]);
+  const [savingRetention, setSavingRetention] = useState(false);
+
+  // Confirm dialogs for Admin delete/archive flows
+  const [confirmAction, setConfirmAction] = useState<
+    | { kind: 'delete_product'; product: Record<string, unknown> }
+    | { kind: 'delete_category'; category: Record<string, unknown> }
+    | { kind: 'delete_subcategory'; sub: Record<string, unknown> }
+    | { kind: 'delete_review'; review: Record<string, unknown> }
+    | { kind: 'delete_ticket'; ticket: Record<string, unknown> }
+    | { kind: 'delete_notification'; notif: Record<string, unknown> }
+    | { kind: 'archive_audit_selected'; ids: string[] }
+    | { kind: 'archive_audit_older'; days: number }
+    | { kind: 'delete_audit_single'; log: Record<string, unknown> }
+    | { kind: 'delete_audit_selected'; ids: string[] }
+    | { kind: 'delete_audit_archived' }
+    | null
+  >(null);
+  const [confirmReason, setConfirmReason] = useState('');
+  const [actionBusy, setActionBusy] = useState(false);
 
   // Category creation forms
   const [newCatName, setNewCatName] = useState('');
@@ -399,9 +440,18 @@ export function AdminPage() {
           const res = await apiFetch<{ users: Array<Record<string, unknown>> }>('/api/admin/users', { isAdmin: true });
           setUsers(res.users);
         }
-        if (activeTab === 'sellers' || activeTab === 'shops') {
+        if (activeTab === 'sellers') {
           const res = await apiFetch<{ sellers: Array<Record<string, unknown>> }>('/api/admin/sellers', { isAdmin: true });
           setSellers(res.sellers);
+        }
+        if (activeTab === 'shops') {
+          const params = new URLSearchParams({ status: shopStatusFilter });
+          if (shopSearch.trim()) params.set('q', shopSearch.trim());
+          const res = await apiFetch<{ shops: Array<Record<string, unknown>> }>(
+            `/api/admin/shops?${params.toString()}`,
+            { isAdmin: true }
+          );
+          setShopsList(res.shops || []);
         }
         if (activeTab === 'products') {
           const res = await apiFetch<{ products: Array<Record<string, unknown>> }>('/api/admin/products', { isAdmin: true });
@@ -527,14 +577,27 @@ export function AdminPage() {
           );
         }
         if (activeTab === 'audit') {
-          const res = await apiFetch<{ logs: Array<Record<string, unknown>> }>('/api/admin/audit-logs', { isAdmin: true });
-          setAuditLogs(res.logs);
+          const params = new URLSearchParams({ scope: auditScope });
+          if (auditFilter.trim()) params.set('q', auditFilter.trim());
+          const res = await apiFetch<{
+            logs: Array<Record<string, unknown>>;
+            retentionDays?: number;
+            summary?: { activeCount: number; archivedCount: number; protectedCount: number };
+          }>(`/api/admin/audit-logs?${params.toString()}`, { isAdmin: true });
+          const fetchedLogs = res.logs || [];
+          setAuditLogs(fetchedLogs);
+          const nextDays = Number(res.retentionDays || 90);
+          setAuditRetentionDays(nextDays);
+          setAuditRetentionInput(String(nextDays));
+          if (res.summary) setAuditSummary(res.summary);
+          const idSet = new Set(fetchedLogs.map((l) => String(l.id)));
+          setSelectedAuditIds((prev) => prev.filter((id) => idSet.has(id)));
         }
       } catch (err) {
         notify(err instanceof Error ? err.message : 'Admin load failed', 'error');
       }
     },
-    [hasPerm, newSubParent, notify, selectedRoleId]
+    [auditFilter, auditScope, hasPerm, newSubParent, notify, selectedRoleId, shopSearch, shopStatusFilter]
   );
 
   useEffect(() => {
@@ -922,13 +985,11 @@ export function AdminPage() {
             </div>
           )}
 
-          {/* SELLERS & SHOPS TABS */}
-          {(tab === 'sellers' || tab === 'shops') && (
+          {/* SELLERS TAB */}
+          {tab === 'sellers' && (
             <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
               <div className="p-4 flex flex-wrap items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-white">
-                  {tab === 'sellers' ? 'Seller Accounts & Verification' : 'Storefronts & Shop Governance'}
-                </div>
+                <div className="text-sm font-semibold text-white">Seller Accounts & Verification</div>
                 <select
                   value={sellerStatusFilter}
                   onChange={(e) => setSellerStatusFilter(e.target.value)}
@@ -946,13 +1007,13 @@ export function AdminPage() {
               ) : (
                 sellers
                   .filter((s) =>
-                    sellerStatusFilter === 'all' ? true : String(s.shop_verification_status) === sellerStatusFilter
+                    sellerStatusFilter === 'all' ? true : String(s.shop_verification_status || s.verification_status || 'unverified') === sellerStatusFilter
                   )
                   .map((s) => (
                     <div key={String(s.id)} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
                       <div>
                         <div className="font-semibold text-white">
-                          {String(s.shop_name)} ({String(s.seller_type)})
+                          {s.shop_name ? String(s.shop_name) : `${String(s.legal_name || s.display_name)} (No active shop)`} ({String(s.seller_type)})
                           {s.is_featured ? (
                             <span className="ml-2 px-1.5 py-0.5 rounded bg-purple-900/50 text-purple-200 text-[10px]">
                               Featured
@@ -961,11 +1022,12 @@ export function AdminPage() {
                         </div>
                         <div className="text-slate-400">
                           Owner: {String(s.display_name)} · Account: {String(s.status)} · Verification:{' '}
-                          {String(s.shop_verification_status)} · Slug: {String(s.shop_slug)}
+                          {String(s.shop_verification_status || s.verification_status)}
+                          {s.shop_slug ? ` · Slug: ${String(s.shop_slug)}` : ''}
                         </div>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        {hasPerm(['sellers.manage', 'shops.manage']) && (
+                        {hasPerm(['sellers.manage', 'shops.manage']) && Boolean(s.shop_id) && (
                           <>
                             <button
                               type="button"
@@ -979,7 +1041,7 @@ export function AdminPage() {
                                         s.shop_verification_status === 'verified' ? 'unverified' : 'verified',
                                     }),
                                   });
-                                  await loadTabData(tab);
+                                  await loadTabData('sellers');
                                 } catch (err) {
                                   notify(err instanceof Error ? err.message : 'Action failed', 'error');
                                 }
@@ -997,7 +1059,7 @@ export function AdminPage() {
                                     isAdmin: true,
                                     body: JSON.stringify({ isFeatured: !s.is_featured }),
                                   });
-                                  await loadTabData(tab);
+                                  await loadTabData('sellers');
                                 } catch (err) {
                                   notify(err instanceof Error ? err.message : 'Action failed', 'error');
                                 }
@@ -1017,7 +1079,7 @@ export function AdminPage() {
                                 isAdmin: true,
                                 body: JSON.stringify({ status: s.status === 'active' ? 'suspended' : 'active' }),
                               });
-                              await loadTabData(tab);
+                              await loadTabData('sellers');
                             } catch (err) {
                               notify(err instanceof Error ? err.message : 'Action failed', 'error');
                             }
@@ -1029,6 +1091,177 @@ export function AdminPage() {
                       </div>
                     </div>
                   ))
+              )}
+            </div>
+          )}
+
+          {/* SHOPS MANAGEMENT TAB (Inspect, Verify, Feature, Suspend, Safe Delete) */}
+          {tab === 'shops' && (
+            <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
+              <div className="p-4 flex flex-wrap items-center justify-between gap-2.5">
+                <div>
+                  <div className="text-sm font-semibold text-white">Storefronts & Shop Management</div>
+                  <div className="text-[11px] text-slate-400">
+                    Manage active, suspended, and closed shops. Deleting a shop archives listings with order history and keeps user accounts intact.
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="search"
+                    value={shopSearch}
+                    onChange={(e) => setShopSearch(e.target.value)}
+                    placeholder="Search shop, slug, owner..."
+                    className="h-8 w-48 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white"
+                  />
+                  <select
+                    value={shopStatusFilter}
+                    onChange={(e) => setShopStatusFilter(e.target.value)}
+                    className="h-8 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-200"
+                  >
+                    <option value="all">All Shops</option>
+                    <option value="active">Active</option>
+                    <option value="suspended">Suspended</option>
+                    <option value="closed">Closed / Deleted</option>
+                  </select>
+                </div>
+              </div>
+
+              {shopsList.length === 0 ? (
+                <div className="p-6 text-xs text-slate-400">No shops matched the current filter.</div>
+              ) : (
+                shopsList.map((sh) => {
+                  const sid = String(sh.id);
+                  const shStatus = String(sh.status || 'active');
+                  const isClosed = shStatus === 'closed';
+                  return (
+                    <div key={sid} className="p-4 space-y-2.5 text-xs">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-white text-sm">{String(sh.name)}</span>
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${
+                                shStatus === 'active'
+                                  ? 'bg-emerald-950/70 border border-emerald-700/50 text-emerald-300'
+                                  : shStatus === 'suspended'
+                                  ? 'bg-amber-950/70 border border-amber-700/50 text-amber-300'
+                                  : 'bg-red-950/70 border border-red-700/50 text-red-300'
+                              }`}
+                            >
+                              {shStatus}
+                            </span>
+                            {sh.is_featured ? (
+                              <span className="px-1.5 py-0.5 rounded bg-purple-900/50 text-purple-200 text-[10px]">
+                                Featured
+                              </span>
+                            ) : null}
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] capitalize">
+                              {String(sh.verification_status || 'unverified')}
+                            </span>
+                          </div>
+                          <div className="text-slate-400 font-mono-nums">
+                            Owner: {String(sh.owner_name || sh.legal_name || '')}
+                            {sh.owner_telegram_username ? ` (@${String(sh.owner_telegram_username)})` : ''} · TG:{' '}
+                            {String(sh.owner_telegram_id || '')} · Slug: {String(sh.slug)}
+                          </div>
+                          <div className="text-slate-400 font-mono-nums">
+                            {String(sh.seller_type || 'individual')} · {Number(sh.product_count ?? 0)} active listing(s) ·{' '}
+                            {Number(sh.order_count ?? 0)} historical order(s)
+                          </div>
+                        </div>
+
+                        {!isClosed && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            {hasPerm(['shops.manage', 'sellers.manage']) && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/shops/${sid}`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          verificationStatus:
+                                            sh.verification_status === 'verified' ? 'unverified' : 'verified',
+                                        }),
+                                      });
+                                      await loadTabData('shops');
+                                      notify('Shop verification updated', 'success');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  }}
+                                  className="h-8 px-3 rounded-lg bg-blue-600 text-white"
+                                >
+                                  {sh.verification_status === 'verified' ? 'Revoke Verification' : 'Verify Shop'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/shops/${sid}`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ isFeatured: !sh.is_featured }),
+                                      });
+                                      await loadTabData('shops');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  }}
+                                  className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                                >
+                                  {sh.is_featured ? 'Unfeature' : 'Feature'}
+                                </button>
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  await apiFetch(`/api/admin/shops/${sid}`, {
+                                    method: 'PATCH',
+                                    isAdmin: true,
+                                    body: JSON.stringify({ status: shStatus === 'active' ? 'suspended' : 'active' }),
+                                  });
+                                  await loadTabData('shops');
+                                  notify(`Shop ${shStatus === 'active' ? 'suspended' : 'restored'}`, 'info');
+                                } catch (err) {
+                                  notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                }
+                              }}
+                              className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/50 text-amber-200"
+                            >
+                              {shStatus === 'active' ? 'Suspend' : 'Restore'}
+                            </button>
+                            {hasPerm(['shops.manage', 'sellers.manage']) && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeleteShopReason('');
+                                  setDeleteShopTarget(sh);
+                                }}
+                                className="h-8 px-3 rounded-lg bg-red-950/70 border border-red-800/70 text-red-200 hover:bg-red-900/70 font-semibold inline-flex items-center gap-1.5"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Delete Shop</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {isClosed && (
+                        <div className="p-2.5 rounded-lg bg-[#070B14] border border-red-900/40 text-[11px] text-slate-400">
+                          Closed {sh.deleted_at ? `on ${new Date(String(sh.deleted_at) + 'Z').toLocaleString()}` : ''}{' '}
+                          {sh.deleted_by ? `by ${String(sh.deleted_by)}` : ''}
+                          {sh.deletion_reason ? ` · Reason: ${String(sh.deletion_reason)}` : ''}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
               )}
             </div>
           )}
@@ -1148,9 +1381,20 @@ export function AdminPage() {
                                     notify(err instanceof Error ? err.message : 'Action failed', 'error');
                                   }
                                 }}
-                                className="h-8 px-3 rounded-lg bg-red-600 text-white"
+                                className="h-8 px-3 rounded-lg bg-amber-700 text-white"
                               >
                                 Reject
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setConfirmReason(moderationNotes[pid] || '');
+                                  setConfirmAction({ kind: 'delete_product', product: p });
+                                }}
+                                className="h-8 px-3 rounded-lg bg-red-600 hover:bg-red-500 text-white inline-flex items-center gap-1"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Delete</span>
                               </button>
                             </div>
                           )}
@@ -1358,27 +1602,38 @@ export function AdminPage() {
                           )}
                         </div>
                         {hasPerm('catalog.manage') && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/api/admin/categories/${cid}`, {
-                                  method: 'PATCH',
-                                  isAdmin: true,
-                                  body: JSON.stringify({ isActive: !c.is_active }),
-                                });
-                                await loadTabData('categories');
-                                await refreshBootstrap();
-                              } catch (err) {
-                                notify(err instanceof Error ? err.message : 'Toggle failed', 'error');
-                              }
-                            }}
-                            className={`h-8 px-3 rounded-lg ${
-                              c.is_active ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'
-                            }`}
-                          >
-                            {c.is_active ? 'Active' : 'Inactive'}
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  await apiFetch(`/api/admin/categories/${cid}`, {
+                                    method: 'PATCH',
+                                    isAdmin: true,
+                                    body: JSON.stringify({ isActive: !c.is_active }),
+                                  });
+                                  await loadTabData('categories');
+                                  await refreshBootstrap();
+                                } catch (err) {
+                                  notify(err instanceof Error ? err.message : 'Toggle failed', 'error');
+                                }
+                              }}
+                              className={`h-8 px-3 rounded-lg ${
+                                c.is_active ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              {c.is_active ? 'Active' : 'Inactive'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmAction({ kind: 'delete_category', category: c })}
+                              aria-label={`Delete category ${String(c.name)}`}
+                              className="h-8 px-2.5 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
+                            </button>
+                          </div>
                         )}
                       </div>
                       <div className="flex flex-wrap gap-1.5 text-[11px]">
@@ -1386,31 +1641,45 @@ export function AdminPage() {
                           <span className="text-slate-500">No subcategories</span>
                         ) : (
                           catSubs.map((s) => (
-                            <button
+                            <div
                               key={String(s.id)}
-                              type="button"
-                              disabled={!hasPerm('catalog.manage')}
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/subcategories/${s.id}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({ isActive: !s.is_active }),
-                                  });
-                                  await loadTabData('categories');
-                                  await refreshBootstrap();
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Subcategory toggle failed', 'error');
-                                }
-                              }}
-                              className={`px-2 py-1 rounded border ${
+                              className={`inline-flex items-center rounded border overflow-hidden ${
                                 s.is_active
                                   ? 'bg-[#070B14] border-slate-700 text-slate-200'
-                                  : 'bg-slate-900 border-slate-800 text-slate-500 line-through'
+                                  : 'bg-slate-900 border-slate-800 text-slate-500'
                               }`}
                             >
-                              {String(s.name)}
-                            </button>
+                              <button
+                                type="button"
+                                disabled={!hasPerm('catalog.manage')}
+                                onClick={async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/subcategories/${s.id}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ isActive: !s.is_active }),
+                                    });
+                                    await loadTabData('categories');
+                                    await refreshBootstrap();
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Subcategory toggle failed', 'error');
+                                  }
+                                }}
+                                className={`px-2 py-1 ${!s.is_active ? 'line-through' : ''}`}
+                              >
+                                {String(s.name)}
+                              </button>
+                              {hasPerm('catalog.manage') && (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmAction({ kind: 'delete_subcategory', sub: s })}
+                                  aria-label={`Delete subcategory ${String(s.name)}`}
+                                  className="px-1.5 py-1 border-l border-slate-800 text-red-400 hover:bg-red-950/70"
+                                >
+                                  ×
+                                </button>
+                              )}
+                            </div>
                           ))
                         )}
                       </div>
@@ -1601,24 +1870,36 @@ export function AdminPage() {
                         By {String(r.reviewer_name)} · {String(r.comment)}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await apiFetch(`/api/admin/reviews/${r.id}`, {
-                            method: 'PATCH',
-                            isAdmin: true,
-                            body: JSON.stringify({ status: r.status === 'published' ? 'hidden' : 'published' }),
-                          });
-                          await loadTabData('reviews');
-                        } catch (err) {
-                          notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                        }
-                      }}
-                      className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
-                    >
-                      {r.status === 'published' ? 'Hide' : 'Publish'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await apiFetch(`/api/admin/reviews/${r.id}`, {
+                              method: 'PATCH',
+                              isAdmin: true,
+                              body: JSON.stringify({ status: r.status === 'published' ? 'hidden' : 'published' }),
+                            });
+                            await loadTabData('reviews');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                          }
+                        }}
+                        className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                      >
+                        {r.status === 'published' ? 'Hide' : 'Publish'}
+                      </button>
+                      {r.status !== 'removed' && (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmAction({ kind: 'delete_review', review: r })}
+                          className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Remove</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))
               )}
@@ -2258,6 +2539,16 @@ export function AdminPage() {
                         >
                           Send Update
                         </button>
+                        {(t.status === 'resolved' || t.status === 'closed') && (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction({ kind: 'delete_ticket', ticket: t })}
+                            className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Ticket</span>
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -2441,11 +2732,22 @@ export function AdminPage() {
                 ) : (
                   broadcastHistory.map((item) => (
                     <div key={String(item.id)} className="py-2.5 border-b border-slate-800/70 space-y-1">
-                      <div className="flex justify-between gap-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="font-semibold text-white">{String(item.title)}</span>
-                        <span className="text-slate-500 font-mono-nums">
-                          {new Date(String(item.created_at) + 'Z').toLocaleString()}
-                        </span>
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-slate-500 font-mono-nums">
+                            {new Date(String(item.created_at) + 'Z').toLocaleString()}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction({ kind: 'delete_notification', notif: item })}
+                            aria-label={`Delete broadcast ${String(item.title)}`}
+                            className="h-7 px-2.5 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Delete</span>
+                          </button>
+                        </div>
                       </div>
                       <p className="text-slate-300">{String(item.body)}</p>
                     </div>
@@ -3008,50 +3310,563 @@ export function AdminPage() {
             </div>
           )}
 
-          {/* AUDIT LOGS TAB */}
+          {/* AUDIT LOGS GOVERNANCE TAB (View, Filter, Archive, Protected-Safe Delete, Retention Policy) */}
           {tab === 'audit' && (
-            <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
-              <div className="p-4 flex flex-wrap items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-white">Immutable Admin Audit Logs</div>
-                <input
-                  type="search"
-                  value={auditFilter}
-                  onChange={(e) => setAuditFilter(e.target.value)}
-                  placeholder="Filter action or admin ID..."
-                  className="h-8 w-full sm:w-56 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white"
-                />
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                  <div className="text-xs text-slate-400">Active Logs</div>
+                  <div className="text-xl font-bold text-white font-mono-nums mt-1">{auditSummary.activeCount}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                  <div className="text-xs text-slate-400">Archived Logs</div>
+                  <div className="text-xl font-bold text-white font-mono-nums mt-1">{auditSummary.archivedCount}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                  <div className="text-xs text-slate-400">Protected Security Logs</div>
+                  <div className="text-xl font-bold text-amber-300 font-mono-nums mt-1">{auditSummary.protectedCount}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-1.5 text-xs">
+                  <div className="text-slate-400">Retention Window (Days)</div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={7}
+                      max={3650}
+                      disabled={!hasPerm('settings.manage') || savingRetention}
+                      value={auditRetentionInput}
+                      onChange={(e) => setAuditRetentionInput(e.target.value)}
+                      className="w-20 h-8 px-2 rounded-lg bg-[#070B14] border border-slate-800 text-white font-mono-nums disabled:opacity-60"
+                    />
+                    {hasPerm('settings.manage') && (
+                      <button
+                        type="button"
+                        disabled={savingRetention}
+                        onClick={async () => {
+                          setSavingRetention(true);
+                          try {
+                            const res = await apiFetch<{ value: string }>(
+                              '/api/admin/settings/audit_retention_days',
+                              {
+                                method: 'PATCH',
+                                isAdmin: true,
+                                body: JSON.stringify({ value: Number(auditRetentionInput || 90) }),
+                              }
+                            );
+                            const savedDays = Number(res.value || 90);
+                            setAuditRetentionDays(savedDays);
+                            setAuditRetentionInput(String(savedDays));
+                            notify(`Audit retention window saved (${savedDays} days)`, 'success');
+                          } catch (err) {
+                            notify(err instanceof Error ? err.message : 'Failed to update retention window', 'error');
+                          } finally {
+                            setSavingRetention(false);
+                          }
+                        }}
+                        className="h-8 px-2.5 rounded-lg bg-blue-600 text-white font-semibold disabled:opacity-60"
+                      >
+                        {savingRetention ? '...' : 'Save'}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
-              {auditLogs.length === 0 ? (
-                <div className="p-6 text-xs text-slate-400">No administrative actions audited yet.</div>
-              ) : (
-                auditLogs
-                  .filter((log) => {
-                    if (!auditFilter.trim()) return true;
-                    const q = auditFilter.trim().toLowerCase();
+
+              <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
+                <div className="p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <div>
+                      <div className="text-sm font-semibold text-white">Audit Logs & Compliance Archive</div>
+                      <div className="text-[11px] text-slate-400">
+                        Critical RBAC, shop closure, and audit-cleanup records are protected and cannot be deleted.
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex items-center gap-1 p-1 rounded-lg bg-[#070B14] border border-slate-800 text-xs">
+                        {(['active', 'archived', 'all'] as const).map((sc) => (
+                          <button
+                            key={sc}
+                            type="button"
+                            onClick={() => {
+                              setSelectedAuditIds([]);
+                              setAuditScope(sc);
+                            }}
+                            className={`px-2.5 py-1 rounded capitalize ${
+                              auditScope === sc ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            {sc}
+                          </button>
+                        ))}
+                      </div>
+                      <input
+                        type="search"
+                        value={auditFilter}
+                        onChange={(e) => setAuditFilter(e.target.value)}
+                        placeholder="Search action, admin, target..."
+                        className="h-8 w-48 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => loadTabData('audit')}
+                        aria-label="Refresh audit logs"
+                        className="h-8 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-slate-300 hover:text-white inline-flex items-center gap-1 text-xs"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {hasPerm('audit.manage') ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const visibleIds = auditLogs.map((l) => String(l.id));
+                            if (selectedAuditIds.length === visibleIds.length && visibleIds.length > 0) {
+                              setSelectedAuditIds([]);
+                            } else {
+                              setSelectedAuditIds(visibleIds);
+                            }
+                          }}
+                          className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                        >
+                          {selectedAuditIds.length > 0 && selectedAuditIds.length === auditLogs.length
+                            ? 'Clear Selection'
+                            : 'Select All'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={selectedAuditIds.length === 0}
+                          onClick={() => {
+                            setConfirmReason('Manual administrative archive');
+                            setConfirmAction({ kind: 'archive_audit_selected', ids: selectedAuditIds });
+                          }}
+                          className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200 disabled:opacity-45 inline-flex items-center gap-1.5"
+                        >
+                          <Archive className="w-3.5 h-3.5" />
+                          <span>Archive Selected ({selectedAuditIds.length})</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setConfirmReason(`Archived entries older than ${auditRetentionDays} days`);
+                            setConfirmAction({ kind: 'archive_audit_older', days: auditRetentionDays });
+                          }}
+                          className="h-8 px-3 rounded-lg bg-[#131C31] border border-slate-700 text-slate-200 inline-flex items-center gap-1.5"
+                        >
+                          <Archive className="w-3.5 h-3.5" />
+                          <span>Archive &gt;{auditRetentionDays}d</span>
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={selectedAuditIds.length === 0}
+                          onClick={() => setConfirmAction({ kind: 'delete_audit_selected', ids: selectedAuditIds })}
+                          className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 disabled:opacity-45 inline-flex items-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete Selected Eligible ({selectedAuditIds.length})</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={auditSummary.archivedCount === 0}
+                          onClick={() => setConfirmAction({ kind: 'delete_audit_archived' })}
+                          className="h-8 px-3 rounded-lg bg-red-600 hover:bg-red-500 text-white disabled:opacity-45 inline-flex items-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete Archived Eligible</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400">
+                      Read-only Audit View — <code className="text-slate-300">audit.manage</code> permission is required to archive or clean up eligible records.
+                    </div>
+                  )}
+                </div>
+
+                {auditLogs.length === 0 ? (
+                  <div className="p-6 text-xs text-slate-400">
+                    No audit logs matched scope "{auditScope}".
+                  </div>
+                ) : (
+                  auditLogs.map((log) => {
+                    const logId = String(log.id);
+                    const isProtected = Number(log.is_protected || 0) === 1;
+                    const isArchived = Number(log.is_archived || 0) === 1;
+                    const checked = selectedAuditIds.includes(logId);
                     return (
-                      String(log.action || '').toLowerCase().includes(q) ||
-                      String(log.admin_identifier || '').toLowerCase().includes(q) ||
-                      String(log.target_type || '').toLowerCase().includes(q)
+                      <div key={logId} className="p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+                        <div className="flex items-start gap-2.5 min-w-0">
+                          {hasPerm('audit.manage') && (
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() =>
+                                setSelectedAuditIds((prev) =>
+                                  prev.includes(logId) ? prev.filter((id) => id !== logId) : [...prev, logId]
+                                )
+                              }
+                              aria-label={`Select audit log ${String(log.action)}`}
+                              className="mt-1 accent-blue-500"
+                            />
+                          )}
+                          <div className="space-y-0.5 min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-semibold text-white">{String(log.action)}</span>
+                              {isProtected && (
+                                <span className="px-1.5 py-0.5 rounded bg-amber-950/70 border border-amber-700/50 text-amber-300 text-[10px] inline-flex items-center gap-1">
+                                  <ShieldAlert className="w-3 h-3" />
+                                  Protected
+                                </span>
+                              )}
+                              {isArchived && (
+                                <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 text-[10px]">
+                                  Archived
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-slate-400">
+                              by {String(log.admin_identifier)} · {String(log.target_type)}:{String(log.target_id)}
+                            </div>
+                            {isArchived && Boolean(log.archive_actor || log.archive_reason) && (
+                              <div className="text-[11px] text-slate-500">
+                                Archived by {String(log.archive_actor || 'system')}
+                                {log.archive_reason ? ` — ${String(log.archive_reason)}` : ''}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="text-slate-500 font-mono-nums">
+                            {new Date(String(log.created_at) + 'Z').toLocaleString()}
+                          </span>
+                          {hasPerm('audit.manage') && !isArchived && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmReason('Archived by administrator');
+                                setConfirmAction({ kind: 'archive_audit_selected', ids: [logId] });
+                              }}
+                              className="h-7 px-2.5 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 hover:border-amber-600"
+                            >
+                              Archive
+                            </button>
+                          )}
+                          {hasPerm('audit.manage') && !isProtected && (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmAction({ kind: 'delete_audit_single', log })}
+                              aria-label={`Delete audit entry ${String(log.action)}`}
+                              className="h-7 px-2.5 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              <span>Delete</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     );
                   })
-                  .map((log) => (
-                    <div key={String(log.id)} className="p-3.5 flex flex-wrap justify-between gap-2 text-xs">
-                      <div>
-                        <span className="font-semibold text-white">{String(log.action)}</span>
-                        <span className="text-slate-400 ml-2">
-                          by {String(log.admin_identifier)} ({String(log.target_type)}:{String(log.target_id)})
-                        </span>
-                      </div>
-                      <span className="text-slate-500 font-mono-nums">
-                        {new Date(String(log.created_at) + 'Z').toLocaleString()}
-                      </span>
-                    </div>
-                  ))
-              )}
+                )}
+              </div>
             </div>
           )}
         </section>
       </div>
+
+      {/* Admin Delete Shop Confirmation */}
+      <ConfirmDialog
+        open={Boolean(deleteShopTarget)}
+        title={`Delete Shop "${String(deleteShopTarget?.name || '')}"`}
+        description="This closes the storefront across SOFUMER and notifies the shop owner."
+        consequences={[
+          'The shop is immediately marked closed and hidden from marketplace browsing and search.',
+          'Listings with historical orders or reviews are archived to preserve records; listings without history are removed along with exclusive media.',
+          'Active promotions and pending Telegram Stars invoices for this shop are stopped.',
+          'The owner user account remains active, and this action is recorded in Protected Audit Logs.',
+        ]}
+        confirmLabel="Delete Shop"
+        variant="danger"
+        confirmTextMatch={String(deleteShopTarget?.name || '')}
+        reasonLabel="Administrative Reason (Optional)"
+        reasonPlaceholder="e.g. Storefront closed at owner request or policy enforcement"
+        reasonValue={deleteShopReason}
+        onReasonChange={setDeleteShopReason}
+        busy={actionBusy}
+        onConfirm={async () => {
+          if (!deleteShopTarget || actionBusy) return;
+          setActionBusy(true);
+          try {
+            const res = await apiFetch<{
+              deleted: boolean;
+              archivedProductsCount?: number;
+              deletedProductsCount?: number;
+            }>(`/api/admin/shops/${String(deleteShopTarget.id)}`, {
+              method: 'DELETE',
+              isAdmin: true,
+              body: JSON.stringify({
+                confirm: true,
+                confirmShopName: String(deleteShopTarget.name || ''),
+                reason: deleteShopReason.trim(),
+              }),
+            });
+            setDeleteShopTarget(null);
+            setDeleteShopReason('');
+            await loadTabData('shops');
+            notify(
+              `Shop closed (${res.deletedProductsCount ?? 0} removed, ${res.archivedProductsCount ?? 0} archived).`,
+              'info'
+            );
+          } catch (err) {
+            notify(err instanceof Error ? err.message : 'Shop deletion failed', 'error');
+          } finally {
+            setActionBusy(false);
+          }
+        }}
+        onCancel={() => {
+          if (!actionBusy) setDeleteShopTarget(null);
+        }}
+      />
+
+      {/* Shared Admin Confirmation Modal */}
+      {(() => {
+        if (!confirmAction) return null;
+        let title = 'Confirm Action';
+        let description = '';
+        let consequences: string[] = [];
+        let confirmLabel = 'Confirm';
+        let variant: 'danger' | 'warning' | 'primary' = 'danger';
+        let showReason = false;
+
+        if (confirmAction.kind === 'delete_product') {
+          title = `Delete Listing "${String(confirmAction.product.title || '')}"`;
+          description = 'Remove this marketplace listing as an administrator.';
+          consequences = [
+            'If historical orders or reviews reference this product, it is archived cleanly.',
+            'Otherwise, the listing and exclusive media are permanently deleted.',
+          ];
+          confirmLabel = 'Delete Listing';
+          showReason = true;
+        } else if (confirmAction.kind === 'delete_category') {
+          title = `Delete Category "${String(confirmAction.category.name || '')}"`;
+          description = 'Permanently delete this category from the catalog.';
+          consequences = [
+            'Deletion succeeds only if no subcategories or listings reference this category.',
+          ];
+          confirmLabel = 'Delete Category';
+        } else if (confirmAction.kind === 'delete_subcategory') {
+          title = `Delete Subcategory "${String(confirmAction.sub.name || '')}"`;
+          description = 'Permanently delete this subcategory.';
+          consequences = [
+            'Deletion succeeds only if no product listings currently reference this subcategory.',
+          ];
+          confirmLabel = 'Delete Subcategory';
+        } else if (confirmAction.kind === 'delete_review') {
+          title = 'Remove Buyer Review';
+          description = `Remove review on "${String(confirmAction.review.product_title || '')}"?`;
+          consequences = [
+            'Review status is set to removed and hidden from buyers.',
+            'Product and shop average ratings are automatically recalculated.',
+          ];
+          confirmLabel = 'Remove Review';
+        } else if (confirmAction.kind === 'delete_ticket') {
+          title = `Delete Support Ticket "${String(confirmAction.ticket.subject || '')}"`;
+          description = 'Permanently delete this resolved/closed support ticket record.';
+          consequences = ['Only resolved or closed tickets may be deleted.'];
+          confirmLabel = 'Delete Ticket';
+        } else if (confirmAction.kind === 'delete_notification') {
+          title = `Delete Broadcast "${String(confirmAction.notif.title || '')}"`;
+          description = 'Remove this broadcast notification from user feeds.';
+          consequences = [
+            'If this broadcast currently drives the top marketplace announcement banner, the banner is also cleared.',
+          ];
+          confirmLabel = 'Delete Broadcast';
+        } else if (confirmAction.kind === 'archive_audit_selected') {
+          title = `Archive ${confirmAction.ids.length} Audit Log(s)`;
+          description = 'Move selected audit logs into the compliance archive view.';
+          consequences = ['Archived entries remain preserved for compliance and can be inspected under the Archived scope.'];
+          confirmLabel = 'Archive Logs';
+          variant = 'warning';
+          showReason = true;
+        } else if (confirmAction.kind === 'archive_audit_older') {
+          title = `Archive Audit Logs Older Than ${confirmAction.days} Days`;
+          description = 'Move eligible older active audit logs into the archive.';
+          consequences = [
+            'No records are deleted during archival; archive provenance metadata is recorded.',
+          ];
+          confirmLabel = 'Archive Older Logs';
+          variant = 'warning';
+          showReason = true;
+        } else if (confirmAction.kind === 'delete_audit_single') {
+          title = `Delete Audit Log "${String(confirmAction.log.action || '')}"`;
+          description = 'Permanently remove this unprotected routine audit log entry.';
+          consequences = ['This deletion itself will be logged in a protected audit entry.'];
+          confirmLabel = 'Delete Log';
+        } else if (confirmAction.kind === 'delete_audit_selected') {
+          title = `Delete Eligible Selected Audit Logs (${confirmAction.ids.length})`;
+          description = 'Delete selected routine audit entries from the database.';
+          consequences = [
+            'Protected security logs (RBAC changes, shop deletions, audit operations) and your own sensitive records are automatically skipped.',
+            'The cleanup summary will be recorded in Protected Audit Logs.',
+          ];
+          confirmLabel = 'Delete Eligible Logs';
+        } else if (confirmAction.kind === 'delete_audit_archived') {
+          title = 'Delete Eligible Archived Audit Logs';
+          description = 'Purge non-protected audit entries currently stored in Archived scope.';
+          consequences = [
+            'Protected security logs remain preserved even when archived.',
+            'An immutable summary entry will record the cleanup.',
+          ];
+          confirmLabel = 'Purge Eligible Archived';
+        }
+
+        return (
+          <ConfirmDialog
+            open
+            title={title}
+            description={description}
+            consequences={consequences}
+            confirmLabel={confirmLabel}
+            variant={variant}
+            reasonLabel="Reason / Note (Optional)"
+            reasonValue={showReason ? confirmReason : undefined}
+            onReasonChange={showReason ? setConfirmReason : undefined}
+            busy={actionBusy}
+            onConfirm={async () => {
+              if (!confirmAction || actionBusy) return;
+              setActionBusy(true);
+              try {
+                if (confirmAction.kind === 'delete_product') {
+                  const res = await apiFetch<{ deleted: boolean; mode?: string }>(
+                    `/api/admin/products/${String(confirmAction.product.id)}`,
+                    {
+                      method: 'DELETE',
+                      isAdmin: true,
+                      body: JSON.stringify({ reason: confirmReason.trim() }),
+                    }
+                  );
+                  await loadTabData('products');
+                  notify(`Listing ${res.mode === 'archived' ? 'archived' : 'deleted'}.`, 'info');
+                } else if (confirmAction.kind === 'delete_category') {
+                  await apiFetch(`/api/admin/categories/${String(confirmAction.category.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('categories');
+                  await refreshBootstrap();
+                  notify('Category deleted.', 'info');
+                } else if (confirmAction.kind === 'delete_subcategory') {
+                  await apiFetch(`/api/admin/subcategories/${String(confirmAction.sub.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('categories');
+                  await refreshBootstrap();
+                  notify('Subcategory deleted.', 'info');
+                } else if (confirmAction.kind === 'delete_review') {
+                  await apiFetch(`/api/admin/reviews/${String(confirmAction.review.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('reviews');
+                  notify('Review removed and ratings recalculated.', 'info');
+                } else if (confirmAction.kind === 'delete_ticket') {
+                  await apiFetch(`/api/admin/support/${String(confirmAction.ticket.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('support');
+                  notify('Support ticket deleted.', 'info');
+                } else if (confirmAction.kind === 'delete_notification') {
+                  await apiFetch(`/api/admin/notifications/${String(confirmAction.notif.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('notifications');
+                  await refreshBootstrap();
+                  notify('Broadcast notification deleted.', 'info');
+                } else if (confirmAction.kind === 'archive_audit_selected') {
+                  const res = await apiFetch<{ archivedCount: number }>('/api/admin/audit-logs/archive', {
+                    method: 'POST',
+                    isAdmin: true,
+                    body: JSON.stringify({ ids: confirmAction.ids, reason: confirmReason.trim() }),
+                  });
+                  setSelectedAuditIds([]);
+                  await loadTabData('audit');
+                  notify(`Archived ${res.archivedCount} audit log(s).`, 'success');
+                } else if (confirmAction.kind === 'archive_audit_older') {
+                  const res = await apiFetch<{ archivedCount: number }>('/api/admin/audit-logs/archive', {
+                    method: 'POST',
+                    isAdmin: true,
+                    body: JSON.stringify({ olderThanDays: confirmAction.days, reason: confirmReason.trim() }),
+                  });
+                  setSelectedAuditIds([]);
+                  await loadTabData('audit');
+                  notify(`Archived ${res.archivedCount} older audit log(s).`, 'success');
+                } else if (confirmAction.kind === 'delete_audit_single') {
+                  await apiFetch(`/api/admin/audit-logs/${String(confirmAction.log.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('audit');
+                  notify('Audit log entry deleted.', 'info');
+                } else if (confirmAction.kind === 'delete_audit_selected') {
+                  const res = await apiFetch<{ deletedCount: number; skippedProtectedCount: number }>(
+                    '/api/admin/audit-logs',
+                    {
+                      method: 'DELETE',
+                      isAdmin: true,
+                      body: JSON.stringify({ ids: confirmAction.ids }),
+                    }
+                  );
+                  setSelectedAuditIds([]);
+                  await loadTabData('audit');
+                  notify(
+                    `Deleted ${res.deletedCount} log(s)${
+                      res.skippedProtectedCount ? ` (${res.skippedProtectedCount} protected skipped)` : ''
+                    }.`,
+                    'info'
+                  );
+                } else if (confirmAction.kind === 'delete_audit_archived') {
+                  const res = await apiFetch<{ deletedCount: number; skippedProtectedCount: number }>(
+                    '/api/admin/audit-logs',
+                    {
+                      method: 'DELETE',
+                      isAdmin: true,
+                      body: JSON.stringify({ scope: 'archived' }),
+                    }
+                  );
+                  setSelectedAuditIds([]);
+                  await loadTabData('audit');
+                  notify(
+                    `Deleted ${res.deletedCount} archived log(s)${
+                      res.skippedProtectedCount ? ` (${res.skippedProtectedCount} protected preserved)` : ''
+                    }.`,
+                    'info'
+                  );
+                }
+                setConfirmAction(null);
+                setConfirmReason('');
+              } catch (err) {
+                notify(err instanceof Error ? err.message : 'Action failed', 'error');
+              } finally {
+                setActionBusy(false);
+              }
+            }}
+            onCancel={() => {
+              if (!actionBusy) {
+                setConfirmAction(null);
+                setConfirmReason('');
+              }
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }

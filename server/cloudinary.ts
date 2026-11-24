@@ -524,8 +524,8 @@ export async function destroyUnreferencedCloudinaryAssetsLocal(
       .prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?')
       .get(publicId) as { cnt: number };
     const shopRow = db
-      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
-      .get(`%/${publicId}%`, `%/${publicId}%`) as { cnt: number };
+      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (INSTR(logo_url, ?) > 0 OR INSTR(banner_url, ?) > 0)")
+      .get(`/${publicId}`, `/${publicId}`) as { cnt: number };
     if ((row?.cnt ?? 0) === 0 && (shopRow?.cnt ?? 0) === 0) {
       const rType = asset.resource_type === 'video' ? 'video' : 'image';
       await destroyCloudinaryAsset(config, rType, publicId);
@@ -545,8 +545,8 @@ export async function destroyExclusiveShopCloudinaryAssetsLocal(
     if (!publicId || !publicId.startsWith('sofumer/shops/') || seen.has(publicId)) continue;
     seen.add(publicId);
     const shopRef = db
-      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
-      .get(`%/${publicId}%`, `%/${publicId}%`) as { cnt: number };
+      .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (INSTR(logo_url, ?) > 0 OR INSTR(banner_url, ?) > 0)")
+      .get(`/${publicId}`, `/${publicId}`) as { cnt: number };
     const mediaRef = db
       .prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?')
       .get(publicId) as { cnt: number };

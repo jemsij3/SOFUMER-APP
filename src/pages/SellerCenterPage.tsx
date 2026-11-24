@@ -26,6 +26,7 @@ import { openTelegramInvoice } from '../lib/telegram';
 import type { Product, ProductDigitalAsset, ProductMedia, Shop, StarsPayment } from '../types';
 import { ImageWithFallback } from '../components/ImageWithFallback';
 import { ProductMediaManager, type DraftMediaItem } from '../components/ProductMediaManager';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 type SellerModule =
   | 'dashboard'
@@ -83,6 +84,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const {
     user,
     sellerProfile,
+    shop,
     categories,
     subcategories,
     countries,
@@ -168,6 +170,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
 
   // Digital delivery asset editor state
   const [digitalEditProduct, setDigitalEditProduct] = useState<Product | null>(null);
+  const [digitalAssetExists, setDigitalAssetExists] = useState(false);
   const [digitalAssetLoading, setDigitalAssetLoading] = useState(false);
   const [digitalAssetSaving, setDigitalAssetSaving] = useState(false);
   const [digitalR2Configured, setDigitalR2Configured] = useState(false);
@@ -177,8 +180,18 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [digitalDownloadLimit, setDigitalDownloadLimit] = useState('5');
   const [digitalUploadFile, setDigitalUploadFile] = useState<File | null>(null);
 
+  // Deletion confirmation dialogs state
+  const [deleteProductTarget, setDeleteProductTarget] = useState<Product | null>(null);
+  const [confirmDeleteDigitalOpen, setConfirmDeleteDigitalOpen] = useState(false);
+  const [deletePromoTarget, setDeletePromoTarget] = useState<SellerDashboardData['promotions'][number] | null>(null);
+  const [deleteShopOpen, setDeleteShopOpen] = useState(false);
+  const [deleteShopReason, setDeleteShopReason] = useState('');
+  const [actionBusy, setActionBusy] = useState(false);
+
   const loadSellerData = useCallback(async () => {
-    if (!user || !sellerProfile) {
+    if (!user || !sellerProfile || !shop) {
+      setDash(null);
+      setProducts([]);
       setLoading(false);
       return;
     }
@@ -204,7 +217,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     } finally {
       setLoading(false);
     }
-  }, [user, sellerProfile]);
+  }, [user, sellerProfile, shop]);
 
   useEffect(() => {
     loadSellerData();
@@ -248,8 +261,8 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     }
   }
 
-  // Show Seller Registration Form if user is not yet a seller
-  if (!sellerProfile) {
+  // Show Seller Registration Form if user has no seller profile or no active shop
+  if (!sellerProfile || !shop) {
     return (
       <div className="max-w-2xl mx-auto space-y-6 pb-12">
         <button type="button" onClick={goBack} className="inline-flex items-center gap-2 text-sm text-slate-300 hover:text-white min-h-[44px]">
@@ -627,13 +640,102 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     }
   }
 
-  async function deleteProduct(id: string) {
+  async function confirmDeleteProduct() {
+    if (!deleteProductTarget || actionBusy) return;
+    setActionBusy(true);
     try {
-      await apiFetch(`/api/seller/products/${id}`, { method: 'DELETE' });
-      notify('Listing deleted', 'info');
+      const res = await apiFetch<{ deleted: boolean; archived?: boolean }>(
+        `/api/seller/products/${deleteProductTarget.id}`,
+        { method: 'DELETE' }
+      );
+      if (digitalEditProduct?.id === deleteProductTarget.id) {
+        setDigitalEditProduct(null);
+        setDigitalAssetExists(false);
+      }
+      setDeleteProductTarget(null);
+      notify(
+        res.archived
+          ? 'Listing archived because historical orders or reviews exist.'
+          : 'Listing permanently deleted.',
+        'info'
+      );
       await loadSellerData();
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Delete failed', 'error');
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function confirmDeleteDigitalAsset() {
+    if (!digitalEditProduct || actionBusy) return;
+    setActionBusy(true);
+    try {
+      await apiFetch(`/api/seller/products/${digitalEditProduct.id}/digital-asset`, {
+        method: 'DELETE',
+      });
+      setConfirmDeleteDigitalOpen(false);
+      setDigitalAssetExists(false);
+      setDigitalFileName('');
+      setDigitalInstructions('');
+      setDigitalLicenseTpl('');
+      setDigitalUploadFile(null);
+      notify('Digital delivery package removed.', 'info');
+      await loadSellerData();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to remove digital package', 'error');
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function confirmDeletePromotion() {
+    if (!deletePromoTarget || actionBusy) return;
+    setActionBusy(true);
+    try {
+      await apiFetch(`/api/seller/promotions/${deletePromoTarget.id}`, {
+        method: 'DELETE',
+      });
+      setDeletePromoTarget(null);
+      notify('Pending promotion cancelled and removed.', 'info');
+      await loadSellerData();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to cancel promotion', 'error');
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function confirmDeleteMyShop() {
+    if (!dash?.shop || actionBusy) return;
+    setActionBusy(true);
+    try {
+      const res = await apiFetch<{
+        deleted: boolean;
+        archivedProductsCount?: number;
+        deletedProductsCount?: number;
+      }>('/api/seller/shop', {
+        method: 'DELETE',
+        body: JSON.stringify({
+          confirmShopName: dash.shop.name,
+          confirm: true,
+          reason: deleteShopReason.trim(),
+        }),
+      });
+      setDeleteShopOpen(false);
+      setDeleteShopReason('');
+      setDash(null);
+      setProducts([]);
+      await refreshSession();
+      switchTab('home');
+      notify(
+        `Shop closed (${res.deletedProductsCount ?? 0} removed, ${res.archivedProductsCount ?? 0} archived with order/review history).`,
+        'info'
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to close shop', 'error');
+    } finally {
+      setActionBusy(false);
     }
   }
 
@@ -690,12 +792,14 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
 
   async function openDigitalAssetEditor(p: Product) {
     setDigitalEditProduct(p);
+    setDigitalAssetExists(Boolean(p.has_digital_package));
     setDigitalUploadFile(null);
     setDigitalAssetLoading(true);
     try {
       const res = await apiFetch<{ asset: ProductDigitalAsset | null; r2Configured: boolean }>(
         `/api/seller/products/${p.id}/digital-asset`
       );
+      setDigitalAssetExists(Boolean(res.asset));
       setDigitalR2Configured(Boolean(res.r2Configured));
       setDigitalFileName(res.asset?.file_name || '');
       setDigitalInstructions(res.asset?.delivery_instructions || p.digital_delivery_method || '');
@@ -1018,9 +1122,9 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                       </button>
                       <button
                         type="button"
-                        onClick={() => deleteProduct(p.id)}
-                        aria-label="Delete listing"
-                        className="h-9 w-9 rounded-lg bg-[#070B14] border border-slate-800 text-red-400 flex items-center justify-center"
+                        onClick={() => setDeleteProductTarget(p)}
+                        aria-label={`Delete listing ${p.title}`}
+                        className="h-9 w-9 rounded-lg bg-[#070B14] border border-slate-800 text-red-400 hover:border-red-700/70 flex items-center justify-center"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -1113,13 +1217,26 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                           Note: Object storage for binary archives is optional and currently omitted; delivery instructions and license keys are delivered as protected order receipts.
                         </p>
                       )}
-                      <button
-                        type="submit"
-                        disabled={digitalAssetSaving}
-                        className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-60"
-                      >
-                        {digitalAssetSaving ? 'Saving Package...' : 'Save Digital Package'}
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <button
+                          type="submit"
+                          disabled={digitalAssetSaving || actionBusy}
+                          className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-60"
+                        >
+                          {digitalAssetSaving ? 'Saving Package...' : 'Save Digital Package'}
+                        </button>
+                        {digitalAssetExists && (
+                          <button
+                            type="button"
+                            disabled={digitalAssetSaving || actionBusy}
+                            onClick={() => setConfirmDeleteDigitalOpen(true)}
+                            className="h-10 px-4 rounded-xl bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-60"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Remove Package</span>
+                          </button>
+                        )}
+                      </div>
                     </>
                   )}
                 </form>
@@ -1515,14 +1632,26 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
 
               <div className="space-y-2">
                 {dash.promotions.map((pr) => (
-                  <div key={pr.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800 flex justify-between text-xs">
+                  <div key={pr.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
                     <div>
                       <div className="font-semibold text-white">{pr.title}</div>
                       <div className="text-slate-400">{pr.promo_type} · {pr.duration_days} days</div>
                     </div>
-                    <div className="text-right font-mono-nums">
-                      <div className="text-white">${pr.price_amount} USD</div>
-                      <div className="text-blue-400">{pr.status}</div>
+                    <div className="flex items-center gap-3">
+                      <div className="text-right font-mono-nums">
+                        <div className="text-white">${pr.price_amount} USD</div>
+                        <div className="text-blue-400">{pr.status}</div>
+                      </div>
+                      {pr.status === 'pending' && (
+                        <button
+                          type="button"
+                          onClick={() => setDeletePromoTarget(pr)}
+                          className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 font-medium inline-flex items-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Cancel Pending</span>
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -1713,10 +1842,117 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                   Submit for Review
                 </button>
               </form>
+
+              <div className="lg:col-span-2 p-5 rounded-2xl bg-red-950/20 border border-red-900/60 flex flex-wrap items-center justify-between gap-4">
+                <div className="space-y-1 max-w-2xl">
+                  <h2 className="text-base font-semibold text-red-200">Danger Zone — Delete Shop</h2>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Closing <strong className="text-white">{dash.shop.name}</strong> removes your storefront from the public marketplace, pauses active promotions, cancels pending plan invoices, and deletes unreferenced listings. Listings linked to orders or reviews are archived to preserve buyer history. Your SOFUMER account remains intact.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteShopReason('');
+                    setDeleteShopOpen(true);
+                  }}
+                  className="h-10 px-4 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold inline-flex items-center gap-2 shrink-0"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>Delete My Shop</span>
+                </button>
+              </div>
             </div>
           )}
         </>
       )}
+
+      <ConfirmDialog
+        open={Boolean(deleteProductTarget)}
+        title="Delete Listing"
+        description={
+          deleteProductTarget
+            ? `Are you sure you want to remove "${deleteProductTarget.title}" from your storefront?`
+            : undefined
+        }
+        consequences={[
+          'If no orders or reviews reference this listing, the listing and its exclusive Cloudinary media will be permanently deleted.',
+          'If historical orders or reviews exist, it will be archived safely so customer records remain intact.',
+        ]}
+        confirmLabel="Delete Listing"
+        variant="danger"
+        busy={actionBusy}
+        onConfirm={confirmDeleteProduct}
+        onCancel={() => {
+          if (!actionBusy) setDeleteProductTarget(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={confirmDeleteDigitalOpen && Boolean(digitalEditProduct)}
+        title="Remove Digital Delivery Package"
+        description={
+          digitalEditProduct
+            ? `Remove the protected delivery instructions, license template, and stored file for "${digitalEditProduct.title}"?`
+            : undefined
+        }
+        consequences={[
+          'Buyers will no longer see an automated digital package on new orders unless you attach a new one.',
+          'Deletion is blocked automatically if paid or confirmed orders already exist for this product.',
+        ]}
+        confirmLabel="Remove Package"
+        variant="danger"
+        busy={actionBusy}
+        onConfirm={confirmDeleteDigitalAsset}
+        onCancel={() => {
+          if (!actionBusy) setConfirmDeleteDigitalOpen(false);
+        }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deletePromoTarget)}
+        title="Cancel Pending Promotion"
+        description={
+          deletePromoTarget
+            ? `Cancel and delete pending promotion "${deletePromoTarget.title}"?`
+            : undefined
+        }
+        consequences={[
+          'Any unpaid Telegram Stars invoice for this campaign will be cancelled.',
+          'The pending promotion record will be removed from your promotions list.',
+        ]}
+        confirmLabel="Cancel Promotion"
+        variant="warning"
+        busy={actionBusy}
+        onConfirm={confirmDeletePromotion}
+        onCancel={() => {
+          if (!actionBusy) setDeletePromoTarget(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={deleteShopOpen && Boolean(dash?.shop)}
+        title={`Close & Delete "${dash?.shop.name || 'Shop'}"`}
+        description="This immediately closes your SOFUMER storefront and takes all active listings offline."
+        consequences={[
+          'Your shop will immediately disappear from marketplace search, categories, and public shop URLs.',
+          'Products without orders or reviews will be deleted along with unreferenced media; products with order/review history will be archived.',
+          'Active promotions and pending Stars invoices will be stopped; historical buyer orders and chats remain accessible.',
+          'Your buyer account stays active, and you can open a new storefront later if you wish.',
+        ]}
+        confirmLabel="Permanently Close Shop"
+        variant="danger"
+        confirmTextMatch={dash?.shop.name || ''}
+        reasonLabel="Closure Reason (Optional)"
+        reasonPlaceholder="e.g. Consolidating storefront or pausing business"
+        reasonValue={deleteShopReason}
+        onReasonChange={setDeleteShopReason}
+        busy={actionBusy}
+        onConfirm={confirmDeleteMyShop}
+        onCancel={() => {
+          if (!actionBusy) setDeleteShopOpen(false);
+        }}
+      />
     </div>
   );
 }

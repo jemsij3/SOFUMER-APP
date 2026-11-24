@@ -58,7 +58,7 @@ export async function handleCommerceAndAccountRoutes(
          JOIN users other_u ON other_u.id = other_cp.user_id
          LEFT JOIN products p ON p.id = c.product_id
          LEFT JOIN shops s ON s.id = c.shop_id
-         WHERE cp.user_id = ?
+         WHERE cp.user_id = ? AND cp.is_hidden = 0
          ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`
       )
         .bind(auth.user.id)
@@ -179,32 +179,40 @@ export async function handleCommerceAndAccountRoutes(
             url.origin
           );
         }
-      } else if (initialMessage) {
+      } else {
         await env.DB.prepare(
-          `INSERT INTO messages (id, conversation_id, sender_user_id, body, message_type)
-           VALUES (?, ?, ?, ?, 'text')`
+          `UPDATE conversation_participants SET is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
         )
-          .bind(newId('msg'), conversationId, buyerId, initialMessage)
-          .run();
-        await env.DB.prepare(
-          `UPDATE conversations SET last_message_at = datetime('now'), last_message_preview = ? WHERE id = ?`
-        )
-          .bind(initialMessage.slice(0, 120), conversationId)
-          .run();
-        await env.DB.prepare(
-          `UPDATE conversation_participants SET unread_count = unread_count + 1 WHERE conversation_id = ? AND user_id = ?`
-        )
-          .bind(conversationId, sellerUserId)
+          .bind(conversationId, buyerId)
           .run();
 
-        await notifyUserAndTelegramEdge(
-          env,
-          sellerUserId,
-          'message',
-          `New Message: ${subject}`,
-          `${auth.user.display_name}: ${initialMessage.slice(0, 120)}`,
-          url.origin
-        );
+        if (initialMessage) {
+          await env.DB.prepare(
+            `INSERT INTO messages (id, conversation_id, sender_user_id, body, message_type)
+             VALUES (?, ?, ?, ?, 'text')`
+          )
+            .bind(newId('msg'), conversationId, buyerId, initialMessage)
+            .run();
+          await env.DB.prepare(
+            `UPDATE conversations SET last_message_at = datetime('now'), last_message_preview = ? WHERE id = ?`
+          )
+            .bind(initialMessage.slice(0, 120), conversationId)
+            .run();
+          await env.DB.prepare(
+            `UPDATE conversation_participants SET unread_count = unread_count + 1, is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
+          )
+            .bind(conversationId, sellerUserId)
+            .run();
+
+          await notifyUserAndTelegramEdge(
+            env,
+            sellerUserId,
+            'message',
+            `New Message: ${subject}`,
+            `${auth.user.display_name}: ${initialMessage.slice(0, 120)}`,
+            url.origin
+          );
+        }
       }
 
       return json({ conversationId }, 201);
@@ -301,9 +309,15 @@ export async function handleCommerceAndAccountRoutes(
         .bind(preview.slice(0, 120), convId)
         .run();
 
+      await env.DB.prepare(
+        `UPDATE conversation_participants SET is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
+      )
+        .bind(convId, auth.user.id)
+        .run();
+
       if (otherPart) {
         await env.DB.prepare(
-          `UPDATE conversation_participants SET unread_count = unread_count + 1 WHERE conversation_id = ? AND user_id = ?`
+          `UPDATE conversation_participants SET unread_count = unread_count + 1, is_hidden = 0 WHERE conversation_id = ? AND user_id = ?`
         )
           .bind(convId, otherPart.user_id)
           .run();
@@ -327,6 +341,84 @@ export async function handleCommerceAndAccountRoutes(
     }
 
     return methodNotAllowed(['GET', 'POST']);
+  }
+
+  const convMsgMatch = path.match(/^\/api\/conversations\/([^/]+)\/messages\/([^/]+)$/);
+  if (convMsgMatch) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const convId = decodeURIComponent(convMsgMatch[1]);
+    const messageId = decodeURIComponent(convMsgMatch[2]);
+
+    const part = await env.DB.prepare(
+      'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?'
+    )
+      .bind(convId, auth.user.id)
+      .first();
+    if (!part) return json({ error: 'Not authorized to modify this conversation.' }, 403);
+
+    const msg = await env.DB.prepare(
+      'SELECT id, sender_user_id, message_type, is_deleted FROM messages WHERE id = ? AND conversation_id = ?'
+    )
+      .bind(messageId, convId)
+      .first<{ id: string; sender_user_id: string; message_type: string; is_deleted: number }>();
+    if (!msg) return json({ error: 'Message not found.' }, 404);
+    if (msg.sender_user_id !== auth.user.id) {
+      return json({ error: 'You can only delete messages you sent.' }, 403);
+    }
+    if (msg.message_type === 'order_proposal' || msg.message_type === 'system') {
+      return json({ error: 'System and order proposal messages cannot be deleted.' }, 403);
+    }
+    if (msg.is_deleted) {
+      return json({ deleted: true, messageId });
+    }
+
+    await env.DB.prepare("UPDATE messages SET is_deleted = 1, body = '', attachment_url = '' WHERE id = ?")
+      .bind(messageId)
+      .run();
+
+    const latest = await env.DB.prepare(
+      `SELECT body, attachment_url, created_at
+       FROM messages
+       WHERE conversation_id = ? AND is_deleted = 0
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT 1`
+    )
+      .bind(convId)
+      .first<{ body: string; attachment_url: string; created_at: string }>();
+
+    if (latest) {
+      const nextPreview = (latest.body || (latest.attachment_url ? '[Image attachment]' : '')).slice(0, 120);
+      await env.DB.prepare('UPDATE conversations SET last_message_preview = ?, last_message_at = ? WHERE id = ?')
+        .bind(nextPreview, latest.created_at, convId)
+        .run();
+    } else {
+      await env.DB.prepare("UPDATE conversations SET last_message_preview = '' WHERE id = ?").bind(convId).run();
+    }
+
+    return json({ deleted: true, messageId });
+  }
+
+  const singleConvMatch = path.match(/^\/api\/conversations\/([^/]+)$/);
+  if (singleConvMatch) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const convId = decodeURIComponent(singleConvMatch[1]);
+    const part = await env.DB.prepare(
+      'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?'
+    )
+      .bind(convId, auth.user.id)
+      .first();
+    if (!part) return json({ error: 'Not authorized to hide this conversation.' }, 403);
+
+    await env.DB.prepare(
+      'UPDATE conversation_participants SET is_hidden = 1, unread_count = 0 WHERE conversation_id = ? AND user_id = ?'
+    )
+      .bind(convId, auth.user.id)
+      .run();
+    return json({ hidden: true, deleted: true, conversationId: convId });
   }
 
   // User blocks
@@ -898,11 +990,44 @@ export async function handleCommerceAndAccountRoutes(
   }
 
   if (path === '/api/account/notifications/read') {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeUser(request, env);
+      if ('error' in auth) return auth.error;
+      await env.DB.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').bind(auth.user.id).run();
+      return json({ read: true });
+    }
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeUser(request, env);
+      if ('error' in auth) return auth.error;
+      const del = await env.DB.prepare(
+        "DELETE FROM notifications WHERE user_id = ? AND is_read = 1 AND scope = 'user'"
+      )
+        .bind(auth.user.id)
+        .run();
+      return json({ deletedCount: del.meta?.changes ?? 0 });
+    }
+    return methodNotAllowed(['PATCH', 'DELETE']);
+  }
+
+  if (path.startsWith('/api/account/notifications/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
     const auth = await requireEdgeUser(request, env);
     if ('error' in auth) return auth.error;
-    await env.DB.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').bind(auth.user.id).run();
-    return json({ read: true });
+    const notifId = decodeURIComponent(path.slice('/api/account/notifications/'.length));
+    const notif = await env.DB.prepare('SELECT id, user_id, scope FROM notifications WHERE id = ?')
+      .bind(notifId)
+      .first<{ id: string; user_id: string | null; scope: string }>();
+    if (!notif) return json({ error: 'Notification not found.' }, 404);
+    if (notif.scope === 'global') {
+      return json({ error: 'Global marketplace announcements cannot be deleted by users.' }, 403);
+    }
+    if (notif.user_id !== auth.user.id) {
+      return json({ error: 'Notification not found.' }, 404);
+    }
+    await env.DB.prepare("DELETE FROM notifications WHERE id = ? AND user_id = ? AND scope = 'user'")
+      .bind(notifId, auth.user.id)
+      .run();
+    return json({ deleted: true, id: notifId });
   }
 
   if (path === '/api/account/support') {
@@ -934,6 +1059,24 @@ export async function handleCommerceAndAccountRoutes(
       return json({ ticketId, status: 'open' }, 201);
     }
     return methodNotAllowed(['GET', 'POST']);
+  }
+
+  if (path.startsWith('/api/account/support/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeUser(request, env);
+    if ('error' in auth) return auth.error;
+    const ticketId = decodeURIComponent(path.slice('/api/account/support/'.length));
+    const ticket = await env.DB.prepare('SELECT id, user_id, status FROM support_tickets WHERE id = ? AND user_id = ?')
+      .bind(ticketId, auth.user.id)
+      .first<{ id: string; user_id: string; status: string }>();
+    if (!ticket) return json({ error: 'Support ticket not found.' }, 404);
+    if (ticket.status !== 'open') {
+      return json({ error: 'Only open support tickets can be cancelled.' }, 409);
+    }
+    await env.DB.prepare('DELETE FROM support_tickets WHERE id = ? AND user_id = ?')
+      .bind(ticketId, auth.user.id)
+      .run();
+    return json({ deleted: true, cancelled: true, id: ticketId });
   }
 
   return json({ error: 'API endpoint not found.' }, 404);

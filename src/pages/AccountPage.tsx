@@ -11,17 +11,18 @@ import {
   Package,
   Shield,
   Store,
+  Trash2,
   User as UserIcon,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
 import type { Product } from '../types';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ProductCard } from '../components/ProductCard';
 
 export function AccountPage() {
   const {
     user,
-    sellerProfile,
     shop,
     countries,
     currencies,
@@ -126,7 +127,7 @@ export function AccountPage() {
                 className="h-10 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1.5"
               >
                 <Store className="w-4 h-4" />
-                <span>{sellerProfile ? 'Seller Center' : 'Sell on SOFUMER'}</span>
+                <span>{shop ? 'Seller Center' : 'Sell on SOFUMER'}</span>
               </button>
             </>
           )}
@@ -247,30 +248,81 @@ export function AccountPage() {
 }
 
 export function WishlistOrRecentPage({ mode }: { mode: 'wishlist' | 'recently_viewed' }) {
-  const { user, goBack, requireUserOrPrompt } = useApp();
+  const { user, goBack, requireUserOrPrompt, refreshSession, notify } = useApp();
   const [items, setItems] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [removingItem, setRemovingItem] = useState<Product | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!user) {
       setLoading(false);
       return;
     }
+    setLoading(true);
     const url = mode === 'wishlist' ? '/api/marketplace/favorites' : '/api/marketplace/recently-viewed';
     apiFetch<{ items: Product[] }>(url)
       .then((res) => setItems(res.items || []))
       .finally(() => setLoading(false));
   }, [user, mode]);
 
+  async function handleConfirmRemoveItem() {
+    if (!removingItem || busy) return;
+    setBusy(true);
+    try {
+      const endpoint =
+        mode === 'wishlist'
+          ? `/api/marketplace/favorites/${removingItem.id}`
+          : `/api/marketplace/recently-viewed/${removingItem.id}`;
+      await apiFetch(endpoint, { method: 'DELETE' });
+      setItems((prev) => prev.filter((item) => item.id !== removingItem.id));
+      await refreshSession();
+      notify(mode === 'wishlist' ? 'Removed from wishlist' : 'Removed from viewing history', 'info');
+      setRemovingItem(null);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to remove item', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmClearAll() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await apiFetch('/api/marketplace/recently-viewed', { method: 'DELETE' });
+      setItems([]);
+      notify('Recently viewed history cleared', 'info');
+      setConfirmClearAll(false);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to clear history', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-5 pb-12">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <button type="button" onClick={goBack} className="text-sm text-slate-300 hover:text-white min-h-[44px]">
           ← Back
         </button>
-        <h1 className="text-lg font-bold text-white">
-          {mode === 'wishlist' ? 'My Wishlist' : 'Recently Viewed'}
-        </h1>
+        <div className="flex items-center gap-3">
+          {mode === 'recently_viewed' && user && items.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setConfirmClearAll(true)}
+              className="h-9 px-3 rounded-xl bg-red-950/60 border border-red-800/50 text-red-200 hover:text-white text-xs font-medium inline-flex items-center gap-1.5"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Clear History</span>
+            </button>
+          )}
+          <h1 className="text-lg font-bold text-white">
+            {mode === 'wishlist' ? 'My Wishlist' : 'Recently Viewed'}
+          </h1>
+        </div>
       </div>
       {!user ? (
         <div className="p-8 rounded-2xl bg-[#0E1525] border border-slate-800 text-center space-y-3">
@@ -288,20 +340,66 @@ export function WishlistOrRecentPage({ mode }: { mode: 'wishlist' | 'recently_vi
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
           {items.map((p) => (
-            <ProductCard key={p.id} product={p} />
+            <div key={p.id} className="space-y-1.5">
+              <ProductCard product={p} />
+              <button
+                type="button"
+                onClick={() => setRemovingItem(p)}
+                className="w-full h-8 px-2.5 rounded-lg bg-[#0E1525] border border-slate-800 hover:border-red-800/60 text-[11px] text-slate-400 hover:text-red-300 flex items-center justify-center gap-1 transition-colors"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>{mode === 'wishlist' ? 'Remove from Wishlist' : 'Remove Entry'}</span>
+              </button>
+            </div>
           ))}
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(removingItem)}
+        title={mode === 'wishlist' ? 'Remove from Wishlist?' : 'Remove Viewing Entry?'}
+        description={
+          removingItem
+            ? `Remove "${removingItem.title}" from your ${mode === 'wishlist' ? 'saved wishlist' : 'recently viewed history'}?`
+            : undefined
+        }
+        confirmLabel="Remove"
+        variant="danger"
+        busy={busy}
+        onConfirm={handleConfirmRemoveItem}
+        onCancel={() => setRemovingItem(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmClearAll}
+        title="Clear Recently Viewed History?"
+        description="This will remove all products from your personal browsing history."
+        consequences={[
+          'All entries in your Recently Viewed list will be removed.',
+          'Your saved Wishlist and active Orders will not be affected.',
+        ]}
+        confirmLabel="Clear History"
+        variant="danger"
+        busy={busy}
+        onConfirm={handleConfirmClearAll}
+        onCancel={() => setConfirmClearAll(false)}
+      />
     </div>
   );
 }
 
 export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notifications' | 'support' | 'policies' }) {
   const { user, goBack, refreshSession, requireUserOrPrompt, notify } = useApp();
-  const [notifs, setNotifs] = useState<Array<{ id: string; title: string; body: string; created_at: string; is_read: number }>>([]);
+  const [notifs, setNotifs] = useState<
+    Array<{ id: string; title: string; body: string; created_at: string; is_read: number; scope?: string }>
+  >([]);
   const [tickets, setTickets] = useState<Array<{ id: string; subject: string; message: string; status: string; admin_response: string }>>([]);
   const [subject, setSubject] = useState('');
   const [message, setMessage] = useState('');
+  const [deleteNotifTarget, setDeleteNotifTarget] = useState<{ id: string; title: string } | null>(null);
+  const [confirmClearReadNotifs, setConfirmClearReadNotifs] = useState(false);
+  const [cancelTicketTarget, setCancelTicketTarget] = useState<{ id: string; subject: string } | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!user) return;
@@ -314,6 +412,58 @@ export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notification
       apiFetch<{ tickets: typeof tickets }>('/api/account/support').then((res) => setTickets(res.tickets || []));
     }
   }, [user, mode, refreshSession]);
+
+  async function handleConfirmDeleteNotif() {
+    if (!deleteNotifTarget || busy) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/account/notifications/${deleteNotifTarget.id}`, { method: 'DELETE' });
+      setNotifs((prev) => prev.filter((item) => item.id !== deleteNotifTarget.id));
+      await refreshSession();
+      notify('Notification deleted', 'info');
+      setDeleteNotifTarget(null);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to delete notification', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmClearReadNotifs() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const res = await apiFetch<{ deletedCount: number }>('/api/account/notifications/read', { method: 'DELETE' });
+      setNotifs((prev) => prev.filter((item) => item.scope === 'global' || item.is_read === 0));
+      await refreshSession();
+      notify(
+        res.deletedCount > 0
+          ? `Cleared ${res.deletedCount} personal notification(s)`
+          : 'No personal read notifications to clear',
+        'info'
+      );
+      setConfirmClearReadNotifs(false);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to clear notifications', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmCancelTicket() {
+    if (!cancelTicketTarget || busy) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/account/support/${cancelTicketTarget.id}`, { method: 'DELETE' });
+      setTickets((prev) => prev.filter((item) => item.id !== cancelTicketTarget.id));
+      notify('Support ticket cancelled', 'info');
+      setCancelTicketTarget(null);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to cancel support ticket', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (mode === 'policies') {
     return (
@@ -329,6 +479,8 @@ export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notification
     );
   }
 
+  const hasPersonalNotifs = notifs.some((n) => n.scope !== 'global');
+
   return (
     <div className="max-w-3xl mx-auto space-y-5 pb-12">
       <button type="button" onClick={goBack} className="text-sm text-slate-300 hover:text-white min-h-[44px]">← Back</button>
@@ -339,15 +491,46 @@ export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notification
         </div>
       ) : mode === 'notifications' ? (
         <div className="space-y-3">
-          <h1 className="text-lg font-bold text-white">Notifications</h1>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h1 className="text-lg font-bold text-white">Notifications</h1>
+            {hasPersonalNotifs && (
+              <button
+                type="button"
+                onClick={() => setConfirmClearReadNotifs(true)}
+                className="h-9 px-3 rounded-xl bg-[#0E1525] border border-slate-700 hover:border-red-800/60 text-xs text-slate-200 hover:text-red-200 inline-flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Clear Read Alerts</span>
+              </button>
+            )}
+          </div>
           {notifs.length === 0 ? (
             <div className="p-6 rounded-2xl bg-[#0E1525] border border-slate-800 text-sm text-slate-400">No notifications yet.</div>
           ) : (
             notifs.map((n) => (
-              <div key={n.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800">
-                <div className="text-sm font-semibold text-white">{n.title}</div>
-                <p className="text-xs text-slate-300 mt-1">{n.body}</p>
-                <div className="text-[11px] text-slate-500 mt-1.5 font-mono-nums">{new Date(n.created_at + 'Z').toLocaleString()}</div>
+              <div key={n.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-white">{n.title}</span>
+                    {n.scope === 'global' && (
+                      <span className="px-2 py-0.5 rounded bg-blue-950/60 border border-blue-800/50 text-[10px] text-blue-300">
+                        Announcement
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-300 mt-1">{n.body}</p>
+                  <div className="text-[11px] text-slate-500 mt-1.5 font-mono-nums">{new Date(n.created_at + 'Z').toLocaleString()}</div>
+                </div>
+                {n.scope !== 'global' && (
+                  <button
+                    type="button"
+                    aria-label="Delete notification"
+                    onClick={() => setDeleteNotifTarget({ id: n.id, title: n.title })}
+                    className="h-8 w-8 rounded-lg bg-[#070B14] border border-slate-800 hover:border-red-800/60 text-slate-400 hover:text-red-300 flex items-center justify-center shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
             ))
           )}
@@ -380,10 +563,22 @@ export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notification
           </form>
           <div className="space-y-2.5">
             {tickets.map((t) => (
-              <div key={t.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800 space-y-1">
-                <div className="flex justify-between text-xs">
+              <div key={t.id} className="p-4 rounded-xl bg-[#0E1525] border border-slate-800 space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-semibold text-white">{t.subject}</span>
-                  <span className="text-blue-400 uppercase">{t.status}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-blue-400 uppercase">{t.status}</span>
+                    {t.status === 'open' && (
+                      <button
+                        type="button"
+                        onClick={() => setCancelTicketTarget({ id: t.id, subject: t.subject })}
+                        className="h-7 px-2.5 rounded-lg bg-red-950/60 border border-red-800/50 text-red-200 hover:text-white inline-flex items-center gap-1"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Cancel Ticket</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <p className="text-xs text-slate-300">{t.message}</p>
                 {t.admin_response && (
@@ -396,6 +591,54 @@ export function NotificationsSupportPoliciesPage({ mode }: { mode: 'notification
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(deleteNotifTarget)}
+        title="Delete Notification?"
+        description={
+          deleteNotifTarget ? `Permanently delete notification "${deleteNotifTarget.title}"?` : undefined
+        }
+        confirmLabel="Delete Notification"
+        variant="danger"
+        busy={busy}
+        onConfirm={handleConfirmDeleteNotif}
+        onCancel={() => setDeleteNotifTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmClearReadNotifs}
+        title="Clear Read Personal Alerts?"
+        description="Removes all read notifications addressed to your account."
+        consequences={[
+          'Global marketplace announcements will remain visible.',
+          'This action cannot be undone.',
+        ]}
+        confirmLabel="Clear Read Alerts"
+        variant="danger"
+        busy={busy}
+        onConfirm={handleConfirmClearReadNotifs}
+        onCancel={() => setConfirmClearReadNotifs(false)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(cancelTicketTarget)}
+        title="Cancel Support Ticket?"
+        description={
+          cancelTicketTarget
+            ? `Cancel and delete your open support ticket "${cancelTicketTarget.subject}"?`
+            : undefined
+        }
+        consequences={[
+          'Support staff will no longer see or reply to this open request.',
+          'Once a ticket is in progress or resolved, it cannot be cancelled.',
+        ]}
+        confirmLabel="Cancel Ticket"
+        variant="danger"
+        busy={busy}
+        onConfirm={handleConfirmCancelTicket}
+        onCancel={() => setCancelTicketTarget(null)}
+      />
     </div>
   );
 }
+

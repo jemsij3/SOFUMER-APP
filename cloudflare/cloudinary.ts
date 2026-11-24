@@ -555,8 +555,8 @@ export async function destroyUnreferencedCloudinaryAssets(
     const [mediaRefRow, shopRefRow] = await Promise.all([
       db.prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?').bind(publicId).first<{ cnt: number }>(),
       db
-        .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
-        .bind(`%/${publicId}%`, `%/${publicId}%`)
+        .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (INSTR(logo_url, ?) > 0 OR INSTR(banner_url, ?) > 0)")
+        .bind(`/${publicId}`, `/${publicId}`)
         .first<{ cnt: number }>(),
     ]);
     if ((mediaRefRow?.cnt ?? 0) === 0 && (shopRefRow?.cnt ?? 0) === 0) {
@@ -581,8 +581,8 @@ export async function destroyExclusiveShopCloudinaryAssets(
     seen.add(publicId);
     const [shopRef, mediaRef] = await Promise.all([
       db
-        .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (logo_url LIKE ? OR banner_url LIKE ?)")
-        .bind(`%/${publicId}%`, `%/${publicId}%`)
+        .prepare("SELECT COUNT(*) as cnt FROM shops WHERE status != 'closed' AND (INSTR(logo_url, ?) > 0 OR INSTR(banner_url, ?) > 0)")
+        .bind(`/${publicId}`, `/${publicId}`)
         .first<{ cnt: number }>(),
       db.prepare('SELECT COUNT(*) as cnt FROM product_media WHERE public_id = ?').bind(publicId).first<{ cnt: number }>(),
     ]);

@@ -8,6 +8,7 @@ import {
   VALID_PERMISSION_KEYS,
   checkProhibitedKeywordsEdge,
   hasEdgeAdminPermission,
+  isAuditActionProtected,
   isTelegramIdAdmin,
   json,
   methodNotAllowed,
@@ -19,6 +20,8 @@ import {
   sanitizeText,
   slugify,
 } from './helpers.ts';
+import { destroyUnreferencedCloudinaryAssets } from './cloudinary.ts';
+import { executeEdgeShopSoftDelete } from './routes-seller.ts';
 import {
   coerceAiString,
   normalizeAiJsonObject,
@@ -26,6 +29,19 @@ import {
   runWorkersAiWithJsonFallback,
   sanitizeAiErrorForUser,
 } from './ai-normalizer.ts';
+
+async function parseOptionalJsonBody(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const raw = await request.text();
+    if (!raw.trim()) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
 
 async function validateAndNormalizeSetting(
   db: D1Database,
@@ -96,6 +112,12 @@ async function validateAndNormalizeSetting(
         return { ok: false, error: 'max_product_video_mb must be between 5 and 100 MB.', status: 400 };
       }
       return { ok: true, value: String(Number(num.toFixed(1))) };
+    }
+    if (key === 'audit_retention_days') {
+      if (!Number.isInteger(num) || num < 7 || num > 3650) {
+        return { ok: false, error: 'audit_retention_days must be a whole number between 7 and 3,650 days.', status: 400 };
+      }
+      return { ok: true, value: String(num) };
     }
     if (num < 0) {
       return { ok: false, error: `${key} must be a non-negative number.`, status: 400 };
@@ -181,7 +203,9 @@ export async function handleAdminRoutes(
       `SELECT
          (SELECT COUNT(*) FROM users) as total_users,
          (SELECT COUNT(*) FROM seller_profiles) as total_sellers,
-         (SELECT COUNT(*) FROM shops) as total_shops,
+         (SELECT COUNT(*) FROM shops WHERE status != 'closed') as total_shops,
+         (SELECT COUNT(*) FROM shops WHERE status = 'active') as active_shops,
+         (SELECT COUNT(*) FROM shops WHERE status = 'closed') as closed_shops,
          (SELECT COUNT(*) FROM products) as total_products,
          (SELECT COUNT(*) FROM products WHERE status = 'pending_review') as pending_products,
          (SELECT COUNT(*) FROM orders) as total_orders,
@@ -236,7 +260,7 @@ export async function handleAdminRoutes(
                 (SELECT COUNT(*) FROM reviews WHERE status = 'published') as published_reviews
          FROM products`
       ).first(),
-      env.DB.prepare('SELECT verification_status, COUNT(*) as cnt FROM shops GROUP BY verification_status').all(),
+      env.DB.prepare("SELECT verification_status, COUNT(*) as cnt FROM shops WHERE status != 'closed' GROUP BY verification_status").all(),
     ]);
 
     return json({
@@ -332,7 +356,10 @@ export async function handleAdminRoutes(
       `SELECT sp.*, u.display_name, u.telegram_username, s.id as shop_id, s.name as shop_name,
               s.slug as shop_slug, s.status as shop_status, s.is_featured, s.verification_status as shop_verification_status
        FROM seller_profiles sp JOIN users u ON u.id = sp.user_id
-       LEFT JOIN shops s ON s.seller_id = sp.id ORDER BY sp.created_at DESC`
+       LEFT JOIN shops s ON s.id = (
+         SELECT s2.id FROM shops s2 WHERE s2.seller_id = sp.id AND s2.status != 'closed' ORDER BY s2.created_at DESC LIMIT 1
+       )
+       ORDER BY sp.created_at DESC`
     ).all();
     return json({ sellers: sellers.results });
   }
@@ -363,7 +390,7 @@ export async function handleAdminRoutes(
       await env.DB.prepare("UPDATE seller_profiles SET status = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(status, seller.id)
         .run();
-      await env.DB.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE seller_id = ?")
+      await env.DB.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE seller_id = ? AND status != 'closed'")
         .bind(status, seller.id)
         .run();
     }
@@ -371,7 +398,7 @@ export async function handleAdminRoutes(
       await env.DB.prepare('UPDATE seller_profiles SET verification_status = ? WHERE id = ?')
         .bind(verificationStatus, seller.id)
         .run();
-      await env.DB.prepare('UPDATE shops SET verification_status = ? WHERE seller_id = ?')
+      await env.DB.prepare("UPDATE shops SET verification_status = ? WHERE seller_id = ? AND status != 'closed'")
         .bind(verificationStatus, seller.id)
         .run();
       await notifyUserAndTelegramEdge(
@@ -384,12 +411,169 @@ export async function handleAdminRoutes(
       );
     }
     if (typeof isFeatured === 'boolean') {
-      await env.DB.prepare('UPDATE shops SET is_featured = ? WHERE seller_id = ?')
+      await env.DB.prepare("UPDATE shops SET is_featured = ? WHERE seller_id = ? AND status != 'closed'")
         .bind(isFeatured ? 1 : 0, seller.id)
         .run();
     }
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'seller.updated', 'seller', sellerId, { status, verificationStatus, isFeatured }, ip);
     return json({ updated: true });
+  }
+
+  if (sub === '/shops') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const auth = await requireEdgeAdmin(request, env, ['shops.manage', 'sellers.manage', 'sellers.suspend']);
+    if ('error' in auth) return auth.error;
+    const statusFilter = String(url.searchParams.get('status') || 'all').toLowerCase();
+    const q = sanitizeText(url.searchParams.get('q') || '', 120).toLowerCase();
+
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (['active', 'suspended', 'closed'].includes(statusFilter)) {
+      where.push('s.status = ?');
+      params.push(statusFilter);
+    }
+    if (q) {
+      where.push('(LOWER(s.name) LIKE ? OR LOWER(s.slug) LIKE ? OR LOWER(u.display_name) LIKE ? OR LOWER(u.telegram_username) LIKE ?)');
+      const pat = `%${q}%`;
+      params.push(pat, pat, pat, pat);
+    }
+    const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const shops = await env.DB.prepare(
+      `SELECT s.*, u.display_name as owner_name, u.telegram_username as owner_telegram_username,
+              u.telegram_id as owner_telegram_id, sp.seller_type, sp.legal_name,
+              (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status != 'archived') as product_count,
+              (SELECT COUNT(*) FROM orders o WHERE o.shop_id = s.id) as order_count
+       FROM shops s
+       JOIN users u ON u.id = s.user_id
+       JOIN seller_profiles sp ON sp.id = s.seller_id
+       ${whereClause}
+       ORDER BY CASE WHEN s.status = 'active' THEN 0 WHEN s.status = 'suspended' THEN 1 ELSE 2 END, s.created_at DESC`
+    )
+      .bind(...params)
+      .all();
+    return json({ shops: shops.results });
+  }
+
+  if (sub.startsWith('/shops/')) {
+    const shopId = decodeURIComponent(sub.slice('/shops/'.length));
+
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, ['shops.manage', 'sellers.manage', 'sellers.suspend']);
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const shop = await env.DB.prepare('SELECT * FROM shops WHERE id = ?')
+        .bind(shopId)
+        .first<Record<string, unknown>>();
+      if (!shop) return json({ error: 'Shop not found.' }, 404);
+      if (String(shop.status) === 'closed') {
+        return json({ error: 'Closed or deleted shops cannot be modified.' }, 409);
+      }
+
+      const body = await parseJsonBody(request);
+      if (!body.ok) return body.error;
+      const status = body.data.status ? String(body.data.status) : null;
+      const verificationStatus = body.data.verificationStatus ? String(body.data.verificationStatus) : null;
+      const isFeatured = body.data.isFeatured;
+
+      if ((verificationStatus || typeof isFeatured === 'boolean') && !hasEdgeAdminPermission(admin, ['shops.manage', 'sellers.manage'])) {
+        return json({ error: 'Insufficient administrative permissions to change shop verification or featured status.' }, 403);
+      }
+
+      if (status && ['active', 'suspended'].includes(status)) {
+        await env.DB.prepare("UPDATE shops SET status = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(status, shopId)
+          .run();
+      }
+      if (verificationStatus && ['unverified', 'pending', 'verified', 'rejected'].includes(verificationStatus)) {
+        await env.DB.prepare("UPDATE shops SET verification_status = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(verificationStatus, shopId)
+          .run();
+        await env.DB.prepare('UPDATE seller_profiles SET verification_status = ? WHERE id = ?')
+          .bind(verificationStatus, shop.seller_id)
+          .run();
+        await notifyUserAndTelegramEdge(
+          env,
+          String(shop.user_id),
+          'verification',
+          `Shop Verification: ${verificationStatus.toUpperCase()}`,
+          `Verification status for "${String(shop.name)}" is now ${verificationStatus}.`,
+          url.origin
+        );
+      }
+      if (typeof isFeatured === 'boolean') {
+        await env.DB.prepare("UPDATE shops SET is_featured = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(isFeatured ? 1 : 0, shopId)
+          .run();
+      }
+
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'shop.updated', 'shop', shopId, { status, verificationStatus, isFeatured }, ip);
+      return json({ updated: true });
+    }
+
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, ['shops.manage', 'sellers.manage']);
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+
+      const shop = await env.DB.prepare('SELECT * FROM shops WHERE id = ?')
+        .bind(shopId)
+        .first<Record<string, unknown>>();
+      if (!shop) return json({ error: 'Shop not found.' }, 404);
+      if (String(shop.status) === 'closed') {
+        return json({ error: 'Shop has already been deleted/closed.' }, 409);
+      }
+
+      const bodyData = await parseOptionalJsonBody(request);
+      const confirmFlag = bodyData.confirm === true;
+      const confirmName = sanitizeText(bodyData.confirmShopName || '', 120);
+      const reason = sanitizeText(bodyData.reason || '', 300);
+
+      if (!confirmFlag && confirmName !== String(shop.name)) {
+        return json({ error: 'Explicit shop deletion confirmation is required.' }, 400);
+      }
+
+      const result = await executeEdgeShopSoftDelete(env.DB, env, shop, admin.adminIdentifier, reason);
+      if (result.ok === false) {
+        return json({ error: result.error }, result.status);
+      }
+
+      await notifyUserAndTelegramEdge(
+        env,
+        String(shop.user_id),
+        'moderation',
+        `Shop Removed: ${String(shop.name)}`,
+        reason
+          ? `Your shop "${String(shop.name)}" was closed by SOFUMER Administration. Reason: ${reason}`
+          : `Your shop "${String(shop.name)}" was closed by SOFUMER Administration. Historical orders remain accessible in your account.`,
+        url.origin
+      );
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'shop.deleted',
+        'shop',
+        shopId,
+        {
+          shopName: shop.name,
+          ownerUserId: shop.user_id,
+          reason,
+          archivedProductsCount: result.archivedProductsCount,
+          deletedProductsCount: result.deletedProductsCount,
+        },
+        ip,
+        true
+      );
+
+      return json({
+        deleted: true,
+        shopId: result.shopId,
+        archivedProductsCount: result.archivedProductsCount,
+        deletedProductsCount: result.deletedProductsCount,
+      });
+    }
+
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/products') {
@@ -402,6 +586,87 @@ export async function handleAdminRoutes(
        ORDER BY CASE WHEN p.status = 'pending_review' THEN 0 ELSE 1 END, p.created_at DESC`
     ).all();
     return json({ products: products.results });
+  }
+
+  if (sub.startsWith('/products/') && !sub.endsWith('/moderate')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeAdmin(request, env, 'moderation.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const prodId = decodeURIComponent(sub.slice('/products/'.length));
+    const product = await env.DB.prepare('SELECT * FROM products WHERE id = ?')
+      .bind(prodId)
+      .first<Record<string, unknown>>();
+    if (!product) return json({ error: 'Product not found.' }, 404);
+
+    const bodyData = await parseOptionalJsonBody(request);
+    const reason = sanitizeText(bodyData.reason || '', 300);
+
+    const [hasOrder, hasReview] = await Promise.all([
+      env.DB.prepare('SELECT id FROM order_items WHERE product_id = ? LIMIT 1').bind(prodId).first(),
+      env.DB.prepare('SELECT id FROM reviews WHERE product_id = ? LIMIT 1').bind(prodId).first(),
+    ]);
+
+    let mode: 'archived' | 'deleted' = 'deleted';
+    if (hasOrder || hasReview) {
+      mode = 'archived';
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(prodId),
+        env.DB.prepare(
+          "UPDATE products SET status = 'archived', is_featured = 0, is_sponsored = 0, moderation_notes = ?, updated_at = datetime('now') WHERE id = ?"
+        ).bind(reason || String(product.moderation_notes || ''), prodId),
+      ]);
+    } else {
+      const [mediaRows, digitalAsset] = await Promise.all([
+        env.DB.prepare('SELECT public_id, resource_type, storage_provider FROM product_media WHERE product_id = ?')
+          .bind(prodId)
+          .all<Record<string, unknown>>(),
+        env.DB.prepare('SELECT storage_provider, storage_key FROM product_digital_assets WHERE product_id = ?')
+          .bind(prodId)
+          .first<{ storage_provider: string; storage_key: string }>(),
+      ]);
+
+      if (digitalAsset?.storage_provider === 'r2' && digitalAsset.storage_key && env.MEDIA_BUCKET?.delete) {
+        await env.MEDIA_BUCKET.delete(digitalAsset.storage_key).catch(() => {});
+      }
+
+      await env.DB.batch([
+        env.DB.prepare('UPDATE conversations SET product_id = NULL WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('UPDATE promotions SET product_id = NULL WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM digital_download_logs WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_digital_assets WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM inquiries WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_variants WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_images WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_media WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM products WHERE id = ?').bind(prodId),
+      ]);
+
+      await destroyUnreferencedCloudinaryAssets(env.DB, env, mediaRows.results);
+    }
+
+    await notifyUserAndTelegramEdge(
+      env,
+      String(product.seller_user_id),
+      'moderation',
+      `Listing ${mode === 'archived' ? 'Archived' : 'Removed'}: ${String(product.title)}`,
+      reason || `Your listing "${String(product.title)}" was ${mode} by an administrator.`,
+      url.origin
+    );
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'product.deleted',
+      'product',
+      prodId,
+      { title: product.title, mode, reason },
+      ip,
+      true
+    );
+    return json({ deleted: true, mode, productId: prodId });
   }
 
   if (sub.startsWith('/products/') && sub.endsWith('/moderate')) {
@@ -595,32 +860,58 @@ export async function handleAdminRoutes(
   }
 
   if (sub.startsWith('/categories/')) {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
-    if ('error' in auth) return auth.error;
-    const admin = auth.admin;
-
     const catId = decodeURIComponent(sub.slice('/categories/'.length));
-    const existing = await env.DB.prepare('SELECT * FROM categories WHERE id = ?')
-      .bind(catId)
-      .first<Record<string, unknown>>();
-    if (!existing) return json({ error: 'Category not found.' }, 404);
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
 
-    const body = await parseJsonBody(request);
-    if (!body.ok) return body.error;
+      const existing = await env.DB.prepare('SELECT * FROM categories WHERE id = ?')
+        .bind(catId)
+        .first<Record<string, unknown>>();
+      if (!existing) return json({ error: 'Category not found.' }, 404);
 
-    const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
-    const description =
-      body.data.description !== undefined ? sanitizeText(body.data.description, 240) : String(existing.description || '');
-    const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
-    if (!name) return json({ error: 'Category name cannot be empty.' }, 400);
+      const body = await parseJsonBody(request);
+      if (!body.ok) return body.error;
 
-    await env.DB.prepare('UPDATE categories SET name = ?, description = ?, is_active = ? WHERE id = ?')
-      .bind(name, description, isActive, catId)
-      .run();
+      const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
+      const description =
+        body.data.description !== undefined ? sanitizeText(body.data.description, 240) : String(existing.description || '');
+      const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
+      if (!name) return json({ error: 'Category name cannot be empty.' }, 400);
 
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'category.updated', 'category', catId, { name, isActive: Boolean(isActive) }, ip);
-    return json({ updated: true });
+      await env.DB.prepare('UPDATE categories SET name = ?, description = ?, is_active = ? WHERE id = ?')
+        .bind(name, description, isActive, catId)
+        .run();
+
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'category.updated', 'category', catId, { name, isActive: Boolean(isActive) }, ip);
+      return json({ updated: true });
+    }
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const existing = await env.DB.prepare('SELECT id, name FROM categories WHERE id = ?')
+        .bind(catId)
+        .first<{ id: string; name: string }>();
+      if (!existing) return json({ error: 'Category not found.' }, 404);
+
+      const [subCnt, prodCnt] = await Promise.all([
+        env.DB.prepare('SELECT COUNT(*) as cnt FROM subcategories WHERE category_id = ?').bind(catId).first<{ cnt: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as cnt FROM products WHERE category_id = ?').bind(catId).first<{ cnt: number }>(),
+      ]);
+      if ((subCnt?.cnt ?? 0) > 0 || (prodCnt?.cnt ?? 0) > 0) {
+        return json(
+          { error: 'Category is referenced by existing subcategories or listings and cannot be deleted. Deactivate it instead.' },
+          409
+        );
+      }
+
+      await env.DB.prepare('DELETE FROM categories WHERE id = ?').bind(catId).run();
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'category.deleted', 'category', catId, { name: existing.name }, ip);
+      return json({ deleted: true, id: catId });
+    }
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/subcategories') {
@@ -644,25 +935,45 @@ export async function handleAdminRoutes(
   }
 
   if (sub.startsWith('/subcategories/')) {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
-    if ('error' in auth) return auth.error;
-    const admin = auth.admin;
     const subId = decodeURIComponent(sub.slice('/subcategories/'.length));
-    const existing = await env.DB.prepare('SELECT * FROM subcategories WHERE id = ?')
-      .bind(subId)
-      .first<Record<string, unknown>>();
-    if (!existing) return json({ error: 'Subcategory not found.' }, 404);
-    const body = await parseJsonBody(request);
-    if (!body.ok) return body.error;
-    const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
-    const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
-    if (!name) return json({ error: 'Subcategory name cannot be empty.' }, 400);
-    await env.DB.prepare('UPDATE subcategories SET name = ?, is_active = ? WHERE id = ?')
-      .bind(name, isActive, subId)
-      .run();
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'subcategory.updated', 'subcategory', subId, { name, isActive: Boolean(isActive) }, ip);
-    return json({ updated: true });
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const existing = await env.DB.prepare('SELECT * FROM subcategories WHERE id = ?')
+        .bind(subId)
+        .first<Record<string, unknown>>();
+      if (!existing) return json({ error: 'Subcategory not found.' }, 404);
+      const body = await parseJsonBody(request);
+      if (!body.ok) return body.error;
+      const name = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : String(existing.name);
+      const isActive = body.data.isActive !== undefined ? (body.data.isActive ? 1 : 0) : Number(existing.is_active ?? 1);
+      if (!name) return json({ error: 'Subcategory name cannot be empty.' }, 400);
+      await env.DB.prepare('UPDATE subcategories SET name = ?, is_active = ? WHERE id = ?')
+        .bind(name, isActive, subId)
+        .run();
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'subcategory.updated', 'subcategory', subId, { name, isActive: Boolean(isActive) }, ip);
+      return json({ updated: true });
+    }
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'catalog.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const existing = await env.DB.prepare('SELECT id, name FROM subcategories WHERE id = ?')
+        .bind(subId)
+        .first<{ id: string; name: string }>();
+      if (!existing) return json({ error: 'Subcategory not found.' }, 404);
+      const prodCnt = await env.DB.prepare('SELECT COUNT(*) as cnt FROM products WHERE subcategory_id = ?')
+        .bind(subId)
+        .first<{ cnt: number }>();
+      if ((prodCnt?.cnt ?? 0) > 0) {
+        return json({ error: 'Subcategory is referenced by existing listings and cannot be deleted.' }, 409);
+      }
+      await env.DB.prepare('DELETE FROM subcategories WHERE id = ?').bind(subId).run();
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'subcategory.deleted', 'subcategory', subId, { name: existing.name }, ip);
+      return json({ deleted: true, id: subId });
+    }
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/orders') {
@@ -756,47 +1067,61 @@ export async function handleAdminRoutes(
   }
 
   if (sub.startsWith('/reviews/')) {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeAdmin(request, env, 'reviews.manage');
-    if ('error' in auth) return auth.error;
-    const admin = auth.admin;
     const revId = decodeURIComponent(sub.slice('/reviews/'.length));
-    const body = await parseJsonBody(request);
-    if (!body.ok) return body.error;
-    const status = String(body.data.status || 'published');
-    if (!['published', 'hidden', 'removed'].includes(status)) {
-      return json({ error: 'Invalid review status.' }, 400);
+    if (request.method === 'PATCH' || request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'reviews.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const review = await env.DB.prepare('SELECT id, product_id, shop_id FROM reviews WHERE id = ?')
+        .bind(revId)
+        .first<{ id: string; product_id: string; shop_id: string }>();
+      if (!review) return json({ error: 'Review not found.' }, 404);
+
+      let status = 'removed';
+      if (request.method === 'PATCH') {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return body.error;
+        status = String(body.data.status || 'published');
+        if (!['published', 'hidden', 'removed'].includes(status)) {
+          return json({ error: 'Invalid review status.' }, 400);
+        }
+      }
+
+      await env.DB.prepare('UPDATE reviews SET status = ? WHERE id = ?').bind(status, revId).run();
+
+      const [prodAgg, shopAgg] = await Promise.all([
+        env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE product_id = ? AND status = 'published'")
+          .bind(review.product_id)
+          .first<{ avg_r: number; cnt: number }>(),
+        env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE shop_id = ? AND status = 'published'")
+          .bind(review.shop_id)
+          .first<{ avg_r: number; cnt: number }>(),
+      ]);
+      await env.DB.batch([
+        env.DB.prepare('UPDATE products SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
+          Number((prodAgg?.avg_r || 0).toFixed(2)),
+          prodAgg?.cnt || 0,
+          review.product_id
+        ),
+        env.DB.prepare('UPDATE shops SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
+          Number((shopAgg?.avg_r || 0).toFixed(2)),
+          shopAgg?.cnt || 0,
+          review.shop_id
+        ),
+      ]);
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        request.method === 'DELETE' ? 'review.removed' : 'review.moderated',
+        'review',
+        revId,
+        { status },
+        ip
+      );
+      return request.method === 'DELETE' ? json({ deleted: true, id: revId }) : json({ updated: true });
     }
-    const review = await env.DB.prepare('SELECT id, product_id, shop_id FROM reviews WHERE id = ?')
-      .bind(revId)
-      .first<{ id: string; product_id: string; shop_id: string }>();
-    if (!review) return json({ error: 'Review not found.' }, 404);
-
-    await env.DB.prepare('UPDATE reviews SET status = ? WHERE id = ?').bind(status, revId).run();
-
-    const [prodAgg, shopAgg] = await Promise.all([
-      env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE product_id = ? AND status = 'published'")
-        .bind(review.product_id)
-        .first<{ avg_r: number; cnt: number }>(),
-      env.DB.prepare("SELECT COALESCE(AVG(rating), 0) as avg_r, COUNT(*) as cnt FROM reviews WHERE shop_id = ? AND status = 'published'")
-        .bind(review.shop_id)
-        .first<{ avg_r: number; cnt: number }>(),
-    ]);
-    await env.DB.batch([
-      env.DB.prepare('UPDATE products SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
-        Number((prodAgg?.avg_r || 0).toFixed(2)),
-        prodAgg?.cnt || 0,
-        review.product_id
-      ),
-      env.DB.prepare('UPDATE shops SET rating_avg = ?, review_count = ? WHERE id = ?').bind(
-        Number((shopAgg?.avg_r || 0).toFixed(2)),
-        shopAgg?.cnt || 0,
-        review.shop_id
-      ),
-    ]);
-
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'review.moderated', 'review', revId, { status }, ip);
-    return json({ updated: true });
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/monetization') {
@@ -1045,39 +1370,56 @@ export async function handleAdminRoutes(
   }
 
   if (sub.startsWith('/support/')) {
-    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeAdmin(request, env, 'support.manage');
-    if ('error' in auth) return auth.error;
-    const admin = auth.admin;
     const ticketId = decodeURIComponent(sub.slice('/support/'.length));
-    const body = await parseJsonBody(request);
-    if (!body.ok) return body.error;
-    const ticket = await env.DB.prepare('SELECT * FROM support_tickets WHERE id = ?')
-      .bind(ticketId)
-      .first<Record<string, unknown>>();
-    if (!ticket) return json({ error: 'Ticket not found.' }, 404);
-    const status = String(body.data.status || 'resolved');
-    if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
-      return json({ error: 'Invalid support ticket status.' }, 400);
+    if (request.method === 'PATCH') {
+      const auth = await requireEdgeAdmin(request, env, 'support.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const body = await parseJsonBody(request);
+      if (!body.ok) return body.error;
+      const ticket = await env.DB.prepare('SELECT * FROM support_tickets WHERE id = ?')
+        .bind(ticketId)
+        .first<Record<string, unknown>>();
+      if (!ticket) return json({ error: 'Ticket not found.' }, 404);
+      const status = String(body.data.status || 'resolved');
+      if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
+        return json({ error: 'Invalid support ticket status.' }, 400);
+      }
+      const adminResponse = sanitizeText(body.data.adminResponse || '', 1500);
+
+      await env.DB.prepare(
+        `UPDATE support_tickets SET status = ?, admin_response = ?, responded_by = ?, updated_at = datetime('now') WHERE id = ?`
+      )
+        .bind(status, adminResponse, admin.adminIdentifier, ticket.id)
+        .run();
+
+      await notifyUserAndTelegramEdge(
+        env,
+        String(ticket.user_id),
+        'support',
+        `Support Ticket Updated: ${String(ticket.subject)}`,
+        adminResponse || `Ticket status changed to ${status}.`,
+        url.origin
+      );
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'support.updated', 'support_ticket', ticketId, { status }, ip);
+      return json({ updated: true });
     }
-    const adminResponse = sanitizeText(body.data.adminResponse || '', 1500);
-
-    await env.DB.prepare(
-      `UPDATE support_tickets SET status = ?, admin_response = ?, responded_by = ?, updated_at = datetime('now') WHERE id = ?`
-    )
-      .bind(status, adminResponse, admin.adminIdentifier, ticket.id)
-      .run();
-
-    await notifyUserAndTelegramEdge(
-      env,
-      String(ticket.user_id),
-      'support',
-      `Support Ticket Updated: ${String(ticket.subject)}`,
-      adminResponse || `Ticket status changed to ${status}.`,
-      url.origin
-    );
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'support.updated', 'support_ticket', ticketId, { status }, ip);
-    return json({ updated: true });
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'support.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const ticket = await env.DB.prepare('SELECT id, subject, status FROM support_tickets WHERE id = ?')
+        .bind(ticketId)
+        .first<{ id: string; subject: string; status: string }>();
+      if (!ticket) return json({ error: 'Ticket not found.' }, 404);
+      if (!['resolved', 'closed'].includes(ticket.status)) {
+        return json({ error: 'Only resolved or closed support tickets can be deleted.' }, 409);
+      }
+      await env.DB.prepare('DELETE FROM support_tickets WHERE id = ?').bind(ticketId).run();
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'support.deleted', 'support_ticket', ticketId, { subject: ticket.subject }, ip);
+      return json({ deleted: true, id: ticketId });
+    }
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/notifications') {
@@ -1121,6 +1463,43 @@ export async function handleAdminRoutes(
 
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'notification.broadcast', 'global', id, { title }, ip);
     return json({ broadcast: true, id }, 201);
+  }
+
+  if (sub.startsWith('/notifications/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeAdmin(request, env, 'notifications.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const notifId = decodeURIComponent(sub.slice('/notifications/'.length));
+    const notif = await env.DB.prepare('SELECT id, title, body, scope FROM notifications WHERE id = ?')
+      .bind(notifId)
+      .first<{ id: string; title: string; body: string; scope: string }>();
+    if (!notif) return json({ error: 'Notification not found.' }, 404);
+
+    await env.DB.prepare('DELETE FROM notifications WHERE id = ?').bind(notifId).run();
+
+    const bannerRow = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'marketplace_announcement'").first<{
+      value: string;
+    }>();
+    if (bannerRow && bannerRow.value === `${notif.title} — ${notif.body}`) {
+      await env.DB.prepare(
+        "UPDATE platform_settings SET value = '', updated_by = ?, updated_at = datetime('now') WHERE key = 'marketplace_announcement'"
+      )
+        .bind(admin.adminIdentifier)
+        .run();
+    }
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'notification.deleted',
+      notif.scope || 'global',
+      notifId,
+      { title: notif.title },
+      ip,
+      true
+    );
+    return json({ deleted: true, id: notifId });
   }
 
   if (sub === '/settings') {
@@ -1562,11 +1941,271 @@ export async function handleAdminRoutes(
   }
 
   if (sub === '/audit-logs') {
-    if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeAdmin(request, env, 'audit.view');
+    if (request.method === 'GET') {
+      const auth = await requireEdgeAdmin(request, env, 'audit.view');
+      if ('error' in auth) return auth.error;
+      const scope = String(url.searchParams.get('scope') || 'active').toLowerCase();
+      const q = sanitizeText(url.searchParams.get('q') || '', 120).toLowerCase();
+
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (scope === 'archived') {
+        where.push('a.is_archived = 1');
+      } else if (scope === 'active') {
+        where.push('a.is_archived = 0');
+      }
+      if (q) {
+        where.push(
+          '(LOWER(a.admin_identifier) LIKE ? OR LOWER(a.action) LIKE ? OR LOWER(a.target_type) LIKE ? OR LOWER(a.target_id) LIKE ? OR LOWER(a.details_json) LIKE ?)'
+        );
+        const pat = `%${q}%`;
+        params.push(pat, pat, pat, pat, pat);
+      }
+      const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+      const [logs, summaryRow, retRow] = await Promise.all([
+        env.DB.prepare(
+          `SELECT a.*, COALESCE(NULLIF(a.archived_by, ''), arch.archived_by, '') as archive_actor,
+                  COALESCE(arch.reason, '') as archive_reason
+           FROM admin_audit_logs a
+           LEFT JOIN admin_audit_log_archives arch ON arch.log_id = a.id
+           ${whereClause}
+           ORDER BY a.created_at DESC LIMIT 200`
+        )
+          .bind(...params)
+          .all<Record<string, unknown>>(),
+        env.DB.prepare(
+          `SELECT
+             SUM(CASE WHEN is_archived = 0 THEN 1 ELSE 0 END) as active_count,
+             SUM(CASE WHEN is_archived = 1 THEN 1 ELSE 0 END) as archived_count,
+             SUM(CASE WHEN is_protected = 1 THEN 1 ELSE 0 END) as protected_count
+           FROM admin_audit_logs`
+        ).first<{ active_count: number; archived_count: number; protected_count: number }>(),
+        env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").first<{ value: string }>(),
+      ]);
+
+      const retentionDays = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+      return json({
+        logs: logs.results.map((r) => ({
+          ...r,
+          is_protected: Number(r.is_protected || 0) === 1 || isAuditActionProtected(String(r.action || '')) ? 1 : 0,
+        })),
+        retentionDays,
+        summary: {
+          activeCount: Number(summaryRow?.active_count || 0),
+          archivedCount: Number(summaryRow?.archived_count || 0),
+          protectedCount: Number(summaryRow?.protected_count || 0),
+        },
+      });
+    }
+
+    if (request.method === 'DELETE') {
+      const auth = await requireEdgeAdmin(request, env, 'audit.manage');
+      if ('error' in auth) return auth.error;
+      const admin = auth.admin;
+      const bodyData = await parseOptionalJsonBody(request);
+      const ids = Array.isArray(bodyData.ids)
+        ? bodyData.ids.map((id) => sanitizeText(String(id || ''), 80)).filter(Boolean)
+        : [];
+      const scope = String(bodyData.scope || 'eligible').toLowerCase();
+
+      const retRow = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").first<{
+        value: string;
+      }>();
+      const defaultRetention = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+      const olderThanDaysRaw = Number(bodyData.olderThanDays ?? defaultRetention);
+      const olderThanDays = Number.isFinite(olderThanDaysRaw)
+        ? Math.min(3650, Math.max(7, Math.floor(olderThanDaysRaw)))
+        : defaultRetention;
+
+      let candidates: Array<{ id: string; admin_identifier: string; action: string; is_protected: number }> = [];
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(', ');
+        const res = await env.DB.prepare(
+          `SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE id IN (${placeholders})`
+        )
+          .bind(...ids)
+          .all<{ id: string; admin_identifier: string; action: string; is_protected: number }>();
+        candidates = res.results;
+      } else if (scope === 'archived') {
+        const res = await env.DB.prepare(
+          'SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE is_archived = 1'
+        ).all<{ id: string; admin_identifier: string; action: string; is_protected: number }>();
+        candidates = res.results;
+      } else {
+        const res = await env.DB.prepare(
+          `SELECT id, admin_identifier, action, is_protected
+           FROM admin_audit_logs
+           WHERE datetime(created_at) <= datetime('now', '-' || ? || ' days')`
+        )
+          .bind(olderThanDays)
+          .all<{ id: string; admin_identifier: string; action: string; is_protected: number }>();
+        candidates = res.results;
+      }
+
+      const deletableIds: string[] = [];
+      let skippedProtectedCount = 0;
+
+      for (const row of candidates) {
+        const act = String(row.action || '');
+        const isProtectedRow = Number(row.is_protected || 0) === 1 || isAuditActionProtected(act);
+        const isSelfSensitive =
+          String(row.admin_identifier || '') === admin.adminIdentifier &&
+          (act.startsWith('audit.') || act.startsWith('rbac.') || isProtectedRow);
+        if (isProtectedRow || isSelfSensitive) {
+          skippedProtectedCount++;
+          continue;
+        }
+        deletableIds.push(row.id);
+      }
+
+      for (let i = 0; i < deletableIds.length; i += 40) {
+        const chunk = deletableIds.slice(i, i + 40);
+        const ph = chunk.map(() => '?').join(', ');
+        await env.DB.batch([
+          env.DB.prepare(`DELETE FROM admin_audit_log_archives WHERE log_id IN (${ph})`).bind(...chunk),
+          env.DB.prepare(`DELETE FROM admin_audit_logs WHERE id IN (${ph})`).bind(...chunk),
+        ]);
+      }
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'audit.logs_deleted',
+        'audit_logs',
+        ids.length ? 'selected' : scope,
+        {
+          deletedCount: deletableIds.length,
+          skippedProtectedCount,
+          mode: ids.length ? 'ids' : scope,
+          olderThanDays,
+        },
+        ip,
+        true
+      );
+
+      return json({
+        deletedCount: deletableIds.length,
+        skippedProtectedCount,
+      });
+    }
+
+    return methodNotAllowed(['GET', 'DELETE']);
+  }
+
+  if (sub === '/audit-logs/archive') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    const auth = await requireEdgeAdmin(request, env, 'audit.manage');
     if ('error' in auth) return auth.error;
-    const logs = await env.DB.prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 150').all();
-    return json({ logs: logs.results });
+    const admin = auth.admin;
+    const bodyData = await parseOptionalJsonBody(request);
+    const ids = Array.isArray(bodyData.ids)
+      ? bodyData.ids.map((id) => sanitizeText(String(id || ''), 80)).filter(Boolean)
+      : [];
+    const reason = sanitizeText(bodyData.reason || 'Archived per audit retention policy', 300);
+
+    const retRow = await env.DB.prepare("SELECT value FROM platform_settings WHERE key = 'audit_retention_days'").first<{
+      value: string;
+    }>();
+    const defaultRetention = Math.min(3650, Math.max(7, Math.floor(Number(retRow?.value || 90)) || 90));
+    const olderThanDaysRaw = Number(bodyData.olderThanDays ?? defaultRetention);
+    const olderThanDays = Number.isFinite(olderThanDaysRaw)
+      ? Math.min(3650, Math.max(7, Math.floor(olderThanDaysRaw)))
+      : defaultRetention;
+
+    let targetIds: string[] = [];
+    if (ids.length > 0) {
+      const ph = ids.map(() => '?').join(', ');
+      const rows = await env.DB.prepare(
+        `SELECT id FROM admin_audit_logs WHERE is_archived = 0 AND id IN (${ph})`
+      )
+        .bind(...ids)
+        .all<{ id: string }>();
+      targetIds = rows.results.map((r) => r.id);
+    } else {
+      const rows = await env.DB.prepare(
+        `SELECT id FROM admin_audit_logs WHERE is_archived = 0 AND datetime(created_at) <= datetime('now', '-' || ? || ' days')`
+      )
+        .bind(olderThanDays)
+        .all<{ id: string }>();
+      targetIds = rows.results.map((r) => r.id);
+    }
+
+    for (let i = 0; i < targetIds.length; i += 40) {
+      const chunk = targetIds.slice(i, i + 40);
+      const ph = chunk.map(() => '?').join(', ');
+      await env.DB.prepare(
+        `UPDATE admin_audit_logs
+         SET is_archived = 1, archived_at = datetime('now'), archived_by = ?
+         WHERE id IN (${ph})`
+      )
+        .bind(admin.adminIdentifier, ...chunk)
+        .run();
+      await env.DB.batch(
+        chunk.map((logId) =>
+          env.DB!.prepare(
+            `INSERT OR REPLACE INTO admin_audit_log_archives (log_id, archived_by, reason, archived_at)
+             VALUES (?, ?, ?, datetime('now'))`
+          ).bind(logId, admin.adminIdentifier, reason)
+        )
+      );
+    }
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'audit.logs_archived',
+      'audit_logs',
+      ids.length ? 'selected' : 'retention',
+      {
+        archivedCount: targetIds.length,
+        mode: ids.length ? 'ids' : 'older_than_days',
+        olderThanDays,
+        reason,
+      },
+      ip,
+      true
+    );
+
+    return json({ archivedCount: targetIds.length, olderThanDays });
+  }
+
+  if (sub.startsWith('/audit-logs/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    const auth = await requireEdgeAdmin(request, env, 'audit.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const logId = decodeURIComponent(sub.slice('/audit-logs/'.length));
+    const row = await env.DB.prepare('SELECT id, admin_identifier, action, is_protected FROM admin_audit_logs WHERE id = ?')
+      .bind(logId)
+      .first<{ id: string; admin_identifier: string; action: string; is_protected: number }>();
+    if (!row) return json({ error: 'Audit log entry not found.' }, 404);
+
+    const act = String(row.action || '');
+    const isProtectedRow = Number(row.is_protected || 0) === 1 || isAuditActionProtected(act);
+    const isSelfSensitive =
+      String(row.admin_identifier || '') === admin.adminIdentifier &&
+      (act.startsWith('audit.') || act.startsWith('rbac.') || isProtectedRow);
+    if (isProtectedRow || isSelfSensitive) {
+      return json({ error: 'Protected audit and critical security logs cannot be deleted.' }, 403);
+    }
+
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM admin_audit_log_archives WHERE log_id = ?').bind(logId),
+      env.DB.prepare('DELETE FROM admin_audit_logs WHERE id = ?').bind(logId),
+    ]);
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'audit.logs_deleted',
+      'audit_log',
+      logId,
+      { deletedCount: 1, deletedAction: act, mode: 'single' },
+      ip,
+      true
+    );
+    return json({ deleted: true, deletedCount: 1, id: logId });
   }
 
   return json({ error: 'Admin API endpoint not found.' }, 404);
