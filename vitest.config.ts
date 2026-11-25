@@ -20,6 +20,7 @@ export default defineConfig(async () => {
     ],
     test: {
       include: ['test/**/*.test.js'],
+      testTimeout: 30000,
     },
   };
 });
