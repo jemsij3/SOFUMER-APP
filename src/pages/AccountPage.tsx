@@ -9,6 +9,7 @@ import {
   LogOut,
   MessageSquare,
   Package,
+  ShieldCheck,
   Store,
   Trash2,
   User as UserIcon,
@@ -198,6 +199,27 @@ export function AccountPage() {
           </select>
         </div>
       </section>
+
+      {user?.isAdmin && (
+        <section className="rounded-2xl bg-gradient-to-r from-[#131C31] to-[#1F1235] border border-purple-700/50 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => navigate({ type: 'admin' })}
+            className="w-full px-5 py-4 flex items-center justify-between gap-3 text-left hover:bg-purple-950/30 transition-colors"
+          >
+            <div className="flex items-center gap-3.5 min-w-0">
+              <div className="w-9 h-9 rounded-xl bg-purple-950/80 border border-purple-700/60 flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-4 h-4 text-purple-300" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-white truncate">SOFUMER Governance Console</div>
+                <div className="text-xs text-purple-300 truncate">Manage users, moderation, settings, RBAC & audit logs</div>
+              </div>
+            </div>
+            <ChevronRight className="w-4 h-4 text-purple-400 shrink-0" />
+          </button>
+        </section>
+      )}
 
       {/* Account Destinations */}
       <section className="rounded-2xl bg-[#0E1525] border border-slate-800 divide-y divide-slate-800/80 overflow-hidden">

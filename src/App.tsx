@@ -296,6 +296,16 @@ function AppShell() {
 
             {/* Zone 3: Primary Action */}
             <div className="flex items-center gap-2 shrink-0">
+              {user?.isAdmin && (
+                <button
+                  type="button"
+                  onClick={() => navigate({ type: 'admin' })}
+                  className="h-9 px-3.5 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-700/60 text-purple-200 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>Admin Console</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => navigate({ type: 'seller' })}
@@ -311,27 +321,21 @@ function AppShell() {
 
       {/* Main Content Container */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-24 lg:pb-12">
-        {isAdminUser ? (
-          <AdminPage />
-        ) : (
-          <>
-            {view.type === 'tab' && view.tab === 'home' && <HomePage />}
-            {view.type === 'tab' && view.tab === 'explore' && <ExplorePage />}
-            {view.type === 'tab' && view.tab === 'ai' && <AiAssistantPage />}
-            {view.type === 'tab' && view.tab === 'messages' && <MessagesPage />}
-            {view.type === 'tab' && view.tab === 'account' && <AccountPage />}
-            {view.type === 'product' && <ProductDetailPage productId={view.productId} />}
-            {view.type === 'shop' && <ShopPage slug={view.slug} />}
-            {view.type === 'seller' && <SellerCenterPage initialSection={view.section} />}
-            {view.type === 'orders' && <OrdersPage initialOrderId={view.orderId} />}
-            {view.type === 'wishlist' && <WishlistOrRecentPage mode="wishlist" />}
-            {view.type === 'recently_viewed' && <WishlistOrRecentPage mode="recently_viewed" />}
-            {view.type === 'notifications' && <NotificationsSupportPoliciesPage mode="notifications" />}
-            {view.type === 'support' && <NotificationsSupportPoliciesPage mode="support" />}
-            {view.type === 'policies' && <NotificationsSupportPoliciesPage mode="policies" />}
-            {view.type === 'admin' && <AdminPage />}
-          </>
-        )}
+        {view.type === 'tab' && view.tab === 'home' && <HomePage />}
+        {view.type === 'tab' && view.tab === 'explore' && <ExplorePage />}
+        {view.type === 'tab' && view.tab === 'ai' && <AiAssistantPage />}
+        {view.type === 'tab' && view.tab === 'messages' && <MessagesPage />}
+        {view.type === 'tab' && view.tab === 'account' && <AccountPage />}
+        {view.type === 'product' && <ProductDetailPage productId={view.productId} />}
+        {view.type === 'shop' && <ShopPage slug={view.slug} />}
+        {view.type === 'seller' && <SellerCenterPage initialSection={view.section} />}
+        {view.type === 'orders' && <OrdersPage initialOrderId={view.orderId} />}
+        {view.type === 'wishlist' && <WishlistOrRecentPage mode="wishlist" />}
+        {view.type === 'recently_viewed' && <WishlistOrRecentPage mode="recently_viewed" />}
+        {view.type === 'notifications' && <NotificationsSupportPoliciesPage mode="notifications" />}
+        {view.type === 'support' && <NotificationsSupportPoliciesPage mode="support" />}
+        {view.type === 'policies' && <NotificationsSupportPoliciesPage mode="policies" />}
+        {view.type === 'admin' && <AdminPage />}
       </main>
 
       {/* 5 Permanent Bottom Navigation Destinations (Mobile & Telegram Mini App) */}

@@ -168,29 +168,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const navigate = useCallback((next: SubView) => {
     triggerHaptic('light');
-    if (isAdminModeRef.current) {
-      setHistory([{ type: 'admin' }]);
-      return;
-    }
     setHistory((prev) => [...prev.slice(-15), next]);
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
 
   const goBack = useCallback(() => {
     triggerHaptic('light');
-    if (isAdminModeRef.current) {
-      setHistory([{ type: 'admin' }]);
-      return;
-    }
     setHistory((prev) => (prev.length > 1 ? prev.slice(0, -1) : [{ type: 'tab', tab: 'home' }]));
   }, []);
 
   const switchTab = useCallback((tab: NavTab) => {
     triggerHaptic('light');
-    if (isAdminModeRef.current) {
-      setHistory([{ type: 'admin' }]);
-      return;
-    }
     setHistory([{ type: 'tab', tab }]);
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
@@ -257,7 +245,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           setUnreadMessages(0);
           setUnreadNotifications(0);
           setFavoriteIds(new Set());
-          setHistory([{ type: 'admin' }]);
           await refreshBootstrap();
           return { authenticated: true, status: 200 };
         }
