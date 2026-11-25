@@ -170,6 +170,29 @@ export async function handleAdminRoutes(
   if (!url.pathname.startsWith('/api/admin/')) return null;
   if (!env.DB) return json({ error: 'Database binding (DB) is not configured.' }, 503);
 
+  try {
+    return await handleAdminRoutesInner(request, { ...env, DB: env.DB }, url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    console.error('SOFUMER Admin Worker route error:', msg);
+    if (/FOREIGN KEY constraint failed/i.test(msg)) {
+      return json({ error: 'Operation blocked by related database records.' }, 409);
+    }
+    if (/UNIQUE constraint failed/i.test(msg)) {
+      return json({ error: 'Duplicate record conflict.' }, 409);
+    }
+    if (/CHECK constraint failed|NOT NULL constraint failed/i.test(msg)) {
+      return json({ error: 'Submitted values violate database validation constraints.' }, 400);
+    }
+    return json({ error: 'Internal server error.' }, 500);
+  }
+}
+
+async function handleAdminRoutesInner(
+  request: Request,
+  env: Env & { DB: D1Database },
+  url: URL
+): Promise<Response> {
   const sub = url.pathname.slice('/api/admin'.length);
   const ip = request.headers.get('CF-Connecting-IP') || '';
 
@@ -477,9 +500,17 @@ export async function handleAdminRoutes(
       const status = body.data.status ? String(body.data.status) : null;
       const verificationStatus = body.data.verificationStatus ? String(body.data.verificationStatus) : null;
       const isFeatured = body.data.isFeatured;
+      const nextName = body.data.name !== undefined ? sanitizeText(body.data.name, 80) : null;
+      const nextDesc = body.data.description !== undefined ? sanitizeText(body.data.description, 600) : null;
 
-      if ((verificationStatus || typeof isFeatured === 'boolean') && !hasEdgeAdminPermission(admin, ['shops.manage', 'sellers.manage'])) {
-        return json({ error: 'Insufficient administrative permissions to change shop verification or featured status.' }, 403);
+      if (
+        (verificationStatus || typeof isFeatured === 'boolean' || nextName !== null || nextDesc !== null) &&
+        !hasEdgeAdminPermission(admin, ['shops.manage', 'sellers.manage'])
+      ) {
+        return json({ error: 'Insufficient administrative permissions to edit shop details or verification status.' }, 403);
+      }
+      if (nextName !== null && nextName.length < 2) {
+        return json({ error: 'Shop name must be at least 2 characters.' }, 400);
       }
 
       if (status && ['active', 'suspended'].includes(status)) {
@@ -499,7 +530,7 @@ export async function handleAdminRoutes(
           String(shop.user_id),
           'verification',
           `Shop Verification: ${verificationStatus.toUpperCase()}`,
-          `Verification status for "${String(shop.name)}" is now ${verificationStatus}.`,
+          `Verification status for "${nextName || String(shop.name)}" is now ${verificationStatus}.`,
           url.origin
         );
       }
@@ -508,8 +539,23 @@ export async function handleAdminRoutes(
           .bind(isFeatured ? 1 : 0, shopId)
           .run();
       }
+      if (nextName !== null || nextDesc !== null) {
+        await env.DB.prepare(
+          "UPDATE shops SET name = ?, description = ?, updated_at = datetime('now') WHERE id = ?"
+        )
+          .bind(nextName !== null ? nextName : String(shop.name), nextDesc !== null ? nextDesc : String(shop.description || ''), shopId)
+          .run();
+      }
 
-      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'shop.updated', 'shop', shopId, { status, verificationStatus, isFeatured }, ip);
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'shop.updated',
+        'shop',
+        shopId,
+        { status, verificationStatus, isFeatured, name: nextName },
+        ip
+      );
       return json({ updated: true });
     }
 
@@ -642,6 +688,7 @@ export async function handleAdminRoutes(
         env.DB.prepare('DELETE FROM inquiries WHERE product_id = ?').bind(prodId),
         env.DB.prepare('DELETE FROM product_favorites WHERE product_id = ?').bind(prodId),
         env.DB.prepare('DELETE FROM recently_viewed WHERE product_id = ?').bind(prodId),
+        env.DB.prepare('DELETE FROM product_inventory WHERE product_id = ?').bind(prodId),
         env.DB.prepare('DELETE FROM product_variants WHERE product_id = ?').bind(prodId),
         env.DB.prepare('DELETE FROM product_images WHERE product_id = ?').bind(prodId),
         env.DB.prepare('DELETE FROM product_media WHERE product_id = ?').bind(prodId),
@@ -992,6 +1039,113 @@ export async function handleAdminRoutes(
     return json({ orders: orders.results });
   }
 
+  if (sub.startsWith('/orders/')) {
+    const orderId = decodeURIComponent(sub.slice('/orders/'.length));
+    const auth = await requireEdgeAdmin(request, env, 'orders.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
+    if (request.method === 'GET') {
+      const order = await env.DB.prepare(
+        `SELECT o.*, s.name as shop_name, bu.display_name as buyer_name, su.display_name as seller_name
+         FROM orders o JOIN shops s ON s.id = o.shop_id
+         JOIN users bu ON bu.id = o.buyer_user_id JOIN users su ON su.id = o.seller_user_id
+         WHERE o.id = ?`
+      )
+        .bind(orderId)
+        .first<Record<string, unknown>>();
+      if (!order) return json({ error: 'Order not found.' }, 404);
+      const [items, history] = await Promise.all([
+        env.DB.prepare('SELECT * FROM order_items WHERE order_id = ?').bind(orderId).all(),
+        env.DB.prepare('SELECT * FROM order_status_history WHERE order_id = ? ORDER BY created_at ASC')
+          .bind(orderId)
+          .all(),
+      ]);
+      return json({ order, items: items.results, history: history.results });
+    }
+
+    if (request.method === 'PATCH') {
+      const VALID_ORDER_STATUSES = [
+        'Inquiry',
+        'Pending Confirmation',
+        'Confirmed',
+        'Processing',
+        'Shipped',
+        'Delivered',
+        'Completed',
+        'Cancelled',
+        'Disputed',
+      ];
+      const order = await env.DB.prepare('SELECT * FROM orders WHERE id = ?')
+        .bind(orderId)
+        .first<Record<string, unknown>>();
+      if (!order) return json({ error: 'Order not found.' }, 404);
+
+      const body = await parseJsonBody<{ status?: string; note?: string }>(request);
+      if (!body.ok) return body.error;
+      const status = String(body.data.status || '');
+      if (!VALID_ORDER_STATUSES.includes(status)) {
+        return json({ error: 'Invalid order status.' }, 400);
+      }
+      const note = sanitizeText(body.data.note || '', 300);
+
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE orders
+           SET status = ?,
+               buyer_confirmed_at = CASE WHEN ? = 'Confirmed' THEN COALESCE(buyer_confirmed_at, datetime('now')) ELSE buyer_confirmed_at END,
+               completed_at = CASE WHEN ? = 'Completed' THEN COALESCE(completed_at, datetime('now')) ELSE completed_at END,
+               updated_at = datetime('now')
+           WHERE id = ?`
+        ).bind(status, status, status, orderId),
+        env.DB.prepare(
+          `INSERT INTO order_status_history (id, order_id, old_status, new_status, changed_by_user_id, changed_by_role, note)
+           VALUES (?, ?, ?, ?, ?, 'admin', ?)`
+        ).bind(
+          newId('osh'),
+          orderId,
+          String(order.status || ''),
+          status,
+          admin.userId,
+          note || `Status updated to ${status} by administrator`
+        ),
+      ]);
+
+      await Promise.all([
+        notifyUserAndTelegramEdge(
+          env,
+          String(order.buyer_user_id),
+          'order',
+          `Order ${String(order.order_number)}: ${status}`,
+          note || `An administrator updated your order status to ${status}.`,
+          url.origin
+        ),
+        notifyUserAndTelegramEdge(
+          env,
+          String(order.seller_user_id),
+          'order',
+          `Order ${String(order.order_number)}: ${status}`,
+          note || `An administrator updated order status to ${status}.`,
+          url.origin
+        ),
+      ]);
+
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'order.status_updated',
+        'order',
+        orderId,
+        { orderNumber: order.order_number, previousStatus: order.status, status, note },
+        ip,
+        true
+      );
+      return json({ updated: true, status });
+    }
+
+    return methodNotAllowed(['GET', 'PATCH']);
+  }
+
   if (sub === '/reports') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const auth = await requireEdgeAdmin(request, env, ['reports.manage', 'messages.moderate']);
@@ -999,11 +1153,14 @@ export async function handleAdminRoutes(
     const [reports, flaggedConversations] = await Promise.all([
       env.DB.prepare(
         `SELECT r.*, u.display_name as reporter_name FROM reports r
-         JOIN users u ON u.id = r.reporter_user_id ORDER BY r.created_at DESC LIMIT 100`
+         JOIN users u ON u.id = r.reporter_user_id
+         ORDER BY CASE WHEN r.status = 'open' THEN 0 WHEN r.status = 'investigating' THEN 1 ELSE 2 END, r.created_at DESC LIMIT 100`
       ).all(),
       env.DB.prepare(
         `SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-         FROM conversations c WHERE c.status = 'flagged' ORDER BY c.last_message_at DESC`
+         FROM conversations c
+         WHERE c.status IN ('flagged', 'closed')
+         ORDER BY CASE WHEN c.status = 'flagged' THEN 0 ELSE 1 END, c.last_message_at DESC LIMIT 60`
       ).all(),
     ]);
     return json({ reports: reports.results, flaggedConversations: flaggedConversations.results });
@@ -1046,6 +1203,10 @@ export async function handleAdminRoutes(
     if ('error' in auth) return auth.error;
     const admin = auth.admin;
     const convId = decodeURIComponent(sub.slice('/conversations/'.length, -'/messages'.length));
+    const conv = await env.DB.prepare('SELECT id, subject, status FROM conversations WHERE id = ?')
+      .bind(convId)
+      .first<Record<string, unknown>>();
+    if (!conv) return json({ error: 'Conversation not found.' }, 404);
     const messages = await env.DB.prepare(
       `SELECT m.*, u.display_name as sender_name FROM messages m
        JOIN users u ON u.id = m.sender_user_id WHERE m.conversation_id = ? ORDER BY m.created_at ASC`
@@ -1053,7 +1214,75 @@ export async function handleAdminRoutes(
       .bind(convId)
       .all();
     await recordEdgeAdminAudit(env, admin.adminIdentifier, 'conversation.investigated', 'conversation', convId, {}, ip);
-    return json({ messages: messages.results });
+    return json({ conversation: conv, messages: messages.results });
+  }
+
+  if (sub.startsWith('/conversations/')) {
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, ['reports.manage', 'messages.moderate']);
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const convId = decodeURIComponent(sub.slice('/conversations/'.length));
+    const body = await parseJsonBody<{ status?: string }>(request);
+    if (!body.ok) return body.error;
+    const status = String(body.data.status || '');
+    if (!['active', 'flagged', 'closed', 'archived'].includes(status)) {
+      return json({ error: 'Invalid conversation status.' }, 400);
+    }
+    const upd = await env.DB.prepare('UPDATE conversations SET status = ? WHERE id = ?')
+      .bind(status, convId)
+      .run();
+    if ((upd.meta?.changes ?? 0) === 0) return json({ error: 'Conversation not found.' }, 404);
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'conversation.status_updated',
+      'conversation',
+      convId,
+      { status },
+      ip
+    );
+    return json({ updated: true, status });
+  }
+
+  if (sub.startsWith('/messages/')) {
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'messages.moderate');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const msgId = decodeURIComponent(sub.slice('/messages/'.length));
+    const body = await parseJsonBody<{ isDeleted?: boolean }>(request);
+    if (!body.ok) return body.error;
+    const existing = await env.DB.prepare('SELECT id, conversation_id, body, is_deleted FROM messages WHERE id = ?')
+      .bind(msgId)
+      .first<{ id: string; conversation_id: string; body: string; is_deleted: number }>();
+    if (!existing) return json({ error: 'Message not found.' }, 404);
+
+    const isDeleted = body.data.isDeleted !== undefined ? Boolean(body.data.isDeleted) : !existing.is_deleted;
+    await env.DB.prepare('UPDATE messages SET is_deleted = ? WHERE id = ?').bind(isDeleted ? 1 : 0, msgId).run();
+
+    const latestMsg = await env.DB.prepare(
+      'SELECT body, is_deleted FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1'
+    )
+      .bind(existing.conversation_id)
+      .first<{ body: string; is_deleted: number }>();
+    if (latestMsg) {
+      const preview = latestMsg.is_deleted ? '[Removed by moderation]' : sanitizeText(latestMsg.body || '', 120);
+      await env.DB.prepare('UPDATE conversations SET last_message_preview = ? WHERE id = ?')
+        .bind(preview, existing.conversation_id)
+        .run();
+    }
+
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'message.moderated',
+      'message',
+      msgId,
+      { conversationId: existing.conversation_id, isDeleted },
+      ip
+    );
+    return json({ updated: true, isDeleted });
   }
 
   if (sub === '/reviews') {
@@ -1131,7 +1360,7 @@ export async function handleAdminRoutes(
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
     const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
     if ('error' in auth) return auth.error;
-    const [plans, subscriptions, promotions, promotionTransactions, starsPayments] = await Promise.all([
+    const [plans, subscriptions, promotions, promotionTransactions, starsPayments, revenueSummary] = await Promise.all([
       env.DB.prepare(
         `SELECT sp.*, COALESCE(sps.stars_monthly, 0) as stars_monthly, COALESCE(sps.stars_annual, 0) as stars_annual
          FROM subscription_plans sp LEFT JOIN subscription_plan_stars sps ON sps.plan_id = sp.id
@@ -1154,6 +1383,13 @@ export async function handleAdminRoutes(
          FROM telegram_stars_payments x LEFT JOIN users u ON u.id = x.user_id
          ORDER BY x.created_at DESC LIMIT 100`
       ).all(),
+      env.DB.prepare(
+        `SELECT
+           (SELECT COALESCE(SUM(stars_amount), 0) FROM telegram_stars_payments WHERE status = 'paid') as stars_revenue_xtr,
+           (SELECT COUNT(*) FROM telegram_stars_payments WHERE status = 'pending') as pending_stars_payments,
+           (SELECT COALESCE(SUM(amount_recorded), 0) FROM subscriptions WHERE status = 'active') as subscription_revenue_usd,
+           (SELECT COALESCE(SUM(amount), 0) FROM promotion_transactions WHERE status = 'recorded') as promotion_revenue_usd`
+      ).first(),
     ]);
     return json({
       plans: plans.results,
@@ -1161,6 +1397,7 @@ export async function handleAdminRoutes(
       promotions: promotions.results,
       promotionTransactions: promotionTransactions.results,
       starsPayments: starsPayments.results,
+      revenueSummary,
     });
   }
 
@@ -1223,36 +1460,185 @@ export async function handleAdminRoutes(
     return json({ updated: true });
   }
 
-  if (sub.startsWith('/promotions/')) {
+  if (sub.startsWith('/subscriptions/')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
     const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
     if ('error' in auth) return auth.error;
     const admin = auth.admin;
-    const promoId = decodeURIComponent(sub.slice('/promotions/'.length));
-    const body = await parseJsonBody(request);
+    const subId = decodeURIComponent(sub.slice('/subscriptions/'.length));
+    const subRow = await env.DB.prepare('SELECT * FROM subscriptions WHERE id = ?')
+      .bind(subId)
+      .first<Record<string, unknown>>();
+    if (!subRow) return json({ error: 'Subscription not found.' }, 404);
+
+    const body = await parseJsonBody<{ status?: string }>(request);
     if (!body.ok) return body.error;
-    const status = String(body.data.status || '');
-    if (!['pending', 'active', 'paused', 'completed', 'rejected'].includes(status)) {
-      return json({ error: 'Invalid promotion status.' }, 400);
+    const nextStatus = String(body.data.status || '');
+    if (!['cancelled', 'expired'].includes(nextStatus)) {
+      return json({ error: 'Administrators can only transition subscriptions to cancelled or expired.' }, 400);
     }
+
+    await env.DB.prepare('UPDATE subscriptions SET status = ? WHERE id = ?').bind(nextStatus, subId).run();
+    await notifyUserAndTelegramEdge(
+      env,
+      String(subRow.user_id),
+      'subscription',
+      `Subscription ${nextStatus.toUpperCase()}`,
+      `Your seller subscription status was updated to ${nextStatus} by SOFUMER Administration.`,
+      url.origin
+    );
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'subscription.updated',
+      'subscription',
+      subId,
+      { previousStatus: subRow.status, status: nextStatus },
+      ip,
+      true
+    );
+    return json({ updated: true, status: nextStatus });
+  }
+
+  if (sub.startsWith('/stars-payments/')) {
+    if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
+    const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+    const payId = decodeURIComponent(sub.slice('/stars-payments/'.length));
+    const payment = await env.DB.prepare('SELECT * FROM telegram_stars_payments WHERE id = ?')
+      .bind(payId)
+      .first<Record<string, unknown>>();
+    if (!payment) return json({ error: 'Stars payment record not found.' }, 404);
+    if (String(payment.status) !== 'pending') {
+      return json({ error: 'Only pending Stars invoices can be expired or cancelled.' }, 409);
+    }
+
+    const body = await parseJsonBody<{ status?: string }>(request);
+    if (!body.ok) return body.error;
+    const nextStatus = String(body.data.status || 'expired');
+    if (!['expired', 'cancelled'].includes(nextStatus)) {
+      return json({ error: 'Pending Stars invoices may only be marked expired or cancelled.' }, 400);
+    }
+
+    await env.DB.prepare("UPDATE telegram_stars_payments SET status = ?, updated_at = datetime('now') WHERE id = ?")
+      .bind(nextStatus, payId)
+      .run();
+    await recordEdgeAdminAudit(
+      env,
+      admin.adminIdentifier,
+      'stars_payment.updated',
+      'telegram_stars_payment',
+      payId,
+      { status: nextStatus, starsAmount: payment.stars_amount },
+      ip,
+      true
+    );
+    return json({ updated: true, status: nextStatus });
+  }
+
+  if (sub.startsWith('/promotions/')) {
+    const promoId = decodeURIComponent(sub.slice('/promotions/'.length));
+    const auth = await requireEdgeAdmin(request, env, 'monetization.manage');
+    if ('error' in auth) return auth.error;
+    const admin = auth.admin;
+
     const promo = await env.DB.prepare('SELECT * FROM promotions WHERE id = ?')
       .bind(promoId)
       .first<Record<string, unknown>>();
     if (!promo) return json({ error: 'Promotion not found.' }, 404);
 
-    await env.DB.prepare('UPDATE promotions SET status = ? WHERE id = ?').bind(status, promo.id).run();
-    if (status === 'active') {
-      await env.DB.prepare("UPDATE promotion_transactions SET status = 'recorded' WHERE promotion_id = ?").bind(promo.id).run();
-      if (promo.product_id) {
-        if (promo.promo_type === 'sponsored_placement') {
-          await env.DB.prepare('UPDATE products SET is_sponsored = 1 WHERE id = ?').bind(promo.product_id).run();
-        } else {
-          await env.DB.prepare('UPDATE products SET is_featured = 1 WHERE id = ?').bind(promo.product_id).run();
+    if (request.method === 'PATCH') {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return body.error;
+      const status = String(body.data.status || '');
+      if (!['pending', 'active', 'paused', 'completed', 'rejected'].includes(status)) {
+        return json({ error: 'Invalid promotion status.' }, 400);
+      }
+
+      if (status === 'active') {
+        const durationDays = Math.max(1, Math.min(365, Number(promo.duration_days || 7) || 7));
+        await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE promotions
+             SET status = 'active',
+                 starts_at = COALESCE(starts_at, datetime('now')),
+                 ends_at = COALESCE(ends_at, datetime('now', '+' || ? || ' days'))
+             WHERE id = ?`
+          ).bind(durationDays, promo.id),
+          env.DB.prepare("UPDATE promotion_transactions SET status = 'recorded' WHERE promotion_id = ?").bind(promo.id),
+        ]);
+        if (promo.product_id) {
+          if (promo.promo_type === 'sponsored_placement') {
+            await env.DB.prepare('UPDATE products SET is_sponsored = 1 WHERE id = ?').bind(promo.product_id).run();
+          } else {
+            await env.DB.prepare('UPDATE products SET is_featured = 1 WHERE id = ?').bind(promo.product_id).run();
+          }
+        }
+      } else {
+        await env.DB.prepare('UPDATE promotions SET status = ? WHERE id = ?').bind(status, promo.id).run();
+        if (promo.product_id && ['paused', 'completed', 'rejected'].includes(status)) {
+          const col = promo.promo_type === 'sponsored_placement' ? 'is_sponsored' : 'is_featured';
+          const otherActive = await env.DB.prepare(
+            "SELECT id FROM promotions WHERE product_id = ? AND promo_type = ? AND status = 'active' AND id != ? LIMIT 1"
+          )
+            .bind(promo.product_id, promo.promo_type, promo.id)
+            .first();
+          if (!otherActive) {
+            await env.DB.prepare(`UPDATE products SET ${col} = 0 WHERE id = ?`).bind(promo.product_id).run();
+          }
         }
       }
+
+      await recordEdgeAdminAudit(env, admin.adminIdentifier, 'promotion.updated', 'promotion', promoId, { status }, ip);
+      return json({ updated: true });
     }
-    await recordEdgeAdminAudit(env, admin.adminIdentifier, 'promotion.updated', 'promotion', promoId, { status }, ip);
-    return json({ updated: true });
+
+    if (request.method === 'DELETE') {
+      if (String(promo.status) === 'active') {
+        return json({ error: 'Pause or complete an active promotion before deleting it.' }, 409);
+      }
+      const paidStars = await env.DB.prepare(
+        "SELECT id FROM telegram_stars_payments WHERE target_type = 'promotion' AND target_id = ? AND status = 'paid' LIMIT 1"
+      )
+        .bind(promoId)
+        .first();
+      if (paidStars) {
+        return json({ error: 'Paid Telegram Stars promotions cannot be permanently deleted; mark them completed or rejected instead.' }, 409);
+      }
+
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE target_type = 'promotion' AND target_id = ? AND status = 'pending'"
+        ).bind(promoId),
+        env.DB.prepare('DELETE FROM promotion_transactions WHERE promotion_id = ?').bind(promoId),
+        env.DB.prepare('DELETE FROM promotions WHERE id = ?').bind(promoId),
+      ]);
+      if (promo.product_id) {
+        const col = promo.promo_type === 'sponsored_placement' ? 'is_sponsored' : 'is_featured';
+        const otherActive = await env.DB.prepare(
+          "SELECT id FROM promotions WHERE product_id = ? AND promo_type = ? AND status = 'active' LIMIT 1"
+        )
+          .bind(promo.product_id, promo.promo_type)
+          .first();
+        if (!otherActive) {
+          await env.DB.prepare(`UPDATE products SET ${col} = 0 WHERE id = ?`).bind(promo.product_id).run();
+        }
+      }
+      await recordEdgeAdminAudit(
+        env,
+        admin.adminIdentifier,
+        'promotion.deleted',
+        'promotion',
+        promoId,
+        { title: promo.title, previousStatus: promo.status },
+        ip,
+        true
+      );
+      return json({ deleted: true, id: promoId });
+    }
+
+    return methodNotAllowed(['PATCH', 'DELETE']);
   }
 
   if (sub === '/ai') {
@@ -1820,7 +2206,7 @@ export async function handleAdminRoutes(
     if (!/^\d{3,20}$/.test(telegramId)) {
       return json({ error: 'Telegram ID must be a numeric Telegram user ID (3–20 digits).' }, 400);
     }
-    if (isTelegramIdAdmin(telegramId, env.ADMIN_TELEGRAM_IDS)) {
+    if (isTelegramIdAdmin(telegramId, [env.ADMIN_TELEGRAM_IDS, env.ADMIN_TELEGRAM_ID].filter(Boolean).join(','))) {
       return json({ error: 'This Telegram ID is already a permanent Owner configured in ADMIN_TELEGRAM_IDS.' }, 409);
     }
     const role = await env.DB.prepare('SELECT * FROM admin_roles WHERE id = ?')

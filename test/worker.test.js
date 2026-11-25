@@ -3444,6 +3444,526 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     expect(expiredMeJson.authenticated).toBe(false);
     expect(expiredMeJson.reason).toBe('session_expired');
   });
+
+  it('28. Complete 20-section Governance Console Audit: every admin mutation, product_inventory FK cleanup, order/promo/subscription/stars lifecycle, message moderation, and RBAC checks', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callWorker = (path, init = {}) => {
+      const ctx = createExecutionContext();
+      return worker
+        .fetch(new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init), testEnv, ctx)
+        .then(async (res) => {
+          await waitOnExecutionContext(ctx);
+          return res;
+        });
+    };
+
+    const loginAs = async (tgId, username) => {
+      const initData = await signTelegramInitData({ id: tgId, first_name: username, username }, testEnv.TELEGRAM_BOT_TOKEN);
+      const authRes = await callWorker('/api/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData }),
+      });
+      const authJson = await authRes.json();
+      const meRes = await callWorker('/api/auth/me', {
+        headers: { Authorization: `Bearer ${authJson.token}` },
+      });
+      const meJson = await meRes.json();
+      return { token: authJson.token, user: meJson.user };
+    };
+
+    const admin = await loginAs(999001, 'gov_admin');
+    const seller = await loginAs(950001, 'gov_seller');
+    const buyer = await loginAs(950002, 'gov_buyer');
+
+    const adminHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${admin.token}` };
+    const sellerHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${seller.token}` };
+    const buyerHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${buyer.token}` };
+
+    // Non-admin RBAC enforcement on new endpoints -> 403
+    expect(
+      (
+        await callWorker('/api/admin/orders/ord_nonexistent', {
+          method: 'PATCH',
+          headers: buyerHeaders,
+          body: JSON.stringify({ status: 'Confirmed' }),
+        })
+      ).status
+    ).toBe(403);
+    expect(
+      (
+        await callWorker('/api/admin/telegram/diagnostics', {
+          headers: { Authorization: `Bearer ${buyer.token}` },
+        })
+      ).status
+    ).toBe(403);
+
+    // 1. Overview & 2. Analytics
+    expect((await callWorker('/api/admin/overview', { headers: { Authorization: `Bearer ${admin.token}` } })).status).toBe(200);
+    expect((await callWorker('/api/admin/analytics', { headers: { Authorization: `Bearer ${admin.token}` } })).status).toBe(200);
+
+    // 3. Users: list, restrict status, custom AI daily limit
+    const usersListRes = await callWorker('/api/admin/users', { headers: { Authorization: `Bearer ${admin.token}` } });
+    expect(usersListRes.status).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/users/${buyer.user.id}/status`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'restricted', reason: 'Audit test restriction' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/users/${buyer.user.id}/status`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'active' }),
+        })
+      ).status
+    ).toBe(200);
+    const aiQuotaRes = await callWorker(`/api/admin/users/${buyer.user.id}/ai-access`, {
+      method: 'PATCH',
+      headers: adminHeaders,
+      body: JSON.stringify({ aiEnabled: true, customDailyLimit: 42 }),
+    });
+    expect(aiQuotaRes.status).toBe(200);
+    const buyerPermRow = await env.DB.prepare('SELECT custom_daily_limit FROM ai_permissions WHERE user_id = ?')
+      .bind(buyer.user.id)
+      .first();
+    expect(Number(buyerPermRow.custom_daily_limit)).toBe(42);
+
+    // 4. Sellers & 5. Shops: register seller, approve/reject, edit shop name/description
+    const regRes = await callWorker('/api/seller/register', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({
+        sellerType: 'individual',
+        legalName: 'Gov Test Seller',
+        shopName: 'Gov Initial Shop',
+        countryCode: 'US',
+      }),
+    });
+    expect(regRes.status).toBe(201);
+    const { sellerProfile, shop } = await regRes.json();
+
+    expect(
+      (
+        await callWorker(`/api/admin/sellers/${sellerProfile.id}/status`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ verificationStatus: 'rejected', notes: 'Need clearer ID' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/sellers/${sellerProfile.id}/status`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ verificationStatus: 'verified' }),
+        })
+      ).status
+    ).toBe(200);
+
+    const editShopRes = await callWorker(`/api/admin/shops/${shop.id}`, {
+      method: 'PATCH',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: 'Gov Updated Shop',
+        description: 'Updated shop description via Governance Console.',
+        isVerified: true,
+      }),
+    });
+    expect(editShopRes.status).toBe(200);
+    const updatedShopRow = await env.DB.prepare('SELECT name, description FROM shops WHERE id = ?').bind(shop.id).first();
+    expect(updatedShopRow.name).toBe('Gov Updated Shop');
+    expect(updatedShopRow.description).toBe('Updated shop description via Governance Console.');
+
+    // 6. Products: create product WITH product_inventory row (FK), archive, sponsor, then DELETE without HTTP 500!
+    const prod1Res = await callWorker('/api/seller/products', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({
+        listingType: 'physical',
+        title: 'Gov Inventory Delete Target',
+        description: 'Must delete cleanly even with product_inventory FK row.',
+        categoryId: 'cat_electronics',
+        price: 89,
+        currency: 'USD',
+        stockQuantity: 15,
+        status: 'published',
+      }),
+    });
+    expect(prod1Res.status).toBe(201);
+    const { product: prodToDelete } = await prod1Res.json();
+
+    // Ensure product_inventory row exists (explicitly verify the FK table that previously threw 500)
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO product_inventory (id, product_id, stock_quantity, low_stock_threshold)
+       VALUES (?, ?, 15, 2)`
+    )
+      .bind(`inv_${prodToDelete.id}`, prodToDelete.id)
+      .run();
+
+    expect(
+      (
+        await callWorker(`/api/admin/products/${prodToDelete.id}/moderate`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'archived', isSponsored: true }),
+        })
+      ).status
+    ).toBe(200);
+
+    const delProdRes = await callWorker(`/api/admin/products/${prodToDelete.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(delProdRes.status).toBe(200);
+    const invLeft = await env.DB.prepare('SELECT COUNT(*) as cnt FROM product_inventory WHERE product_id = ?')
+      .bind(prodToDelete.id)
+      .first();
+    expect(Number(invLeft.cnt)).toBe(0);
+
+    // Create a second active product for Orders, Promotions, and Messaging tests
+    const prod2Res = await callWorker('/api/seller/products', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({
+        listingType: 'physical',
+        title: 'Gov Active Studio Mic',
+        description: 'Used across order, promo, and chat moderation tests.',
+        categoryId: 'cat_electronics',
+        price: 150,
+        currency: 'USD',
+        status: 'published',
+      }),
+    });
+    const { product: activeProd } = await prod2Res.json();
+
+    // 7. Categories: edit existing category description & rename subcategory
+    const catCreate = await callWorker('/api/admin/categories', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ name: 'Gov Editable Cat', description: 'Before desc' }),
+    });
+    const { id: govCatId } = await catCreate.json();
+    expect(
+      (
+        await callWorker(`/api/admin/categories/${govCatId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ name: 'Gov Edited Cat', description: 'After desc', sortOrder: 12 }),
+        })
+      ).status
+    ).toBe(200);
+    const subCreate = await callWorker('/api/admin/subcategories', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ categoryId: govCatId, name: 'Gov Sub Before' }),
+    });
+    const { id: govSubId } = await subCreate.json();
+    expect(
+      (
+        await callWorker(`/api/admin/subcategories/${govSubId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ name: 'Gov Sub After', isActive: false }),
+        })
+      ).status
+    ).toBe(200);
+    await callWorker(`/api/admin/subcategories/${govSubId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${admin.token}` } });
+    await callWorker(`/api/admin/categories/${govCatId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${admin.token}` } });
+
+    // 8. Orders: GET detail + PATCH status + invalid status -> 400 + history + protected audit log
+    const convRes = await callWorker('/api/conversations', {
+      method: 'POST',
+      headers: buyerHeaders,
+      body: JSON.stringify({ productId: activeProd.id, message: 'Hello seller' }),
+    });
+    const { conversationId } = await convRes.json();
+    const ordRes = await callWorker('/api/orders', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({
+        productId: activeProd.id,
+        buyerUserId: buyer.user.id,
+        conversationId,
+        quantity: 1,
+        agreedTotal: 150,
+        currency: 'USD',
+      }),
+    });
+    const { orderId } = await ordRes.json();
+
+    expect(
+      (
+        await callWorker(`/api/admin/orders/${orderId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'NotARealStatus' }),
+        })
+      ).status
+    ).toBe(400);
+
+    const ordPatchRes = await callWorker(`/api/admin/orders/${orderId}`, {
+      method: 'PATCH',
+      headers: adminHeaders,
+      body: JSON.stringify({ status: 'Disputed', note: 'Admin escalated dispute review' }),
+    });
+    expect(ordPatchRes.status).toBe(200);
+
+    const ordDetailRes = await callWorker(`/api/admin/orders/${orderId}`, {
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(ordDetailRes.status).toBe(200);
+    const ordDetail = await ordDetailRes.json();
+    expect(ordDetail.order.status).toBe('Disputed');
+    expect(ordDetail.history.some((h) => h.new_status === 'Disputed')).toBe(true);
+
+    // 9. Messages & Reports: submit report, transition investigating -> resolved, hide/restore message, close/restore conversation
+    const badMsgRes = await callWorker(`/api/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      headers: buyerHeaders,
+      body: JSON.stringify({ body: 'Suspicious off-platform link' }),
+    });
+    const { message: badMsg } = await badMsgRes.json();
+
+    const repSubmit = await callWorker('/api/marketplace/reports', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({
+        targetType: 'message',
+        targetId: conversationId,
+        reason: 'spam',
+        details: 'Off-platform spam attempt',
+      }),
+    });
+    expect(repSubmit.status).toBe(201);
+    const { reportId: repId } = await repSubmit.json();
+
+    expect(
+      (
+        await callWorker(`/api/admin/reports/${repId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'investigating', resolutionNotes: 'Reviewing evidence' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/messages/${badMsg.id}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ isDeleted: true }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/conversations/${conversationId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'closed', reason: 'Moderator closed thread' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/conversations/${conversationId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'active' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/reports/${repId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'resolved', resolutionNotes: 'Message hidden and thread resolved' }),
+        })
+      ).status
+    ).toBe(200);
+
+    // 11. Promotions, 12. Subscriptions, 13. Revenue & Stars invoices
+    const promo1Res = await callWorker('/api/seller/promotions', {
+      method: 'POST',
+      headers: sellerHeaders,
+      body: JSON.stringify({ promoType: 'featured_product', productId: activeProd.id, durationDays: 7, title: 'Gov Promo 1' }),
+    });
+    const { promotionId: promo1Id } = await promo1Res.json();
+
+    // Activate sets starts_at / ends_at and flags product featured
+    expect(
+      (
+        await callWorker(`/api/admin/promotions/${promo1Id}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'active' }),
+        })
+      ).status
+    ).toBe(200);
+    const activeProdFeatured = await env.DB.prepare('SELECT is_featured FROM products WHERE id = ?').bind(activeProd.id).first();
+    expect(Number(activeProdFeatured.is_featured)).toBe(1);
+
+    // Pause clears product featured flag, and DELETE fails if active (409) -> then paused unpaid promo deletes cleanly (200)
+    expect(
+      (
+        await callWorker(`/api/admin/promotions/${promo1Id}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'paused' }),
+        })
+      ).status
+    ).toBe(200);
+    const pausedProdFeatured = await env.DB.prepare('SELECT is_featured FROM products WHERE id = ?').bind(activeProd.id).first();
+    expect(Number(pausedProdFeatured.is_featured)).toBe(0);
+    expect(
+      (
+        await callWorker(`/api/admin/promotions/${promo1Id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${admin.token}` },
+        })
+      ).status
+    ).toBe(200);
+
+    // Seed an active subscription & pending Stars payment -> test cancel/expire & revenueSummary
+    const subId = `sub_gov_${Date.now()}`;
+    const spPendingId = `sp_pend_${Date.now()}`;
+    const spPaidId = `sp_paid_${Date.now()}`;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO subscriptions (id, seller_id, user_id, plan_id, billing_cycle, amount_recorded, currency, status, starts_at, ends_at)
+         VALUES (?, ?, ?, 'plan_pro', 'monthly', 24, 'USD', 'active', datetime('now'), datetime('now', '+30 days'))`
+      ).bind(subId, sellerProfile.id, seller.user.id),
+      env.DB.prepare(
+        `INSERT INTO telegram_stars_payments (id, user_id, payer_telegram_id, target_type, target_id, plan_code, billing_cycle, title, payload_token, currency, stars_amount, usd_equivalent, status, expires_at)
+         VALUES (?, ?, '950001', 'subscription', 'plan_pro', 'PRO', 'monthly', 'Pro Plan Pending', ?, 'XTR', 1200, 24, 'pending', datetime('now', '+1 hour'))`
+      ).bind(spPendingId, seller.user.id, `paytok_pend_${Date.now()}`),
+      env.DB.prepare(
+        `INSERT INTO telegram_stars_payments (id, user_id, payer_telegram_id, target_type, target_id, plan_code, billing_cycle, title, payload_token, currency, stars_amount, usd_equivalent, status, expires_at, paid_at)
+         VALUES (?, ?, '950001', 'subscription', 'plan_pro', 'PRO', 'monthly', 'Pro Plan Paid', ?, 'XTR', 1200, 24, 'paid', datetime('now', '+1 hour'), datetime('now'))`
+      ).bind(spPaidId, seller.user.id, `paytok_paid_${Date.now()}`),
+    ]);
+
+    const monRes = await callWorker('/api/admin/monetization', { headers: { Authorization: `Bearer ${admin.token}` } });
+    expect(monRes.status).toBe(200);
+    const monJson = await monRes.json();
+    expect(monJson.revenueSummary).toBeDefined();
+    expect(Number(monJson.revenueSummary.stars_revenue_xtr)).toBeGreaterThanOrEqual(1200);
+
+    expect(
+      (
+        await callWorker(`/api/admin/subscriptions/${subId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'cancelled' }),
+        })
+      ).status
+    ).toBe(200);
+
+    // Pending Stars invoice expires cleanly (200); already-paid Stars invoice cannot be mutated (409)
+    expect(
+      (
+        await callWorker(`/api/admin/stars-payments/${spPendingId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'expired' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/stars-payments/${spPaidId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ status: 'cancelled' }),
+        })
+      ).status
+    ).toBe(409);
+
+    // 16. Countries, 18. Settings + Telegram Launch Diagnostics
+    expect(
+      (
+        await callWorker('/api/admin/countries/US', {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ isSupported: true, notes: 'Governance audited' }),
+        })
+      ).status
+    ).toBe(200);
+
+    const diagRes = await callWorker('/api/admin/telegram/diagnostics', {
+      headers: { Authorization: `Bearer ${admin.token}` },
+    });
+    expect(diagRes.status).toBe(200);
+    const diagJson = await diagRes.json();
+    expect(diagJson.telegramConfigured).toBe(true);
+    expect(diagJson.jwtConfigured).toBe(true);
+
+    // 19. Admin Roles: edit custom role name/description + revoke + delete role
+    const roleRes = await callWorker('/api/admin/roles', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        code: 'GOV_EDITOR',
+        name: 'Gov Editor',
+        description: 'Initial role description',
+        permissions: ['analytics.view'],
+      }),
+    });
+    expect(roleRes.status).toBe(201);
+    const { id: govRoleId } = await roleRes.json();
+    expect(
+      (
+        await callWorker(`/api/admin/roles/${govRoleId}`, {
+          method: 'PATCH',
+          headers: adminHeaders,
+          body: JSON.stringify({ name: 'Gov Senior Editor', description: 'Updated desc' }),
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await callWorker(`/api/admin/roles/${govRoleId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${admin.token}` },
+        })
+      ).status
+    ).toBe(200);
+
+    // 20. Audit Logs: protected financial/moderation log blocked from deletion, normal log can be archived and deleted
+    const protAudit = await env.DB.prepare("SELECT id FROM admin_audit_logs WHERE action = 'order.status_updated' LIMIT 1").first();
+    expect(protAudit?.id).toBeDefined();
+    expect(
+      (
+        await callWorker(`/api/admin/audit-logs/${protAudit.id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${admin.token}` },
+        })
+      ).status
+    ).toBe(403);
+
+    const softShopDelRes = await callWorker(`/api/admin/shops/${shop.id}`, {
+      method: 'DELETE',
+      headers: adminHeaders,
+      body: JSON.stringify({ confirmShopName: 'Gov Updated Shop', reason: 'End of governance audit test' }),
+    });
+    expect(softShopDelRes.status).toBe(200);
+  });
 });
+
 
 

@@ -1046,13 +1046,44 @@ export async function isD1Initialized(db?: D1Database): Promise<boolean> {
       .first<{ cnt: number }>();
     if ((staleModel?.cnt ?? 0) > 0) return false;
 
-    const [hasShopDel, hasAuditProt, hasPartHidden, retentionSetting] = await Promise.all([
+    const [
+      hasShopDel,
+      hasShopDelBy,
+      hasShopDelReason,
+      hasAuditProt,
+      hasAuditArch,
+      hasAuditArchAt,
+      hasAuditArchBy,
+      hasPartHidden,
+      hasRepRevBy,
+      hasRepUpdAt,
+      retentionSetting,
+    ] = await Promise.all([
       hasColumn(db, 'shops', 'deleted_at'),
+      hasColumn(db, 'shops', 'deleted_by'),
+      hasColumn(db, 'shops', 'deletion_reason'),
       hasColumn(db, 'admin_audit_logs', 'is_protected'),
+      hasColumn(db, 'admin_audit_logs', 'is_archived'),
+      hasColumn(db, 'admin_audit_logs', 'archived_at'),
+      hasColumn(db, 'admin_audit_logs', 'archived_by'),
       hasColumn(db, 'conversation_participants', 'is_hidden'),
+      hasColumn(db, 'reports', 'reviewed_by'),
+      hasColumn(db, 'reports', 'updated_at'),
       db.prepare("SELECT key FROM platform_settings WHERE key = 'audit_retention_days'").first(),
     ]);
-    return hasShopDel && hasAuditProt && hasPartHidden && Boolean(retentionSetting);
+    return (
+      hasShopDel &&
+      hasShopDelBy &&
+      hasShopDelReason &&
+      hasAuditProt &&
+      hasAuditArch &&
+      hasAuditArchAt &&
+      hasAuditArchBy &&
+      hasPartHidden &&
+      hasRepRevBy &&
+      hasRepUpdAt &&
+      Boolean(retentionSetting)
+    );
   } catch {
     return false;
   }
@@ -1087,6 +1118,8 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
       await ensureColumn(db, 'admin_audit_logs', 'archived_at', 'TEXT');
       await ensureColumn(db, 'admin_audit_logs', 'archived_by', "TEXT DEFAULT ''");
       await ensureColumn(db, 'conversation_participants', 'is_hidden', 'INTEGER NOT NULL DEFAULT 0');
+      await ensureColumn(db, 'reports', 'reviewed_by', "TEXT DEFAULT ''");
+      await ensureColumn(db, 'reports', 'updated_at', "TEXT DEFAULT ''");
 
       await db.batch([
         db.prepare('CREATE INDEX IF NOT EXISTS idx_shops_deleted_at ON shops(deleted_at)'),

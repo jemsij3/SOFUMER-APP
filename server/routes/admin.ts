@@ -20,9 +20,21 @@ import {
   requireAdminPermission,
   sanitizeText,
 } from '../security.ts';
-import { notifyUserAndTelegram } from '../telegram.ts';
+import {
+  ensureTelegramMenuButtonLocal,
+  getTelegramBotLaunchDiagnosticsLocal,
+  notifyUserAndTelegram,
+  resolveSafeMiniAppUrlLocal,
+} from '../telegram.ts';
+import type { NextFunction, Request, Response } from 'express';
 
 export const adminRouter = Router();
+
+const asyncHandler =
+  (fn: (req: Request, res: Response, next: NextFunction) => unknown) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 
 function validateAndNormalizeSettingLocal(
   key: string,
@@ -402,7 +414,7 @@ adminRouter.get('/shops', requireAdminPermission(['shops.manage', 'sellers.manag
   res.json({ shops });
 });
 
-adminRouter.patch('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage', 'sellers.suspend']), async (req, res) => {
+adminRouter.patch('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage', 'sellers.suspend']), asyncHandler(async (req, res) => {
   const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
   if (!shop) return res.status(404).json({ error: 'Shop not found.' });
   if (String(shop.status) === 'closed') {
@@ -412,9 +424,17 @@ adminRouter.patch('/shops/:id', requireAdminPermission(['shops.manage', 'sellers
   const status = req.body?.status ? String(req.body.status) : null;
   const verificationStatus = req.body?.verificationStatus ? String(req.body.verificationStatus) : null;
   const isFeatured = req.body?.isFeatured;
+  const nextName = req.body?.name !== undefined ? sanitizeText(req.body.name, 80) : null;
+  const nextDesc = req.body?.description !== undefined ? sanitizeText(req.body.description, 600) : null;
 
-  if ((verificationStatus || typeof isFeatured === 'boolean') && !hasAdminPermission(req.adminSession!, ['shops.manage', 'sellers.manage'])) {
-    return res.status(403).json({ error: 'Insufficient administrative permissions to change shop verification or featured status.' });
+  if (
+    (verificationStatus || typeof isFeatured === 'boolean' || nextName !== null || nextDesc !== null) &&
+    !hasAdminPermission(req.adminSession!, ['shops.manage', 'sellers.manage'])
+  ) {
+    return res.status(403).json({ error: 'Insufficient administrative permissions to edit shop details or verification status.' });
+  }
+  if (nextName !== null && nextName.length < 2) {
+    return res.status(400).json({ error: 'Shop name must be at least 2 characters.' });
   }
 
   if (status && ['active', 'suspended'].includes(status)) {
@@ -427,18 +447,32 @@ adminRouter.patch('/shops/:id', requireAdminPermission(['shops.manage', 'sellers
       String(shop.user_id),
       'verification',
       `Shop Verification: ${verificationStatus.toUpperCase()}`,
-      `Verification status for "${String(shop.name)}" is now ${verificationStatus}.`
+      `Verification status for "${nextName || String(shop.name)}" is now ${verificationStatus}.`
     );
   }
   if (typeof isFeatured === 'boolean') {
     db.prepare("UPDATE shops SET is_featured = ?, updated_at = datetime('now') WHERE id = ?").run(isFeatured ? 1 : 0, req.params.id);
   }
+  if (nextName !== null || nextDesc !== null) {
+    db.prepare("UPDATE shops SET name = ?, description = ?, updated_at = datetime('now') WHERE id = ?").run(
+      nextName !== null ? nextName : String(shop.name),
+      nextDesc !== null ? nextDesc : String(shop.description || ''),
+      req.params.id
+    );
+  }
 
-  recordAdminAudit(req.adminSession!.adminIdentifier, 'shop.updated', 'shop', req.params.id, { status, verificationStatus, isFeatured }, req.ip || '');
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'shop.updated',
+    'shop',
+    req.params.id,
+    { status, verificationStatus, isFeatured, name: nextName },
+    req.ip || ''
+  );
   res.json({ updated: true });
-});
+}));
 
-adminRouter.delete('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage']), async (req, res) => {
+adminRouter.delete('/shops/:id', requireAdminPermission(['shops.manage', 'sellers.manage']), asyncHandler(async (req, res) => {
   const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
   if (!shop) return res.status(404).json({ error: 'Shop not found.' });
   if (String(shop.status) === 'closed') {
@@ -489,7 +523,7 @@ adminRouter.delete('/shops/:id', requireAdminPermission(['shops.manage', 'seller
     archivedProductsCount: result.archivedProductsCount,
     deletedProductsCount: result.deletedProductsCount,
   });
-});
+}));
 
 // ============================================================================
 // PRODUCTS MODERATION & AI POLICY SCAN
@@ -509,7 +543,7 @@ adminRouter.get('/products', requireAdminPermission(['moderation.manage', 'catal
   res.json({ products });
 });
 
-adminRouter.delete('/products/:id', requireAdminPermission('moderation.manage'), async (req, res) => {
+adminRouter.delete('/products/:id', requireAdminPermission('moderation.manage'), asyncHandler(async (req, res) => {
   const prodId = req.params.id;
   const product = db.prepare('SELECT * FROM products WHERE id = ?').get(prodId) as Record<string, unknown> | undefined;
   if (!product) return res.status(404).json({ error: 'Product not found.' });
@@ -549,6 +583,7 @@ adminRouter.delete('/products/:id', requireAdminPermission('moderation.manage'),
       db.prepare('DELETE FROM inquiries WHERE product_id = ?').run(prodId);
       db.prepare('DELETE FROM product_favorites WHERE product_id = ?').run(prodId);
       db.prepare('DELETE FROM recently_viewed WHERE product_id = ?').run(prodId);
+      db.prepare('DELETE FROM product_inventory WHERE product_id = ?').run(prodId);
       db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(prodId);
       db.prepare('DELETE FROM product_images WHERE product_id = ?').run(prodId);
       db.prepare('DELETE FROM product_media WHERE product_id = ?').run(prodId);
@@ -574,9 +609,9 @@ adminRouter.delete('/products/:id', requireAdminPermission('moderation.manage'),
     true
   );
   res.json({ deleted: true, mode, productId: prodId });
-});
+}));
 
-adminRouter.patch('/products/:id/moderate', requireAdminPermission('moderation.manage'), async (req, res) => {
+adminRouter.patch('/products/:id/moderate', requireAdminPermission('moderation.manage'), asyncHandler(async (req, res) => {
   const status = String(req.body?.status || '');
   const notes = sanitizeText(req.body?.notes || '', 400);
   const isFeatured = req.body?.isFeatured;
@@ -615,9 +650,9 @@ adminRouter.patch('/products/:id/moderate', requireAdminPermission('moderation.m
     req.ip || ''
   );
   res.json({ updated: true });
-});
+}));
 
-adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('moderation.manage'), async (req, res) => {
+adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('moderation.manage'), asyncHandler(async (req, res) => {
   const product = db
     .prepare(
       `SELECT p.*, c.name as category_name, s.name as shop_name
@@ -710,7 +745,7 @@ adminRouter.post('/moderation/products/:id/ai-scan', requireAdminPermission('mod
     aiEvaluated,
     model: modelName,
   });
-});
+}));
 
 // ============================================================================
 // CATEGORIES & SUBCATEGORIES
@@ -849,11 +884,103 @@ adminRouter.get('/orders', requireAdminPermission('orders.manage'), (_req, res) 
        JOIN shops s ON s.id = o.shop_id
        JOIN users bu ON bu.id = o.buyer_user_id
        JOIN users su ON su.id = o.seller_user_id
-       ORDER BY o.updated_at DESC LIMIT 100`
+       ORDER BY o.updated_at DESC LIMIT 120`
     )
     .all();
   res.json({ orders });
 });
+
+adminRouter.get('/orders/:id', requireAdminPermission('orders.manage'), (req, res) => {
+  const order = db
+    .prepare(
+      `SELECT o.*, s.name as shop_name, bu.display_name as buyer_name, su.display_name as seller_name
+       FROM orders o
+       JOIN shops s ON s.id = o.shop_id
+       JOIN users bu ON bu.id = o.buyer_user_id
+       JOIN users su ON su.id = o.seller_user_id
+       WHERE o.id = ?`
+    )
+    .get(req.params.id) as Record<string, unknown> | undefined;
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id);
+  const history = db
+    .prepare('SELECT * FROM order_status_history WHERE order_id = ? ORDER BY created_at ASC')
+    .all(req.params.id);
+  res.json({ order, items, history });
+});
+
+adminRouter.patch('/orders/:id', requireAdminPermission('orders.manage'), asyncHandler(async (req, res) => {
+  const VALID_ORDER_STATUSES = [
+    'Inquiry',
+    'Pending Confirmation',
+    'Confirmed',
+    'Processing',
+    'Shipped',
+    'Delivered',
+    'Completed',
+    'Cancelled',
+    'Disputed',
+  ];
+  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+
+  const status = String(req.body?.status || '');
+  if (!VALID_ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'Invalid order status.' });
+  }
+  const note = sanitizeText(req.body?.note || '', 300);
+
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE orders
+       SET status = ?,
+           buyer_confirmed_at = CASE WHEN ? = 'Confirmed' THEN COALESCE(buyer_confirmed_at, datetime('now')) ELSE buyer_confirmed_at END,
+           completed_at = CASE WHEN ? = 'Completed' THEN COALESCE(completed_at, datetime('now')) ELSE completed_at END,
+           updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(status, status, status, req.params.id);
+
+    db.prepare(
+      `INSERT INTO order_status_history (id, order_id, old_status, new_status, changed_by_user_id, changed_by_role, note)
+       VALUES (?, ?, ?, ?, ?, 'admin', ?)`
+    ).run(
+      newId('osh'),
+      req.params.id,
+      String(order.status || ''),
+      status,
+      req.adminSession!.userId,
+      note || `Status updated to ${status} by administrator`
+    );
+  })();
+
+  await Promise.all([
+    notifyUserAndTelegram(
+      String(order.buyer_user_id),
+      'order',
+      `Order ${String(order.order_number)}: ${status}`,
+      note || `An administrator updated your order status to ${status}.`
+    ),
+    notifyUserAndTelegram(
+      String(order.seller_user_id),
+      'order',
+      `Order ${String(order.order_number)}: ${status}`,
+      note || `An administrator updated order status to ${status}.`
+    ),
+  ]);
+
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'order.status_updated',
+    'order',
+    req.params.id,
+    { orderNumber: order.order_number, previousStatus: order.status, status, note },
+    req.ip || '',
+    true
+  );
+  res.json({ updated: true, status });
+}));
 
 adminRouter.get('/reports', requireAdminPermission(['reports.manage', 'messages.moderate']), (_req, res) => {
   const reports = db
@@ -861,19 +988,25 @@ adminRouter.get('/reports', requireAdminPermission(['reports.manage', 'messages.
       `SELECT r.*, u.display_name as reporter_name
        FROM reports r
        JOIN users u ON u.id = r.reporter_user_id
-       ORDER BY CASE WHEN r.status = 'open' THEN 0 ELSE 1 END, r.created_at DESC`
+       ORDER BY CASE WHEN r.status = 'open' THEN 0 WHEN r.status = 'investigating' THEN 1 ELSE 2 END, r.created_at DESC`
     )
     .all();
   const flaggedConversations = db
     .prepare(
       `SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-       FROM conversations c WHERE c.status = 'flagged' ORDER BY c.created_at DESC`
+       FROM conversations c
+       WHERE c.status IN ('flagged', 'closed')
+       ORDER BY CASE WHEN c.status = 'flagged' THEN 0 ELSE 1 END, c.last_message_at DESC LIMIT 60`
     )
     .all();
   res.json({ reports, flaggedConversations });
 });
 
 adminRouter.get('/conversations/:id/messages', requireAdminPermission(['reports.manage', 'messages.moderate']), (req, res) => {
+  const conv = db.prepare('SELECT id, subject, status FROM conversations WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!conv) return res.status(404).json({ error: 'Conversation not found.' });
   const messages = db
     .prepare(
       `SELECT m.*, u.display_name as sender_name
@@ -882,7 +1015,58 @@ adminRouter.get('/conversations/:id/messages', requireAdminPermission(['reports.
     )
     .all(req.params.id);
   recordAdminAudit(req.adminSession!.adminIdentifier, 'conversation.investigated', 'conversation', req.params.id, {}, req.ip || '');
-  res.json({ messages });
+  res.json({ conversation: conv, messages });
+});
+
+adminRouter.patch('/conversations/:id', requireAdminPermission(['reports.manage', 'messages.moderate']), (req, res) => {
+  const status = String(req.body?.status || '');
+  if (!['active', 'flagged', 'closed', 'archived'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid conversation status.' });
+  }
+  const upd = db
+    .prepare('UPDATE conversations SET status = ? WHERE id = ?')
+    .run(status, req.params.id);
+  if (upd.changes === 0) return res.status(404).json({ error: 'Conversation not found.' });
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'conversation.status_updated',
+    'conversation',
+    req.params.id,
+    { status },
+    req.ip || ''
+  );
+  res.json({ updated: true, status });
+});
+
+adminRouter.patch('/messages/:id', requireAdminPermission('messages.moderate'), (req, res) => {
+  const existing = db
+    .prepare('SELECT id, conversation_id, body, is_deleted FROM messages WHERE id = ?')
+    .get(req.params.id) as { id: string; conversation_id: string; body: string; is_deleted: number } | undefined;
+  if (!existing) return res.status(404).json({ error: 'Message not found.' });
+
+  const isDeleted = req.body?.isDeleted !== undefined ? Boolean(req.body.isDeleted) : !existing.is_deleted;
+  db.prepare('UPDATE messages SET is_deleted = ? WHERE id = ?').run(isDeleted ? 1 : 0, req.params.id);
+
+  const latestMsg = db
+    .prepare('SELECT body, is_deleted FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1')
+    .get(existing.conversation_id) as { body: string; is_deleted: number } | undefined;
+  if (latestMsg) {
+    const preview = latestMsg.is_deleted ? '[Removed by moderation]' : sanitizeText(latestMsg.body || '', 120);
+    db.prepare('UPDATE conversations SET last_message_preview = ? WHERE id = ?').run(
+      preview,
+      existing.conversation_id
+    );
+  }
+
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'message.moderated',
+    'message',
+    req.params.id,
+    { conversationId: existing.conversation_id, isDeleted },
+    req.ip || ''
+  );
+  res.json({ updated: true, isDeleted });
 });
 
 adminRouter.patch('/reports/:id', requireAdminPermission('reports.manage'), (req, res) => {
@@ -891,13 +1075,29 @@ adminRouter.patch('/reports/:id', requireAdminPermission('reports.manage'), (req
   if (!['open', 'investigating', 'resolved', 'dismissed'].includes(status)) {
     return res.status(400).json({ error: 'Invalid report status.' });
   }
+  const isResolved = status === 'resolved' || status === 'dismissed' ? 1 : 0;
   const repUpd = db
     .prepare(
-      `UPDATE reports SET status = ?, resolution_notes = ?, resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`
+      `UPDATE reports
+       SET status = ?,
+           resolution_notes = ?,
+           reviewed_by = ?,
+           resolved_by = CASE WHEN ? = 1 THEN ? ELSE resolved_by END,
+           resolved_at = CASE WHEN ? = 1 THEN datetime('now') ELSE resolved_at END,
+           updated_at = datetime('now')
+       WHERE id = ?`
     )
-    .run(status, resolutionNotes, req.adminSession!.adminIdentifier, req.params.id);
+    .run(
+      status,
+      resolutionNotes,
+      req.adminSession!.adminIdentifier,
+      isResolved,
+      req.adminSession!.adminIdentifier,
+      isResolved,
+      req.params.id
+    );
   if (repUpd.changes === 0) return res.status(404).json({ error: 'Report not found.' });
-  recordAdminAudit(req.adminSession!.adminIdentifier, 'report.updated', 'report', req.params.id, { status, resolutionNotes }, req.ip || '');
+  recordAdminAudit(req.adminSession!.adminIdentifier, 'report.resolved', 'report', req.params.id, { status, notes: resolutionNotes }, req.ip || '');
   res.json({ updated: true });
 });
 
@@ -1028,7 +1228,76 @@ adminRouter.get('/monetization', requireAdminPermission('monetization.manage'), 
     )
     .all();
 
-  res.json({ plans, subscriptions, promotions, promotionTransactions, starsPayments });
+  const revenueSummary = db
+    .prepare(
+      `SELECT
+         (SELECT COALESCE(SUM(stars_amount), 0) FROM telegram_stars_payments WHERE status = 'paid') as stars_revenue_xtr,
+         (SELECT COUNT(*) FROM telegram_stars_payments WHERE status = 'pending') as pending_stars_payments,
+         (SELECT COALESCE(SUM(amount_recorded), 0) FROM subscriptions WHERE status = 'active') as subscription_revenue_usd,
+         (SELECT COALESCE(SUM(amount), 0) FROM promotion_transactions WHERE status = 'recorded') as promotion_revenue_usd`
+    )
+    .get();
+
+  res.json({ plans, subscriptions, promotions, promotionTransactions, starsPayments, revenueSummary });
+});
+
+adminRouter.patch('/subscriptions/:id', requireAdminPermission('monetization.manage'), asyncHandler(async (req, res) => {
+  const subRow = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!subRow) return res.status(404).json({ error: 'Subscription not found.' });
+
+  const nextStatus = String(req.body?.status || '');
+  if (!['cancelled', 'expired'].includes(nextStatus)) {
+    return res.status(400).json({ error: 'Administrators can only transition subscriptions to cancelled or expired.' });
+  }
+
+  db.prepare('UPDATE subscriptions SET status = ? WHERE id = ?').run(nextStatus, req.params.id);
+  await notifyUserAndTelegram(
+    String(subRow.user_id),
+    'subscription',
+    `Subscription ${nextStatus.toUpperCase()}`,
+    `Your seller subscription status was updated to ${nextStatus} by SOFUMER Administration.`
+  );
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'subscription.updated',
+    'subscription',
+    req.params.id,
+    { previousStatus: subRow.status, status: nextStatus },
+    req.ip || '',
+    true
+  );
+  res.json({ updated: true, status: nextStatus });
+}));
+
+adminRouter.patch('/stars-payments/:id', requireAdminPermission('monetization.manage'), (req, res) => {
+  const payment = db.prepare('SELECT * FROM telegram_stars_payments WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!payment) return res.status(404).json({ error: 'Stars payment record not found.' });
+  if (String(payment.status) !== 'pending') {
+    return res.status(409).json({ error: 'Only pending Stars invoices can be expired or cancelled.' });
+  }
+  const nextStatus = String(req.body?.status || 'expired');
+  if (!['expired', 'cancelled'].includes(nextStatus)) {
+    return res.status(400).json({ error: 'Pending Stars invoices may only be marked expired or cancelled.' });
+  }
+
+  db.prepare("UPDATE telegram_stars_payments SET status = ?, updated_at = datetime('now') WHERE id = ?").run(
+    nextStatus,
+    req.params.id
+  );
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'stars_payment.updated',
+    'telegram_stars_payment',
+    req.params.id,
+    { status: nextStatus, starsAmount: payment.stars_amount },
+    req.ip || '',
+    true
+  );
+  res.json({ updated: true, status: nextStatus });
 });
 
 adminRouter.patch('/plans/:id', requireAdminPermission('monetization.manage'), (req, res) => {
@@ -1099,8 +1368,15 @@ adminRouter.patch('/promotions/:id', requireAdminPermission('monetization.manage
   if (!promo) return res.status(404).json({ error: 'Promotion not found.' });
 
   db.transaction(() => {
-    db.prepare('UPDATE promotions SET status = ? WHERE id = ?').run(status, promo.id);
     if (status === 'active') {
+      const durationDays = Math.max(1, Math.min(365, Number(promo.duration_days || 7) || 7));
+      db.prepare(
+        `UPDATE promotions
+         SET status = 'active',
+             starts_at = COALESCE(starts_at, datetime('now')),
+             ends_at = COALESCE(ends_at, datetime('now', '+' || ? || ' days'))
+         WHERE id = ?`
+      ).run(durationDays, promo.id);
       db.prepare("UPDATE promotion_transactions SET status = 'recorded' WHERE promotion_id = ?").run(promo.id);
       if (promo.product_id) {
         if (promo.promo_type === 'sponsored_placement') {
@@ -1109,11 +1385,73 @@ adminRouter.patch('/promotions/:id', requireAdminPermission('monetization.manage
           db.prepare('UPDATE products SET is_featured = 1 WHERE id = ?').run(promo.product_id);
         }
       }
+    } else {
+      db.prepare('UPDATE promotions SET status = ? WHERE id = ?').run(status, promo.id);
+      if (promo.product_id && ['paused', 'completed', 'rejected'].includes(status)) {
+        const col = promo.promo_type === 'sponsored_placement' ? 'is_sponsored' : 'is_featured';
+        const otherActive = db
+          .prepare(
+            "SELECT id FROM promotions WHERE product_id = ? AND promo_type = ? AND status = 'active' AND id != ? LIMIT 1"
+          )
+          .get(promo.product_id, promo.promo_type, promo.id);
+        if (!otherActive) {
+          db.prepare(`UPDATE products SET ${col} = 0 WHERE id = ?`).run(promo.product_id);
+        }
+      }
     }
   })();
 
   recordAdminAudit(req.adminSession!.adminIdentifier, 'promotion.updated', 'promotion', req.params.id, { status }, req.ip || '');
   res.json({ updated: true });
+});
+
+adminRouter.delete('/promotions/:id', requireAdminPermission('monetization.manage'), (req, res) => {
+  const promoId = req.params.id;
+  const promo = db.prepare('SELECT * FROM promotions WHERE id = ?').get(promoId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!promo) return res.status(404).json({ error: 'Promotion not found.' });
+  if (String(promo.status) === 'active') {
+    return res.status(409).json({ error: 'Pause or complete an active promotion before deleting it.' });
+  }
+  const paidStars = db
+    .prepare(
+      "SELECT id FROM telegram_stars_payments WHERE target_type = 'promotion' AND target_id = ? AND status = 'paid' LIMIT 1"
+    )
+    .get(promoId);
+  if (paidStars) {
+    return res
+      .status(409)
+      .json({ error: 'Paid Telegram Stars promotions cannot be permanently deleted; mark them completed or rejected instead.' });
+  }
+
+  db.transaction(() => {
+    db.prepare(
+      "UPDATE telegram_stars_payments SET status = 'cancelled', updated_at = datetime('now') WHERE target_type = 'promotion' AND target_id = ? AND status = 'pending'"
+    ).run(promoId);
+    db.prepare('DELETE FROM promotion_transactions WHERE promotion_id = ?').run(promoId);
+    db.prepare('DELETE FROM promotions WHERE id = ?').run(promoId);
+    if (promo.product_id) {
+      const col = promo.promo_type === 'sponsored_placement' ? 'is_sponsored' : 'is_featured';
+      const otherActive = db
+        .prepare("SELECT id FROM promotions WHERE product_id = ? AND promo_type = ? AND status = 'active' LIMIT 1")
+        .get(promo.product_id, promo.promo_type);
+      if (!otherActive) {
+        db.prepare(`UPDATE products SET ${col} = 0 WHERE id = ?`).run(promo.product_id);
+      }
+    }
+  })();
+
+  recordAdminAudit(
+    req.adminSession!.adminIdentifier,
+    'promotion.deleted',
+    'promotion',
+    promoId,
+    { title: promo.title, previousStatus: promo.status },
+    req.ip || '',
+    true
+  );
+  res.json({ deleted: true, id: promoId });
 });
 
 // ============================================================================
@@ -1931,3 +2269,23 @@ adminRouter.delete('/audit-logs/:id', requireAdminPermission('audit.manage'), (r
   );
   res.json({ deleted: true, deletedCount: 1, id: logId });
 });
+
+adminRouter.get('/telegram/diagnostics', requireAdminPermission('settings.manage'), asyncHandler(async (req, res) => {
+  const origin = `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+  const diagnostics = await getTelegramBotLaunchDiagnosticsLocal(origin);
+  res.json(diagnostics);
+}));
+
+adminRouter.post('/telegram/configure-launch', requireAdminPermission('settings.manage'), asyncHandler(async (req, res) => {
+  const origin = `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+  const targetUrl =
+    (typeof req.body?.miniAppUrl === 'string' && req.body.miniAppUrl.trim().startsWith('https://')
+      ? req.body.miniAppUrl.trim()
+      : '') || resolveSafeMiniAppUrlLocal(origin);
+  const result = await ensureTelegramMenuButtonLocal(targetUrl);
+  if (!result.ok) {
+    return res.status(502).json({ error: result.error || 'Failed to update Telegram chat Menu Button.' });
+  }
+  const diagnostics = await getTelegramBotLaunchDiagnosticsLocal(origin);
+  res.json({ configured: true, targetUrl, diagnostics });
+}));

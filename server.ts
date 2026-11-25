@@ -82,6 +82,22 @@ async function startServer() {
     res.status(404).json({ error: 'API endpoint not found.' });
   });
 
+  // JSON error middleware for async/sync API errors
+  app.use('/api', (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const msg = err instanceof Error ? err.message : 'Internal server error.';
+    console.error('SOFUMER Express API error:', msg);
+    if (res.headersSent) return;
+    if (/FOREIGN KEY constraint failed/i.test(msg)) {
+      res.status(409).json({ error: 'Operation blocked by related database records.' });
+      return;
+    }
+    if (/UNIQUE constraint failed/i.test(msg)) {
+      res.status(409).json({ error: 'Duplicate record conflict.' });
+      return;
+    }
+    res.status(500).json({ error: 'Internal server error.' });
+  });
+
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
     const vite = await createViteServer({

@@ -249,6 +249,8 @@ export function AdminPage() {
 
   const [users, setUsers] = useState<Array<Record<string, unknown>>>([]);
   const [userFilter, setUserFilter] = useState('');
+  const [userDailyDrafts, setUserDailyDrafts] = useState<Record<string, string>>({});
+  const [userReasonDrafts, setUserReasonDrafts] = useState<Record<string, string>>({});
 
   const [sellers, setSellers] = useState<Array<Record<string, unknown>>>([]);
   const [sellerStatusFilter, setSellerStatusFilter] = useState('all');
@@ -256,6 +258,7 @@ export function AdminPage() {
   const [shopsList, setShopsList] = useState<Array<Record<string, unknown>>>([]);
   const [shopStatusFilter, setShopStatusFilter] = useState('all');
   const [shopSearch, setShopSearch] = useState('');
+  const [editingShop, setEditingShop] = useState<{ id: string; name: string; description: string } | null>(null);
   const [deleteShopTarget, setDeleteShopTarget] = useState<Record<string, unknown> | null>(null);
   const [deleteShopReason, setDeleteShopReason] = useState('');
 
@@ -268,13 +271,23 @@ export function AdminPage() {
   const [categories, setCategories] = useState<Array<Record<string, unknown>>>([]);
   const [subcategories, setSubcategories] = useState<Array<Record<string, unknown>>>([]);
   const [categoryDrafts, setCategoryDrafts] = useState<Record<string, string>>({});
+  const [categoryDescDrafts, setCategoryDescDrafts] = useState<Record<string, string>>({});
+  const [subcatDrafts, setSubcatDrafts] = useState<Record<string, string>>({});
 
   const [orders, setOrders] = useState<Array<Record<string, unknown>>>([]);
   const [orderStatusFilter, setOrderStatusFilter] = useState('all');
+  const [inspectedOrder, setInspectedOrder] = useState<{
+    order: Record<string, unknown>;
+    items: Array<Record<string, unknown>>;
+    history: Array<Record<string, unknown>>;
+  } | null>(null);
+  const [orderNextStatus, setOrderNextStatus] = useState('Confirmed');
+  const [orderStatusNote, setOrderStatusNote] = useState('');
 
   const [reports, setReports] = useState<Array<Record<string, unknown>>>([]);
   const [reportNotes, setReportNotes] = useState<Record<string, string>>({});
   const [flaggedConvs, setFlaggedConvs] = useState<Array<Record<string, unknown>>>([]);
+  const [inspectedConv, setInspectedConv] = useState<Record<string, unknown> | null>(null);
   const [inspectedMsgs, setInspectedMsgs] = useState<Array<Record<string, unknown>>>([]);
 
   const [reviews, setReviews] = useState<Array<Record<string, unknown>>>([]);
@@ -285,6 +298,7 @@ export function AdminPage() {
     promotions: Array<Record<string, unknown>>;
     promotionTransactions: Array<Record<string, unknown>>;
     starsPayments?: Array<Record<string, unknown>>;
+    revenueSummary?: Record<string, number>;
   } | null>(null);
   const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
   const [promoStatusFilter, setPromoStatusFilter] = useState('all');
@@ -324,6 +338,9 @@ export function AdminPage() {
   } | null>(null);
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [savingSettings, setSavingSettings] = useState(false);
+  const [telegramDiagnostics, setTelegramDiagnostics] = useState<Record<string, unknown> | null>(null);
+  const [loadingDiag, setLoadingDiag] = useState(false);
+  const [configuringTelegram, setConfiguringTelegram] = useState(false);
 
   // RBAC tab state
   const [rbacData, setRbacData] = useState<{
@@ -335,6 +352,7 @@ export function AdminPage() {
   } | null>(null);
   const [selectedRoleId, setSelectedRoleId] = useState('');
   const [rolePermDraft, setRolePermDraft] = useState<string[]>([]);
+  const [roleEditDraft, setRoleEditDraft] = useState<{ name: string; description: string }>({ name: '', description: '' });
   const [newRoleCode, setNewRoleCode] = useState('');
   const [newRoleName, setNewRoleName] = useState('');
   const [newRoleDesc, setNewRoleDesc] = useState('');
@@ -360,6 +378,11 @@ export function AdminPage() {
     | { kind: 'delete_review'; review: Record<string, unknown> }
     | { kind: 'delete_ticket'; ticket: Record<string, unknown> }
     | { kind: 'delete_notification'; notif: Record<string, unknown> }
+    | { kind: 'delete_promotion'; promo: Record<string, unknown> }
+    | { kind: 'cancel_subscription'; sub: Record<string, unknown>; status: 'cancelled' | 'expired' }
+    | { kind: 'expire_stars_payment'; payment: Record<string, unknown> }
+    | { kind: 'delete_role'; role: Record<string, unknown> }
+    | { kind: 'revoke_role_assignment'; assignment: Record<string, unknown> }
     | { kind: 'archive_audit_selected'; ids: string[] }
     | { kind: 'archive_audit_older'; days: number }
     | { kind: 'delete_audit_single'; log: Record<string, unknown> }
@@ -369,6 +392,19 @@ export function AdminPage() {
   >(null);
   const [confirmReason, setConfirmReason] = useState('');
   const [actionBusy, setActionBusy] = useState(false);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const runBusyAction = useCallback(async (key: string, fn: () => Promise<void>) => {
+    setBusyKey((curr) => {
+      if (curr === key) return curr;
+      return key;
+    });
+    try {
+      await fn();
+    } finally {
+      setBusyKey((curr) => (curr === key ? null : curr));
+    }
+  }, []);
 
   // Category creation forms
   const [newCatName, setNewCatName] = useState('');
@@ -439,6 +475,12 @@ export function AdminPage() {
         if (activeTab === 'users') {
           const res = await apiFetch<{ users: Array<Record<string, unknown>> }>('/api/admin/users', { isAdmin: true });
           setUsers(res.users);
+          const nextLimits: Record<string, string> = {};
+          res.users.forEach((u) => {
+            nextLimits[String(u.id)] =
+              u.custom_daily_limit !== null && u.custom_daily_limit !== undefined ? String(u.custom_daily_limit) : '';
+          });
+          setUserDailyDrafts(nextLimits);
         }
         if (activeTab === 'sellers') {
           const res = await apiFetch<{ sellers: Array<Record<string, unknown>> }>('/api/admin/sellers', { isAdmin: true });
@@ -465,11 +507,21 @@ export function AdminPage() {
           setCategories(res.categories);
           setSubcategories(res.subcategories);
           const nextCatDrafts: Record<string, string> = {};
+          const nextCatDescs: Record<string, string> = {};
           res.categories.forEach((c) => {
             nextCatDrafts[String(c.id)] = String(c.name || '');
+            nextCatDescs[String(c.id)] = String(c.description || '');
+          });
+          const nextSubDrafts: Record<string, string> = {};
+          res.subcategories.forEach((s) => {
+            nextSubDrafts[String(s.id)] = String(s.name || '');
           });
           setCategoryDrafts(nextCatDrafts);
-          if (!newSubParent && res.categories[0]) setNewSubParent(String(res.categories[0].id));
+          setCategoryDescDrafts(nextCatDescs);
+          setSubcatDrafts(nextSubDrafts);
+          if ((!newSubParent || !res.categories.some((c) => String(c.id) === newSubParent)) && res.categories[0]) {
+            setNewSubParent(String(res.categories[0].id));
+          }
         }
         if (activeTab === 'orders') {
           const res = await apiFetch<{ orders: Array<Record<string, unknown>> }>('/api/admin/orders', { isAdmin: true });
@@ -554,8 +606,14 @@ export function AdminPage() {
           setBroadcastHistory(res.notifications || []);
         }
         if (activeTab === 'settings') {
-          const res = await apiFetch<NonNullable<typeof settingsData>>('/api/admin/settings', { isAdmin: true });
+          const [res, diag] = await Promise.all([
+            apiFetch<NonNullable<typeof settingsData>>('/api/admin/settings', { isAdmin: true }),
+            hasPerm('settings.manage')
+              ? apiFetch<Record<string, unknown>>('/api/admin/telegram/diagnostics', { isAdmin: true }).catch(() => null)
+              : Promise.resolve(null),
+          ]);
           setSettingsData(res);
+          if (diag) setTelegramDiagnostics(diag);
           const nextDrafts: Record<string, string> = {};
           res.settings.forEach((st) => {
             nextDrafts[String(st.key)] = String(st.value ?? '');
@@ -575,6 +633,13 @@ export function AdminPage() {
               .filter((p) => String(p.role_id) === targetId)
               .map((p) => String(p.permission_key))
           );
+          const targetRoleObj = res.roles.find((r) => String(r.id) === targetId);
+          if (targetRoleObj) {
+            setRoleEditDraft({
+              name: String(targetRoleObj.name || ''),
+              description: String(targetRoleObj.description || ''),
+            });
+          }
         }
         if (activeTab === 'audit') {
           const params = new URLSearchParams({ scope: auditScope });
@@ -606,7 +671,7 @@ export function AdminPage() {
     }
   }, [adminSession, tab, hasPerm, loadTabData]);
 
-  // Keep selected role permission checkboxes synced when selecting a different role
+  // Keep selected role permission checkboxes and name/description synced when selecting a different role
   const handleSelectRole = (roleId: string) => {
     setSelectedRoleId(roleId);
     if (rbacData) {
@@ -615,6 +680,13 @@ export function AdminPage() {
           .filter((p) => String(p.role_id) === roleId)
           .map((p) => String(p.permission_key))
       );
+      const roleObj = rbacData.roles.find((r) => String(r.id) === roleId);
+      if (roleObj) {
+        setRoleEditDraft({
+          name: String(roleObj.name || ''),
+          description: String(roleObj.description || ''),
+        });
+      }
     }
   };
 
@@ -727,6 +799,11 @@ export function AdminPage() {
 
         <section className="lg:col-span-9 space-y-4">
           {/* OVERVIEW TAB */}
+          {tab === 'overview' && !overview && (
+            <div className="p-6 rounded-2xl bg-[#0E1525] border border-slate-800 text-xs text-slate-400">
+              Loading marketplace overview metrics...
+            </div>
+          )}
           {tab === 'overview' && overview && (
             <div className="space-y-4">
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -785,6 +862,11 @@ export function AdminPage() {
           )}
 
           {/* ANALYTICS TAB (Distinct deep database breakdowns) */}
+          {tab === 'analytics' && !analytics && (
+            <div className="p-6 rounded-2xl bg-[#0E1525] border border-slate-800 text-xs text-slate-400">
+              Loading deep analytics breakdowns...
+            </div>
+          )}
           {tab === 'analytics' && analytics && (
             <div className="space-y-4">
               {analytics.engagementTotals && (
@@ -922,62 +1004,152 @@ export function AdminPage() {
                       String(u.telegram_username || '').toLowerCase().includes(q)
                     );
                   })
-                  .map((u) => (
-                    <div key={String(u.id)} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
-                      <div>
-                        <div className="font-semibold text-white">
-                          {String(u.display_name)}{' '}
-                          {u.telegram_username ? (
-                            <span className="text-slate-400 font-normal">@{String(u.telegram_username)}</span>
-                          ) : null}
+                  .map((u) => {
+                    const uid = String(u.id);
+                    return (
+                      <div key={uid} className="p-4 space-y-2 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div className="font-semibold text-white">
+                              {String(u.display_name)}{' '}
+                              {u.telegram_username ? (
+                                <span className="text-slate-400 font-normal">@{String(u.telegram_username)}</span>
+                              ) : null}
+                            </div>
+                            <div className="text-slate-400 font-mono-nums">
+                              TG: {String(u.telegram_id)} · Roles: {String(u.roles || 'buyer')} · Status: {String(u.status)} · AI: {u.ai_enabled ? 'Enabled' : 'Disabled'}
+                              {u.custom_daily_limit !== null && u.custom_daily_limit !== undefined
+                                ? ` (${String(u.custom_daily_limit)}/day)`
+                                : ''}
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              type="number"
+                              min={0}
+                              max={10000}
+                              placeholder="AI/day"
+                              value={userDailyDrafts[uid] ?? ''}
+                              onChange={(e) => setUserDailyDrafts((prev) => ({ ...prev, [uid]: e.target.value }))}
+                              className="w-20 h-8 px-2 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white font-mono-nums"
+                            />
+                            <button
+                              type="button"
+                              disabled={busyKey === `user-limit-${uid}`}
+                              onClick={() =>
+                                runBusyAction(`user-limit-${uid}`, async () => {
+                                  try {
+                                    const raw = (userDailyDrafts[uid] ?? '').trim();
+                                    const customDailyLimit = raw === '' ? null : Math.max(0, Math.floor(Number(raw)));
+                                    await apiFetch(`/api/admin/users/${uid}/ai-access`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({
+                                        aiEnabled: Boolean(u.ai_enabled),
+                                        customDailyLimit,
+                                        reason: userReasonDrafts[uid] || '',
+                                      }),
+                                    });
+                                    await loadTabData('users');
+                                    notify('User AI quota saved', 'success');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-2.5 rounded-lg bg-[#131C31] border border-slate-700 text-slate-200 disabled:opacity-50"
+                            >
+                              Save Limit
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busyKey === `user-ai-${uid}`}
+                              onClick={() =>
+                                runBusyAction(`user-ai-${uid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/users/${uid}/ai-access`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ aiEnabled: !u.ai_enabled }),
+                                    });
+                                    await loadTabData('users');
+                                    notify(`AI access ${u.ai_enabled ? 'disabled' : 'enabled'}`, 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className={`h-8 px-3 rounded-lg border disabled:opacity-50 ${
+                                u.ai_enabled ? 'border-purple-700 text-purple-200' : 'border-red-700 text-red-200'
+                              }`}
+                            >
+                              {u.ai_enabled ? 'Disable AI' : 'Enable AI'}
+                            </button>
+                            {u.status === 'active' && (
+                              <button
+                                type="button"
+                                disabled={busyKey === `user-restrict-${uid}`}
+                                onClick={() =>
+                                  runBusyAction(`user-restrict-${uid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/users/${uid}/status`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          status: 'restricted',
+                                          reason: userReasonDrafts[uid] || '',
+                                        }),
+                                      });
+                                      await loadTabData('users');
+                                      notify('User restricted', 'info');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200 disabled:opacity-50"
+                              >
+                                Restrict
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={busyKey === `user-status-${uid}`}
+                              onClick={() =>
+                                runBusyAction(`user-status-${uid}`, async () => {
+                                  try {
+                                    const nextStatus = u.status === 'active' ? 'suspended' : 'active';
+                                    await apiFetch(`/api/admin/users/${uid}/status`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({
+                                        status: nextStatus,
+                                        reason: userReasonDrafts[uid] || '',
+                                      }),
+                                    });
+                                    await loadTabData('users');
+                                    notify(`User ${nextStatus === 'active' ? 'restored' : 'suspended'}`, 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
+                            >
+                              {u.status === 'active' ? 'Suspend' : 'Restore'}
+                            </button>
+                          </div>
                         </div>
-                        <div className="text-slate-400 font-mono-nums">
-                          TG: {String(u.telegram_id)} · Roles: {String(u.roles || 'buyer')} · Status: {String(u.status)} · AI: {u.ai_enabled ? 'Enabled' : 'Disabled'}
-                        </div>
+                        <input
+                          type="text"
+                          value={userReasonDrafts[uid] ?? ''}
+                          onChange={(e) => setUserReasonDrafts((prev) => ({ ...prev, [uid]: e.target.value }))}
+                          placeholder="Optional note / reason sent with user status or AI restriction..."
+                          className="w-full h-8 px-3 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-300"
+                        />
                       </div>
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              await apiFetch(`/api/admin/users/${u.id}/ai-access`, {
-                                method: 'PATCH',
-                                isAdmin: true,
-                                body: JSON.stringify({ aiEnabled: !u.ai_enabled }),
-                              });
-                              await loadTabData('users');
-                            } catch (err) {
-                              notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                            }
-                          }}
-                          className={`h-8 px-3 rounded-lg border ${
-                            u.ai_enabled ? 'border-purple-700 text-purple-200' : 'border-red-700 text-red-200'
-                          }`}
-                        >
-                          {u.ai_enabled ? 'Disable AI' : 'Enable AI'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              const nextStatus = u.status === 'active' ? 'suspended' : 'active';
-                              await apiFetch(`/api/admin/users/${u.id}/status`, {
-                                method: 'PATCH',
-                                isAdmin: true,
-                                body: JSON.stringify({ status: nextStatus }),
-                              });
-                              await loadTabData('users');
-                            } catch (err) {
-                              notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                            }
-                          }}
-                          className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
-                        >
-                          {u.status === 'active' ? 'Suspend' : 'Restore'}
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 {users.length === 0 && (
                   <div className="p-6 text-xs text-slate-400">No marketplace users registered yet.</div>
                 )}
@@ -1009,88 +1181,128 @@ export function AdminPage() {
                   .filter((s) =>
                     sellerStatusFilter === 'all' ? true : String(s.shop_verification_status || s.verification_status || 'unverified') === sellerStatusFilter
                   )
-                  .map((s) => (
-                    <div key={String(s.id)} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
-                      <div>
-                        <div className="font-semibold text-white">
-                          {s.shop_name ? String(s.shop_name) : `${String(s.legal_name || s.display_name)} (No active shop)`} ({String(s.seller_type)})
-                          {s.is_featured ? (
-                            <span className="ml-2 px-1.5 py-0.5 rounded bg-purple-900/50 text-purple-200 text-[10px]">
-                              Featured
-                            </span>
-                          ) : null}
+                  .map((s) => {
+                    const sid = String(s.id);
+                    const verStatus = String(s.shop_verification_status || s.verification_status || 'unverified');
+                    return (
+                      <div key={sid} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+                        <div>
+                          <div className="font-semibold text-white">
+                            {s.shop_name ? String(s.shop_name) : `${String(s.legal_name || s.display_name)} (No active shop)`} ({String(s.seller_type)})
+                            {s.is_featured ? (
+                              <span className="ml-2 px-1.5 py-0.5 rounded bg-purple-900/50 text-purple-200 text-[10px]">
+                                Featured
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="text-slate-400">
+                            Owner: {String(s.display_name)} · Account: {String(s.status)} · Verification: {verStatus}
+                            {s.shop_slug ? ` · Slug: ${String(s.shop_slug)}` : ''}
+                          </div>
                         </div>
-                        <div className="text-slate-400">
-                          Owner: {String(s.display_name)} · Account: {String(s.status)} · Verification:{' '}
-                          {String(s.shop_verification_status || s.verification_status)}
-                          {s.shop_slug ? ` · Slug: ${String(s.shop_slug)}` : ''}
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        {hasPerm(['sellers.manage', 'shops.manage']) && Boolean(s.shop_id) && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={async () => {
+                        <div className="flex flex-wrap gap-2">
+                          {hasPerm(['sellers.manage', 'shops.manage']) && Boolean(s.shop_id) && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busyKey === `seller-verify-${sid}`}
+                                onClick={() =>
+                                  runBusyAction(`seller-verify-${sid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/sellers/${sid}/status`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          verificationStatus: verStatus === 'verified' ? 'unverified' : 'verified',
+                                        }),
+                                      });
+                                      await loadTabData('sellers');
+                                      await refreshBootstrap();
+                                      notify('Seller verification updated', 'success');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-blue-600 text-white disabled:opacity-50"
+                              >
+                                {verStatus === 'verified' ? 'Revoke Verification' : 'Verify Shop'}
+                              </button>
+                              {verStatus !== 'rejected' && (
+                                <button
+                                  type="button"
+                                  disabled={busyKey === `seller-reject-${sid}`}
+                                  onClick={() =>
+                                    runBusyAction(`seller-reject-${sid}`, async () => {
+                                      try {
+                                        await apiFetch(`/api/admin/sellers/${sid}/status`, {
+                                          method: 'PATCH',
+                                          isAdmin: true,
+                                          body: JSON.stringify({ verificationStatus: 'rejected' }),
+                                        });
+                                        await loadTabData('sellers');
+                                        notify('Seller verification rejected', 'info');
+                                      } catch (err) {
+                                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                      }
+                                    })
+                                  }
+                                  className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/60 text-amber-200 disabled:opacity-50"
+                                >
+                                  Reject Verification
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                disabled={busyKey === `seller-feat-${sid}`}
+                                onClick={() =>
+                                  runBusyAction(`seller-feat-${sid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/sellers/${sid}/status`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ isFeatured: !s.is_featured }),
+                                      });
+                                      await loadTabData('sellers');
+                                      await refreshBootstrap();
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
+                              >
+                                {s.is_featured ? 'Unfeature' : 'Feature Shop'}
+                              </button>
+                            </>
+                          )}
+                          <button
+                            type="button"
+                            disabled={busyKey === `seller-status-${sid}`}
+                            onClick={() =>
+                              runBusyAction(`seller-status-${sid}`, async () => {
                                 try {
-                                  await apiFetch(`/api/admin/sellers/${s.id}/status`, {
+                                  await apiFetch(`/api/admin/sellers/${sid}/status`, {
                                     method: 'PATCH',
                                     isAdmin: true,
-                                    body: JSON.stringify({
-                                      verificationStatus:
-                                        s.shop_verification_status === 'verified' ? 'unverified' : 'verified',
-                                    }),
+                                    body: JSON.stringify({ status: s.status === 'active' ? 'suspended' : 'active' }),
                                   });
                                   await loadTabData('sellers');
+                                  await refreshBootstrap();
+                                  notify(`Seller ${s.status === 'active' ? 'suspended' : 'restored'}`, 'info');
                                 } catch (err) {
                                   notify(err instanceof Error ? err.message : 'Action failed', 'error');
                                 }
-                              }}
-                              className="h-8 px-3 rounded-lg bg-blue-600 text-white"
-                            >
-                              {s.shop_verification_status === 'verified' ? 'Revoke Verification' : 'Verify Shop'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/sellers/${s.id}/status`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({ isFeatured: !s.is_featured }),
-                                  });
-                                  await loadTabData('sellers');
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                }
-                              }}
-                              className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
-                            >
-                              {s.is_featured ? 'Unfeature' : 'Feature Shop'}
-                            </button>
-                          </>
-                        )}
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              await apiFetch(`/api/admin/sellers/${s.id}/status`, {
-                                method: 'PATCH',
-                                isAdmin: true,
-                                body: JSON.stringify({ status: s.status === 'active' ? 'suspended' : 'active' }),
-                              });
-                              await loadTabData('sellers');
-                            } catch (err) {
-                              notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                              })
                             }
-                          }}
-                          className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/50 text-red-200"
-                        >
-                          {s.status === 'active' ? 'Suspend' : 'Restore'}
-                        </button>
+                            className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/50 text-red-200 disabled:opacity-50"
+                          >
+                            {s.status === 'active' ? 'Suspend' : 'Restore'}
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
               )}
             </div>
           )}
@@ -1176,41 +1388,90 @@ export function AdminPage() {
                               <>
                                 <button
                                   type="button"
-                                  onClick={async () => {
-                                    try {
-                                      await apiFetch(`/api/admin/shops/${sid}`, {
-                                        method: 'PATCH',
-                                        isAdmin: true,
-                                        body: JSON.stringify({
-                                          verificationStatus:
-                                            sh.verification_status === 'verified' ? 'unverified' : 'verified',
-                                        }),
-                                      });
-                                      await loadTabData('shops');
-                                      notify('Shop verification updated', 'success');
-                                    } catch (err) {
-                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                    }
-                                  }}
-                                  className="h-8 px-3 rounded-lg bg-blue-600 text-white"
+                                  disabled={busyKey === `shop-verify-${sid}`}
+                                  onClick={() =>
+                                    runBusyAction(`shop-verify-${sid}`, async () => {
+                                      try {
+                                        await apiFetch(`/api/admin/shops/${sid}`, {
+                                          method: 'PATCH',
+                                          isAdmin: true,
+                                          body: JSON.stringify({
+                                            verificationStatus:
+                                              sh.verification_status === 'verified' ? 'unverified' : 'verified',
+                                          }),
+                                        });
+                                        await loadTabData('shops');
+                                        await refreshBootstrap();
+                                        notify('Shop verification updated', 'success');
+                                      } catch (err) {
+                                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                      }
+                                    })
+                                  }
+                                  className="h-8 px-3 rounded-lg bg-blue-600 text-white disabled:opacity-50"
                                 >
                                   {sh.verification_status === 'verified' ? 'Revoke Verification' : 'Verify Shop'}
                                 </button>
+                                {sh.verification_status !== 'rejected' && (
+                                  <button
+                                    type="button"
+                                    disabled={busyKey === `shop-reject-${sid}`}
+                                    onClick={() =>
+                                      runBusyAction(`shop-reject-${sid}`, async () => {
+                                        try {
+                                          await apiFetch(`/api/admin/shops/${sid}`, {
+                                            method: 'PATCH',
+                                            isAdmin: true,
+                                            body: JSON.stringify({ verificationStatus: 'rejected' }),
+                                          });
+                                          await loadTabData('shops');
+                                          notify('Shop verification rejected', 'info');
+                                        } catch (err) {
+                                          notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                        }
+                                      })
+                                    }
+                                    className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/60 text-amber-200 disabled:opacity-50"
+                                  >
+                                    Reject Verification
+                                  </button>
+                                )}
                                 <button
                                   type="button"
-                                  onClick={async () => {
-                                    try {
-                                      await apiFetch(`/api/admin/shops/${sid}`, {
-                                        method: 'PATCH',
-                                        isAdmin: true,
-                                        body: JSON.stringify({ isFeatured: !sh.is_featured }),
-                                      });
-                                      await loadTabData('shops');
-                                    } catch (err) {
-                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                    }
-                                  }}
+                                  onClick={() =>
+                                    setEditingShop(
+                                      editingShop?.id === sid
+                                        ? null
+                                        : {
+                                            id: sid,
+                                            name: String(sh.name || ''),
+                                            description: String(sh.description || ''),
+                                          }
+                                    )
+                                  }
                                   className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                                >
+                                  {editingShop?.id === sid ? 'Close Edit' : 'Edit'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={busyKey === `shop-feat-${sid}`}
+                                  onClick={() =>
+                                    runBusyAction(`shop-feat-${sid}`, async () => {
+                                      try {
+                                        await apiFetch(`/api/admin/shops/${sid}`, {
+                                          method: 'PATCH',
+                                          isAdmin: true,
+                                          body: JSON.stringify({ isFeatured: !sh.is_featured }),
+                                        });
+                                        await loadTabData('shops');
+                                        await refreshBootstrap();
+                                      } catch (err) {
+                                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                      }
+                                    })
+                                  }
+                                  className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
                                 >
                                   {sh.is_featured ? 'Unfeature' : 'Feature'}
                                 </button>
@@ -1218,20 +1479,24 @@ export function AdminPage() {
                             )}
                             <button
                               type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/shops/${sid}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({ status: shStatus === 'active' ? 'suspended' : 'active' }),
-                                  });
-                                  await loadTabData('shops');
-                                  notify(`Shop ${shStatus === 'active' ? 'suspended' : 'restored'}`, 'info');
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                }
-                              }}
-                              className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/50 text-amber-200"
+                              disabled={busyKey === `shop-status-${sid}`}
+                              onClick={() =>
+                                runBusyAction(`shop-status-${sid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/shops/${sid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ status: shStatus === 'active' ? 'suspended' : 'active' }),
+                                    });
+                                    await loadTabData('shops');
+                                    await refreshBootstrap();
+                                    notify(`Shop ${shStatus === 'active' ? 'suspended' : 'restored'}`, 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/50 text-amber-200 disabled:opacity-50"
                             >
                               {shStatus === 'active' ? 'Suspend' : 'Restore'}
                             </button>
@@ -1251,6 +1516,70 @@ export function AdminPage() {
                           </div>
                         )}
                       </div>
+
+                      {editingShop?.id === sid && !isClosed && (
+                        <form
+                          onSubmit={async (e) => {
+                            e.preventDefault();
+                            await runBusyAction(`shop-save-${sid}`, async () => {
+                              try {
+                                await apiFetch(`/api/admin/shops/${sid}`, {
+                                  method: 'PATCH',
+                                  isAdmin: true,
+                                  body: JSON.stringify({
+                                    name: editingShop.name,
+                                    description: editingShop.description,
+                                  }),
+                                });
+                                setEditingShop(null);
+                                await loadTabData('shops');
+                                await refreshBootstrap();
+                                notify('Shop details updated', 'success');
+                              } catch (err) {
+                                notify(err instanceof Error ? err.message : 'Shop update failed', 'error');
+                              }
+                            });
+                          }}
+                          className="p-3 rounded-xl bg-[#070B14] border border-slate-800 space-y-2"
+                        >
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <input
+                              type="text"
+                              required
+                              minLength={2}
+                              value={editingShop.name}
+                              onChange={(e) => setEditingShop((prev) => (prev ? { ...prev, name: e.target.value } : null))}
+                              placeholder="Shop name"
+                              className="h-9 px-3 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-white"
+                            />
+                            <input
+                              type="text"
+                              value={editingShop.description}
+                              onChange={(e) =>
+                                setEditingShop((prev) => (prev ? { ...prev, description: e.target.value } : null))
+                              }
+                              placeholder="Shop description"
+                              className="h-9 px-3 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-white"
+                            />
+                          </div>
+                          <div className="flex justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setEditingShop(null)}
+                              className="h-8 px-3 rounded-lg bg-[#0E1525] border border-slate-700 text-slate-300"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="submit"
+                              disabled={busyKey === `shop-save-${sid}`}
+                              className="h-8 px-3 rounded-lg bg-blue-600 text-white font-semibold disabled:opacity-50"
+                            >
+                              Save Changes
+                            </button>
+                          </div>
+                        </form>
+                      )}
 
                       {isClosed && (
                         <div className="p-2.5 rounded-lg bg-[#070B14] border border-red-900/40 text-[11px] text-slate-400">
@@ -1299,6 +1628,8 @@ export function AdminPage() {
                             <div className="text-slate-400 font-mono-nums">
                               {String(p.shop_name)} · {String(p.currency)} {String(p.price)} · {String(p.listing_type)} · Status:{' '}
                               <span className="text-slate-200">{String(p.status)}</span>
+                              {p.is_featured ? ' · Featured' : ''}
+                              {p.is_sponsored ? ' · Sponsored' : ''}
                             </div>
                           </div>
                           {hasPerm('moderation.manage') && (
@@ -1327,61 +1658,120 @@ export function AdminPage() {
                               </button>
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch(`/api/admin/products/${pid}/moderate`, {
-                                      method: 'PATCH',
-                                      isAdmin: true,
-                                      body: JSON.stringify({
-                                        status: 'published',
-                                        notes: moderationNotes[pid] || '',
-                                      }),
-                                    });
-                                    await loadTabData('products');
-                                  } catch (err) {
-                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                  }
-                                }}
-                                className="h-8 px-3 rounded-lg bg-emerald-600 text-white"
+                                disabled={busyKey === `prod-mod-${pid}`}
+                                onClick={() =>
+                                  runBusyAction(`prod-mod-${pid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/products/${pid}/moderate`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          status: 'published',
+                                          notes: moderationNotes[pid] || '',
+                                        }),
+                                      });
+                                      await loadTabData('products');
+                                      notify('Listing published', 'success');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-emerald-600 text-white disabled:opacity-50"
                               >
-                                Approve
+                                {p.status === 'published' ? 'Published' : 'Publish'}
                               </button>
+                              {p.status !== 'archived' && (
+                                <button
+                                  type="button"
+                                  disabled={busyKey === `prod-mod-${pid}`}
+                                  onClick={() =>
+                                    runBusyAction(`prod-mod-${pid}`, async () => {
+                                      try {
+                                        await apiFetch(`/api/admin/products/${pid}/moderate`, {
+                                          method: 'PATCH',
+                                          isAdmin: true,
+                                          body: JSON.stringify({
+                                            status: 'archived',
+                                            notes: moderationNotes[pid] || 'Unpublished/archived by moderation',
+                                          }),
+                                        });
+                                        await loadTabData('products');
+                                        notify('Listing archived', 'info');
+                                      } catch (err) {
+                                        notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                      }
+                                    })
+                                  }
+                                  className="h-8 px-3 rounded-lg bg-slate-800 border border-slate-700 text-slate-200 disabled:opacity-50"
+                                >
+                                  Archive
+                                </button>
+                              )}
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch(`/api/admin/products/${pid}/moderate`, {
-                                      method: 'PATCH',
-                                      isAdmin: true,
-                                      body: JSON.stringify({ isFeatured: !p.is_featured }),
-                                    });
-                                    await loadTabData('products');
-                                  } catch (err) {
-                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                  }
-                                }}
-                                className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                                disabled={busyKey === `prod-mod-${pid}`}
+                                onClick={() =>
+                                  runBusyAction(`prod-mod-${pid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/products/${pid}/moderate`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ isFeatured: !p.is_featured }),
+                                      });
+                                      await loadTabData('products');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
                               >
                                 {p.is_featured ? 'Unfeature' : 'Feature'}
                               </button>
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch(`/api/admin/products/${pid}/moderate`, {
-                                      method: 'PATCH',
-                                      isAdmin: true,
-                                      body: JSON.stringify({
-                                        status: 'rejected',
-                                        notes: moderationNotes[pid] || 'Policy violation',
-                                      }),
-                                    });
-                                    await loadTabData('products');
-                                  } catch (err) {
-                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                  }
-                                }}
-                                className="h-8 px-3 rounded-lg bg-amber-700 text-white"
+                                disabled={busyKey === `prod-mod-${pid}`}
+                                onClick={() =>
+                                  runBusyAction(`prod-mod-${pid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/products/${pid}/moderate`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ isSponsored: !p.is_sponsored }),
+                                      });
+                                      await loadTabData('products');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
+                              >
+                                {p.is_sponsored ? 'Unsponsor' : 'Sponsor'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busyKey === `prod-mod-${pid}`}
+                                onClick={() =>
+                                  runBusyAction(`prod-mod-${pid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/products/${pid}/moderate`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          status: 'rejected',
+                                          notes: moderationNotes[pid] || 'Policy violation',
+                                        }),
+                                      });
+                                      await loadTabData('products');
+                                      notify('Listing rejected', 'info');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-amber-700 text-white disabled:opacity-50"
                               >
                                 Reject
                               </button>
@@ -1569,33 +1959,47 @@ export function AdminPage() {
                   const cid = String(c.id);
                   const catSubs = subcategories.filter((s) => s.category_id === c.id);
                   return (
-                    <div key={cid} className="py-3 space-y-2">
+                    <div key={cid} className="py-3 space-y-2.5">
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                        <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[240px]">
                           <input
                             type="text"
                             value={categoryDrafts[cid] ?? String(c.name)}
                             onChange={(e) => setCategoryDrafts((prev) => ({ ...prev, [cid]: e.target.value }))}
+                            placeholder="Category name"
                             className="h-8 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white font-semibold"
+                          />
+                          <input
+                            type="text"
+                            value={categoryDescDrafts[cid] ?? String(c.description || '')}
+                            onChange={(e) => setCategoryDescDrafts((prev) => ({ ...prev, [cid]: e.target.value }))}
+                            placeholder="Description..."
+                            className="h-8 flex-1 min-w-[160px] px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-300"
                           />
                           {hasPerm('catalog.manage') && (
                             <button
                               type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/categories/${cid}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({ name: categoryDrafts[cid] }),
-                                  });
-                                  await loadTabData('categories');
-                                  await refreshBootstrap();
-                                  notify('Category renamed', 'success');
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Rename failed', 'error');
-                                }
-                              }}
-                              className="h-8 px-2.5 rounded-lg bg-[#131C31] border border-slate-700 text-slate-200"
+                              disabled={busyKey === `cat-save-${cid}`}
+                              onClick={() =>
+                                runBusyAction(`cat-save-${cid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/categories/${cid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({
+                                        name: categoryDrafts[cid],
+                                        description: categoryDescDrafts[cid] ?? '',
+                                      }),
+                                    });
+                                    await loadTabData('categories');
+                                    await refreshBootstrap();
+                                    notify('Category saved', 'success');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Save failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-2.5 rounded-lg bg-[#131C31] border border-slate-700 text-slate-200 disabled:opacity-50"
                             >
                               Save
                             </button>
@@ -1605,20 +2009,23 @@ export function AdminPage() {
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/categories/${cid}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({ isActive: !c.is_active }),
-                                  });
-                                  await loadTabData('categories');
-                                  await refreshBootstrap();
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Toggle failed', 'error');
-                                }
-                              }}
-                              className={`h-8 px-3 rounded-lg ${
+                              disabled={busyKey === `cat-toggle-${cid}`}
+                              onClick={() =>
+                                runBusyAction(`cat-toggle-${cid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/categories/${cid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ isActive: !c.is_active }),
+                                    });
+                                    await loadTabData('categories');
+                                    await refreshBootstrap();
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Toggle failed', 'error');
+                                  }
+                                })
+                              }
+                              className={`h-8 px-3 rounded-lg disabled:opacity-50 ${
                                 c.is_active ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'
                               }`}
                             >
@@ -1636,51 +2043,91 @@ export function AdminPage() {
                           </div>
                         )}
                       </div>
-                      <div className="flex flex-wrap gap-1.5 text-[11px]">
+                      <div className="flex flex-wrap gap-2 text-[11px]">
                         {catSubs.length === 0 ? (
                           <span className="text-slate-500">No subcategories</span>
                         ) : (
-                          catSubs.map((s) => (
-                            <div
-                              key={String(s.id)}
-                              className={`inline-flex items-center rounded border overflow-hidden ${
-                                s.is_active
-                                  ? 'bg-[#070B14] border-slate-700 text-slate-200'
-                                  : 'bg-slate-900 border-slate-800 text-slate-500'
-                              }`}
-                            >
-                              <button
-                                type="button"
-                                disabled={!hasPerm('catalog.manage')}
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch(`/api/admin/subcategories/${s.id}`, {
-                                      method: 'PATCH',
-                                      isAdmin: true,
-                                      body: JSON.stringify({ isActive: !s.is_active }),
-                                    });
-                                    await loadTabData('categories');
-                                    await refreshBootstrap();
-                                  } catch (err) {
-                                    notify(err instanceof Error ? err.message : 'Subcategory toggle failed', 'error');
-                                  }
-                                }}
-                                className={`px-2 py-1 ${!s.is_active ? 'line-through' : ''}`}
+                          catSubs.map((s) => {
+                            const subId = String(s.id);
+                            return (
+                              <div
+                                key={subId}
+                                className={`inline-flex items-center rounded border overflow-hidden ${
+                                  s.is_active
+                                    ? 'bg-[#070B14] border-slate-700 text-slate-200'
+                                    : 'bg-slate-900 border-slate-800 text-slate-500'
+                                }`}
                               >
-                                {String(s.name)}
-                              </button>
-                              {hasPerm('catalog.manage') && (
-                                <button
-                                  type="button"
-                                  onClick={() => setConfirmAction({ kind: 'delete_subcategory', sub: s })}
-                                  aria-label={`Delete subcategory ${String(s.name)}`}
-                                  className="px-1.5 py-1 border-l border-slate-800 text-red-400 hover:bg-red-950/70"
-                                >
-                                  ×
-                                </button>
-                              )}
-                            </div>
-                          ))
+                                {hasPerm('catalog.manage') ? (
+                                  <input
+                                    type="text"
+                                    value={subcatDrafts[subId] ?? String(s.name)}
+                                    onChange={(e) => setSubcatDrafts((prev) => ({ ...prev, [subId]: e.target.value }))}
+                                    className="w-28 px-2 py-1 bg-transparent text-slate-200 focus:outline-none"
+                                  />
+                                ) : (
+                                  <span className={`px-2 py-1 ${!s.is_active ? 'line-through' : ''}`}>
+                                    {String(s.name)}
+                                  </span>
+                                )}
+                                {hasPerm('catalog.manage') && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        runBusyAction(`sub-save-${subId}`, async () => {
+                                          try {
+                                            await apiFetch(`/api/admin/subcategories/${subId}`, {
+                                              method: 'PATCH',
+                                              isAdmin: true,
+                                              body: JSON.stringify({ name: subcatDrafts[subId] ?? String(s.name) }),
+                                            });
+                                            await loadTabData('categories');
+                                            await refreshBootstrap();
+                                            notify('Subcategory saved', 'success');
+                                          } catch (err) {
+                                            notify(err instanceof Error ? err.message : 'Rename failed', 'error');
+                                          }
+                                        })
+                                      }
+                                      className="px-1.5 py-1 border-l border-slate-800 text-blue-300 hover:bg-blue-950/60"
+                                    >
+                                      Save
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        runBusyAction(`sub-toggle-${subId}`, async () => {
+                                          try {
+                                            await apiFetch(`/api/admin/subcategories/${subId}`, {
+                                              method: 'PATCH',
+                                              isAdmin: true,
+                                              body: JSON.stringify({ isActive: !s.is_active }),
+                                            });
+                                            await loadTabData('categories');
+                                            await refreshBootstrap();
+                                          } catch (err) {
+                                            notify(err instanceof Error ? err.message : 'Subcategory toggle failed', 'error');
+                                          }
+                                        })
+                                      }
+                                      className="px-1.5 py-1 border-l border-slate-800 text-slate-300 hover:bg-slate-800"
+                                    >
+                                      {s.is_active ? 'On' : 'Off'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmAction({ kind: 'delete_subcategory', sub: s })}
+                                      aria-label={`Delete subcategory ${String(s.name)}`}
+                                      className="px-1.5 py-1 border-l border-slate-800 text-red-400 hover:bg-red-950/70"
+                                    >
+                                      ×
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            );
+                          })
                         )}
                       </div>
                     </div>
@@ -1692,45 +2139,185 @@ export function AdminPage() {
 
           {/* ORDERS TAB */}
           {tab === 'orders' && (
-            <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
-              <div className="p-4 flex flex-wrap items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-white">Direct Transaction Orders</div>
-                <select
-                  value={orderStatusFilter}
-                  onChange={(e) => setOrderStatusFilter(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-200"
-                >
-                  <option value="all">All Order Statuses</option>
-                  <option value="Pending">Pending</option>
-                  <option value="Confirmed">Confirmed</option>
-                  <option value="In Progress">In Progress</option>
-                  <option value="Delivered">Delivered</option>
-                  <option value="Completed">Completed</option>
-                  <option value="Disputed">Disputed</option>
-                  <option value="Cancelled">Cancelled</option>
-                </select>
+            <div className="space-y-4">
+              <div className="bg-[#0E1525] border border-slate-800 rounded-2xl divide-y divide-slate-800/70">
+                <div className="p-4 flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-white">Direct Transaction Orders</div>
+                  <select
+                    value={orderStatusFilter}
+                    onChange={(e) => setOrderStatusFilter(e.target.value)}
+                    className="h-8 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-200"
+                  >
+                    <option value="all">All Order Statuses</option>
+                    <option value="Inquiry">Inquiry</option>
+                    <option value="Pending Confirmation">Pending Confirmation</option>
+                    <option value="Confirmed">Confirmed</option>
+                    <option value="Processing">Processing</option>
+                    <option value="Shipped">Shipped</option>
+                    <option value="Delivered">Delivered</option>
+                    <option value="Completed">Completed</option>
+                    <option value="Cancelled">Cancelled</option>
+                    <option value="Disputed">Disputed</option>
+                  </select>
+                </div>
+                {orders.length === 0 ? (
+                  <div className="p-6 text-xs text-slate-400">No orders recorded yet.</div>
+                ) : (
+                  orders
+                    .filter((o) => (orderStatusFilter === 'all' ? true : String(o.status) === orderStatusFilter))
+                    .map((o) => {
+                      const oid = String(o.id);
+                      return (
+                        <div key={oid} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+                          <div>
+                            <div className="font-semibold text-white font-mono-nums">{String(o.order_number)}</div>
+                            <div className="text-slate-400">
+                              Buyer: {String(o.buyer_name)} · Seller: {String(o.seller_name)} · Shop: {String(o.shop_name)}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="text-right font-mono-nums">
+                              <div className="text-white">
+                                {String(o.currency)} {String(o.agreed_total)}
+                              </div>
+                              <div className="text-blue-400">{String(o.status)}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  const detail = await apiFetch<NonNullable<typeof inspectedOrder>>(
+                                    `/api/admin/orders/${oid}`,
+                                    { isAdmin: true }
+                                  );
+                                  setInspectedOrder(detail);
+                                  setOrderNextStatus(String(detail.order.status || 'Confirmed'));
+                                  setOrderStatusNote('');
+                                } catch (err) {
+                                  notify(err instanceof Error ? err.message : 'Unable to load order details', 'error');
+                                }
+                              }}
+                              className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 hover:border-blue-500"
+                            >
+                              Manage
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })
+                )}
               </div>
-              {orders.length === 0 ? (
-                <div className="p-6 text-xs text-slate-400">No orders recorded yet.</div>
-              ) : (
-                orders
-                  .filter((o) => (orderStatusFilter === 'all' ? true : String(o.status) === orderStatusFilter))
-                  .map((o) => (
-                    <div key={String(o.id)} className="p-4 flex flex-wrap justify-between gap-2 text-xs">
-                      <div>
-                        <div className="font-semibold text-white font-mono-nums">{String(o.order_number)}</div>
-                        <div className="text-slate-400">
-                          Buyer: {String(o.buyer_name)} · Seller: {String(o.seller_name)} · Shop: {String(o.shop_name)}
-                        </div>
+
+              {inspectedOrder && (
+                <div className="p-5 rounded-2xl bg-[#0E1525] border border-blue-800/50 space-y-4 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-semibold text-white font-mono-nums">
+                        Order {String(inspectedOrder.order.order_number)} — {String(inspectedOrder.order.status)}
                       </div>
-                      <div className="text-right font-mono-nums">
-                        <div className="text-white">
-                          {String(o.currency)} {String(o.agreed_total)}
-                        </div>
-                        <div className="text-blue-400">{String(o.status)}</div>
+                      <div className="text-slate-400">
+                        {String(inspectedOrder.order.shop_name)} · Buyer: {String(inspectedOrder.order.buyer_name)} · Seller:{' '}
+                        {String(inspectedOrder.order.seller_name)}
                       </div>
                     </div>
-                  ))
+                    <button
+                      type="button"
+                      onClick={() => setInspectedOrder(null)}
+                      className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-300"
+                    >
+                      Close
+                    </button>
+                  </div>
+
+                  {inspectedOrder.items.length > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="font-semibold text-slate-300">Order Items</div>
+                      {inspectedOrder.items.map((it) => (
+                        <div key={String(it.id)} className="flex justify-between p-2 rounded-lg bg-[#070B14] text-slate-200">
+                          <span>
+                            {String(it.title_snapshot)} × {String(it.quantity)}
+                          </span>
+                          <span className="font-mono-nums">
+                            {String(inspectedOrder.order.currency)} {String(it.line_total)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {inspectedOrder.history.length > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="font-semibold text-slate-300">Status History</div>
+                      {inspectedOrder.history.map((h) => (
+                        <div key={String(h.id)} className="p-2 rounded-lg bg-[#070B14] text-slate-400 flex flex-wrap justify-between gap-2">
+                          <span>
+                            {h.old_status ? <span className="text-slate-500">{String(h.old_status)} → </span> : null}
+                            <strong className="text-slate-200">{String(h.new_status || h.status || '')}</strong> ({String(h.changed_by_role)})
+                            {h.note ? ` — ${String(h.note)}` : ''}
+                          </span>
+                          <span className="font-mono-nums">{new Date(String(h.created_at) + 'Z').toLocaleString()}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const oid = String(inspectedOrder.order.id);
+                      await runBusyAction(`order-upd-${oid}`, async () => {
+                        try {
+                          await apiFetch(`/api/admin/orders/${oid}`, {
+                            method: 'PATCH',
+                            isAdmin: true,
+                            body: JSON.stringify({ status: orderNextStatus, note: orderStatusNote }),
+                          });
+                          const refreshed = await apiFetch<NonNullable<typeof inspectedOrder>>(
+                            `/api/admin/orders/${oid}`,
+                            { isAdmin: true }
+                          );
+                          setInspectedOrder(refreshed);
+                          setOrderStatusNote('');
+                          await loadTabData('orders');
+                          notify(`Order updated to ${orderNextStatus}`, 'success');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Order update failed', 'error');
+                        }
+                      });
+                    }}
+                    className="grid grid-cols-1 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800"
+                  >
+                    <select
+                      value={orderNextStatus}
+                      onChange={(e) => setOrderNextStatus(e.target.value)}
+                      className="h-9 px-2.5 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white"
+                    >
+                      <option value="Inquiry">Inquiry</option>
+                      <option value="Pending Confirmation">Pending Confirmation</option>
+                      <option value="Confirmed">Confirmed</option>
+                      <option value="Processing">Processing</option>
+                      <option value="Shipped">Shipped</option>
+                      <option value="Delivered">Delivered</option>
+                      <option value="Completed">Completed</option>
+                      <option value="Cancelled">Cancelled</option>
+                      <option value="Disputed">Disputed</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={orderStatusNote}
+                      onChange={(e) => setOrderStatusNote(e.target.value)}
+                      placeholder="Administrative note (optional)..."
+                      className="sm:col-span-2 h-9 px-3 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-white"
+                    />
+                    <button
+                      type="submit"
+                      disabled={busyKey === `order-upd-${String(inspectedOrder.order.id)}`}
+                      className="h-9 px-4 rounded-lg bg-blue-600 text-white font-semibold disabled:opacity-50"
+                    >
+                      Update Order
+                    </button>
+                  </form>
+                </div>
               )}
             </div>
           )}
@@ -1745,6 +2332,7 @@ export function AdminPage() {
                 )}
                 {reports.map((r) => {
                   const rid = String(r.id);
+                  const currentNotes = reportNotes[rid] ?? String(r.resolution_notes || '');
                   return (
                     <div key={rid} className="p-4 space-y-2 text-xs">
                       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1754,49 +2342,85 @@ export function AdminPage() {
                           </div>
                           <div className="text-slate-400">
                             Reporter: {String(r.reporter_name)} · Status: {String(r.status)}
+                            {r.details ? ` · ${String(r.details)}` : ''}
                           </div>
                         </div>
                         {hasPerm('reports.manage') && (
-                          <div className="flex gap-2">
+                          <div className="flex flex-wrap gap-2">
+                            {r.status !== 'investigating' && (
+                              <button
+                                type="button"
+                                disabled={busyKey === `rep-${rid}`}
+                                onClick={() =>
+                                  runBusyAction(`rep-${rid}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/reports/${rid}`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({
+                                          status: 'investigating',
+                                          resolutionNotes: currentNotes || 'Investigation started by moderation',
+                                        }),
+                                      });
+                                      await loadTabData('reports');
+                                      notify('Report marked investigating', 'info');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-amber-950/60 border border-amber-800/60 text-amber-200 disabled:opacity-50"
+                              >
+                                Investigate
+                              </button>
+                            )}
                             <button
                               type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/reports/${rid}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({
-                                      status: 'resolved',
-                                      resolutionNotes: reportNotes[rid] || 'Reviewed and resolved by moderation',
-                                    }),
-                                  });
-                                  await loadTabData('reports');
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                }
-                              }}
-                              className="h-8 px-3 rounded-lg bg-blue-600 text-white"
+                              disabled={busyKey === `rep-${rid}`}
+                              onClick={() =>
+                                runBusyAction(`rep-${rid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/reports/${rid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({
+                                        status: 'resolved',
+                                        resolutionNotes: currentNotes || 'Reviewed and resolved by moderation',
+                                      }),
+                                    });
+                                    await loadTabData('reports');
+                                    notify('Report resolved', 'success');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-blue-600 text-white disabled:opacity-50"
                             >
                               Resolve
                             </button>
                             <button
                               type="button"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/reports/${rid}`, {
-                                    method: 'PATCH',
-                                    isAdmin: true,
-                                    body: JSON.stringify({
-                                      status: 'dismissed',
-                                      resolutionNotes: reportNotes[rid] || 'Dismissed after review',
-                                    }),
-                                  });
-                                  await loadTabData('reports');
-                                } catch (err) {
-                                  notify(err instanceof Error ? err.message : 'Action failed', 'error');
-                                }
-                              }}
-                              className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                              disabled={busyKey === `rep-${rid}`}
+                              onClick={() =>
+                                runBusyAction(`rep-${rid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/reports/${rid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({
+                                        status: 'dismissed',
+                                        resolutionNotes: currentNotes || 'Dismissed after review',
+                                      }),
+                                    });
+                                    await loadTabData('reports');
+                                    notify('Report dismissed', 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Action failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200 disabled:opacity-50"
                             >
                               Dismiss
                             </button>
@@ -1806,7 +2430,7 @@ export function AdminPage() {
                       {hasPerm('reports.manage') && (
                         <input
                           type="text"
-                          value={reportNotes[rid] ?? String(r.resolution_notes || '')}
+                          value={currentNotes}
                           onChange={(e) => setReportNotes((prev) => ({ ...prev, [rid]: e.target.value }))}
                           placeholder="Resolution notes..."
                           className="w-full h-8 px-3 rounded-lg bg-[#070B14] border border-slate-800 text-xs text-slate-200"
@@ -1815,39 +2439,147 @@ export function AdminPage() {
                     </div>
                   );
                 })}
-                {flaggedConvs.map((c) => (
-                  <div key={String(c.id)} className="p-4 flex items-center justify-between text-xs">
-                    <div className="text-amber-300">
-                      Flagged Conversation: {String(c.subject)} ({String(c.message_count)} messages)
+                {flaggedConvs.map((c) => {
+                  const cid = String(c.id);
+                  return (
+                    <div key={cid} className="p-4 flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <div className="text-amber-300">
+                        [{String(c.status).toUpperCase()}] {String(c.subject)} ({String(c.message_count)} messages)
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const res = await apiFetch<{
+                                conversation?: Record<string, unknown>;
+                                messages: Array<Record<string, unknown>>;
+                              }>(`/api/admin/conversations/${cid}/messages`, { isAdmin: true });
+                              setInspectedConv(res.conversation || c);
+                              setInspectedMsgs(res.messages);
+                            } catch (err) {
+                              notify(err instanceof Error ? err.message : 'Unable to inspect thread', 'error');
+                            }
+                          }}
+                          className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                        >
+                          Inspect Thread
+                        </button>
+                        {c.status !== 'active' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              runBusyAction(`conv-${cid}`, async () => {
+                                try {
+                                  await apiFetch(`/api/admin/conversations/${cid}`, {
+                                    method: 'PATCH',
+                                    isAdmin: true,
+                                    body: JSON.stringify({ status: 'active' }),
+                                  });
+                                  await loadTabData('reports');
+                                  notify('Conversation restored to active', 'success');
+                                } catch (err) {
+                                  notify(err instanceof Error ? err.message : 'Failed to update conversation', 'error');
+                                }
+                              })
+                            }
+                            className="h-8 px-3 rounded-lg bg-emerald-700 text-white"
+                          >
+                            Restore
+                          </button>
+                        )}
+                        {c.status !== 'closed' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              runBusyAction(`conv-${cid}`, async () => {
+                                try {
+                                  await apiFetch(`/api/admin/conversations/${cid}`, {
+                                    method: 'PATCH',
+                                    isAdmin: true,
+                                    body: JSON.stringify({ status: 'closed' }),
+                                  });
+                                  await loadTabData('reports');
+                                  notify('Conversation closed', 'info');
+                                } catch (err) {
+                                  notify(err instanceof Error ? err.message : 'Failed to close conversation', 'error');
+                                }
+                              })
+                            }
+                            className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200"
+                          >
+                            Close Thread
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {(inspectedConv || inspectedMsgs.length > 0) && (
+                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-2.5 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-semibold text-white">
+                      Conversation Investigation Transcript
+                      {inspectedConv?.subject ? ` — ${String(inspectedConv.subject)} (${String(inspectedConv.status)})` : ''}
                     </div>
                     <button
                       type="button"
-                      onClick={async () => {
-                        try {
-                          const res = await apiFetch<{ messages: Array<Record<string, unknown>> }>(
-                            `/api/admin/conversations/${c.id}/messages`,
-                            { isAdmin: true }
-                          );
-                          setInspectedMsgs(res.messages);
-                        } catch (err) {
-                          notify(err instanceof Error ? err.message : 'Unable to inspect thread', 'error');
-                        }
+                      onClick={() => {
+                        setInspectedConv(null);
+                        setInspectedMsgs([]);
                       }}
-                      className="h-8 px-3 rounded-lg bg-[#070B14] border border-slate-700 text-slate-200"
+                      className="h-7 px-2.5 rounded-lg bg-[#070B14] border border-slate-700 text-slate-300"
                     >
-                      Inspect Thread
+                      Close Transcript
                     </button>
                   </div>
-                ))}
-              </div>
-              {inspectedMsgs.length > 0 && (
-                <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-2 text-xs">
-                  <div className="font-semibold text-white">Conversation Investigation Transcript</div>
-                  {inspectedMsgs.map((m) => (
-                    <div key={String(m.id)} className="p-2 rounded bg-[#070B14] text-slate-300">
-                      <strong>{String(m.sender_name)}:</strong> {String(m.body)}
-                    </div>
-                  ))}
+                  {inspectedMsgs.length === 0 ? (
+                    <div className="text-slate-400">No messages in this conversation yet.</div>
+                  ) : (
+                    inspectedMsgs.map((m) => {
+                      const mid = String(m.id);
+                      const isDeleted = Boolean(m.is_deleted);
+                      return (
+                        <div key={mid} className="p-2.5 rounded-lg bg-[#070B14] flex flex-wrap items-center justify-between gap-2 text-slate-300">
+                          <div>
+                            <strong>{String(m.sender_name)}:</strong>{' '}
+                            <span className={isDeleted ? 'line-through text-slate-500' : ''}>{String(m.body)}</span>
+                            {isDeleted && <span className="ml-2 text-[10px] text-amber-400">[Hidden]</span>}
+                          </div>
+                          {hasPerm('messages.moderate') && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                runBusyAction(`msg-${mid}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/messages/${mid}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ isDeleted: !isDeleted }),
+                                    });
+                                    if (inspectedConv?.id) {
+                                      const res = await apiFetch<{
+                                        conversation?: Record<string, unknown>;
+                                        messages: Array<Record<string, unknown>>;
+                                      }>(`/api/admin/conversations/${String(inspectedConv.id)}/messages`, { isAdmin: true });
+                                      setInspectedMsgs(res.messages);
+                                    }
+                                    notify(isDeleted ? 'Message restored' : 'Message hidden', 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Message moderation failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-7 px-2.5 rounded bg-[#131C31] border border-slate-700 text-slate-200"
+                            >
+                              {isDeleted ? 'Restore Message' : 'Hide Message'}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               )}
             </div>
@@ -2107,7 +2839,7 @@ export function AdminPage() {
                   <div className="text-slate-400">No seller subscriptions recorded yet.</div>
                 ) : (
                   monetization.subscriptions.map((subItem) => (
-                    <div key={String(subItem.id)} className="flex flex-wrap justify-between py-2 border-b border-slate-800/70">
+                    <div key={String(subItem.id)} className="flex flex-wrap items-center justify-between gap-2 py-2.5 border-b border-slate-800/70">
                       <div>
                         <span className="font-semibold text-white">
                           {String(subItem.seller_name)} ({String(subItem.shop_name || 'No shop')})
@@ -2116,9 +2848,41 @@ export function AdminPage() {
                           · {String(subItem.plan_name)} ({String(subItem.plan_code)}) · {String(subItem.billing_cycle)}
                         </span>
                       </div>
-                      <span className="font-mono-nums text-blue-300">
-                        ${String(subItem.amount_recorded)} · {String(subItem.status)}
-                      </span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono-nums text-blue-300">
+                          ${String(subItem.amount_recorded)} · {String(subItem.status)}
+                        </span>
+                        {subItem.status === 'active' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmAction({
+                                  kind: 'cancel_subscription',
+                                  sub: subItem,
+                                  status: 'expired',
+                                })
+                              }
+                              className="h-7 px-2.5 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200"
+                            >
+                              Expire
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmAction({
+                                  kind: 'cancel_subscription',
+                                  sub: subItem,
+                                  status: 'cancelled',
+                                })
+                              }
+                              className="h-7 px-2.5 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
                   ))
                 )}
@@ -2149,78 +2913,128 @@ export function AdminPage() {
               ) : (
                 monetization.promotions
                   .filter((pr) => (promoStatusFilter === 'all' ? true : String(pr.status) === promoStatusFilter))
-                  .map((pr) => (
-                    <div key={String(pr.id)} className="flex flex-wrap items-center justify-between gap-3 py-2.5 border-b border-slate-800/70">
-                      <div>
-                        <span className="font-semibold text-white">{String(pr.title)}</span>
-                        <span className="text-slate-400 ml-2">
-                          ({String(pr.shop_name)} · {String(pr.promo_type)} · ${String(pr.price_amount)} · {String(pr.status)})
-                        </span>
+                  .map((pr) => {
+                    const prId = String(pr.id);
+                    const prStatus = String(pr.status || 'pending');
+                    return (
+                      <div key={prId} className="flex flex-wrap items-center justify-between gap-3 py-2.5 border-b border-slate-800/70">
+                        <div>
+                          <span className="font-semibold text-white">{String(pr.title)}</span>
+                          <span className="text-slate-400 ml-2">
+                            ({String(pr.shop_name)} · {String(pr.promo_type)} · ${String(pr.price_amount)} · {prStatus})
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {prStatus !== 'active' && (
+                            <button
+                              type="button"
+                              disabled={busyKey === `promo-${prId}`}
+                              onClick={() =>
+                                runBusyAction(`promo-${prId}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/promotions/${prId}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ status: 'active' }),
+                                    });
+                                    await loadTabData('promotions');
+                                    notify('Promotion activated', 'success');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-emerald-600 text-white disabled:opacity-50"
+                            >
+                              {prStatus === 'paused' ? 'Resume' : 'Activate'}
+                            </button>
+                          )}
+                          {prStatus === 'active' && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busyKey === `promo-${prId}`}
+                                onClick={() =>
+                                  runBusyAction(`promo-${prId}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/promotions/${prId}`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ status: 'paused' }),
+                                      });
+                                      await loadTabData('promotions');
+                                      notify('Promotion paused', 'info');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-amber-600 text-white disabled:opacity-50"
+                              >
+                                Pause
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busyKey === `promo-${prId}`}
+                                onClick={() =>
+                                  runBusyAction(`promo-${prId}`, async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/promotions/${prId}`, {
+                                        method: 'PATCH',
+                                        isAdmin: true,
+                                        body: JSON.stringify({ status: 'completed' }),
+                                      });
+                                      await loadTabData('promotions');
+                                      notify('Promotion completed', 'info');
+                                    } catch (err) {
+                                      notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
+                                    }
+                                  })
+                                }
+                                className="h-8 px-3 rounded-lg bg-blue-600 text-white disabled:opacity-50"
+                              >
+                                Complete
+                              </button>
+                            </>
+                          )}
+                          {prStatus === 'pending' && (
+                            <button
+                              type="button"
+                              disabled={busyKey === `promo-${prId}`}
+                              onClick={() =>
+                                runBusyAction(`promo-${prId}`, async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/promotions/${prId}`, {
+                                      method: 'PATCH',
+                                      isAdmin: true,
+                                      body: JSON.stringify({ status: 'rejected' }),
+                                    });
+                                    await loadTabData('promotions');
+                                    notify('Promotion rejected', 'info');
+                                  } catch (err) {
+                                    notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
+                                  }
+                                })
+                              }
+                              className="h-8 px-3 rounded-lg bg-red-600 text-white disabled:opacity-50"
+                            >
+                              Reject
+                            </button>
+                          )}
+                          {prStatus !== 'active' && (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmAction({ kind: 'delete_promotion', promo: pr })}
+                              className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/60 text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <div className="flex flex-wrap gap-2">
-                        {pr.status !== 'active' && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/api/admin/promotions/${pr.id}`, {
-                                  method: 'PATCH',
-                                  isAdmin: true,
-                                  body: JSON.stringify({ status: 'active' }),
-                                });
-                                await loadTabData('promotions');
-                              } catch (err) {
-                                notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
-                              }
-                            }}
-                            className="h-8 px-3 rounded-lg bg-emerald-600 text-white"
-                          >
-                            Activate
-                          </button>
-                        )}
-                        {pr.status === 'active' && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/api/admin/promotions/${pr.id}`, {
-                                  method: 'PATCH',
-                                  isAdmin: true,
-                                  body: JSON.stringify({ status: 'paused' }),
-                                });
-                                await loadTabData('promotions');
-                              } catch (err) {
-                                notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
-                              }
-                            }}
-                            className="h-8 px-3 rounded-lg bg-amber-600 text-white"
-                          >
-                            Pause
-                          </button>
-                        )}
-                        {pr.status === 'pending' && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/api/admin/promotions/${pr.id}`, {
-                                  method: 'PATCH',
-                                  isAdmin: true,
-                                  body: JSON.stringify({ status: 'rejected' }),
-                                });
-                                await loadTabData('promotions');
-                              } catch (err) {
-                                notify(err instanceof Error ? err.message : 'Promotion update failed', 'error');
-                              }
-                            }}
-                            className="h-8 px-3 rounded-lg bg-red-600 text-white"
-                          >
-                            Reject
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))
+                    );
+                  })
               )}
             </div>
           )}
@@ -2228,30 +3042,34 @@ export function AdminPage() {
           {/* REVENUE TAB (Distinct Ledger & Totals View) */}
           {tab === 'revenue' && monetization && (
             <div className="space-y-4">
-              {overview && (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
-                    <div className="text-xs text-slate-400">Stars Revenue (XTR)</div>
-                    <div className="text-xl font-bold text-white font-mono-nums mt-1">{overview.stars_revenue_xtr ?? 0}</div>
-                  </div>
-                  <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
-                    <div className="text-xs text-slate-400">Pending Stars Invoices</div>
-                    <div className="text-xl font-bold text-white font-mono-nums mt-1">{overview.pending_stars_payments ?? 0}</div>
-                  </div>
-                  <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
-                    <div className="text-xs text-slate-400">Subscription Rev (USD)</div>
-                    <div className="text-xl font-bold text-white font-mono-nums mt-1">
-                      ${Number(overview.subscription_revenue_usd ?? 0).toFixed(2)}
+              {(() => {
+                const rev = monetization.revenueSummary || overview;
+                if (!rev) return null;
+                return (
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                      <div className="text-xs text-slate-400">Stars Revenue (XTR)</div>
+                      <div className="text-xl font-bold text-white font-mono-nums mt-1">{rev.stars_revenue_xtr ?? 0}</div>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                      <div className="text-xs text-slate-400">Pending Stars Invoices</div>
+                      <div className="text-xl font-bold text-white font-mono-nums mt-1">{rev.pending_stars_payments ?? 0}</div>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                      <div className="text-xs text-slate-400">Subscription Rev (USD)</div>
+                      <div className="text-xl font-bold text-white font-mono-nums mt-1">
+                        ${Number(rev.subscription_revenue_usd ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
+                      <div className="text-xs text-slate-400">Promotion Rev (USD)</div>
+                      <div className="text-xl font-bold text-white font-mono-nums mt-1">
+                        ${Number(rev.promotion_revenue_usd ?? 0).toFixed(2)}
+                      </div>
                     </div>
                   </div>
-                  <div className="p-4 rounded-2xl bg-[#0E1525] border border-slate-800">
-                    <div className="text-xs text-slate-400">Promotion Rev (USD)</div>
-                    <div className="text-xl font-bold text-white font-mono-nums mt-1">
-                      ${Number(overview.promotion_revenue_usd ?? 0).toFixed(2)}
-                    </div>
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               <div className="p-5 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-2 text-xs">
                 <div className="text-sm font-semibold text-white">Telegram Stars (XTR) Payment Ledger</div>
@@ -2266,7 +3084,18 @@ export function AdminPage() {
                         </span>
                         <span className="text-slate-400 ml-2 font-mono-nums">{String(sp.stars_amount)} XTR</span>
                       </div>
-                      <span className="uppercase font-mono-nums text-blue-300">{String(sp.status)}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="uppercase font-mono-nums text-blue-300">{String(sp.status)}</span>
+                        {sp.status === 'pending' && (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction({ kind: 'expire_stars_payment', payment: sp })}
+                            className="h-7 px-2.5 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200"
+                          >
+                            Mark Expired
+                          </button>
+                        )}
+                      </div>
                     </div>
                   ))
                 )}
@@ -3206,18 +4035,7 @@ export function AdminPage() {
                           </button>
                           <button
                             type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/api/admin/role-assignments/${as.id}`, {
-                                  method: 'DELETE',
-                                  isAdmin: true,
-                                });
-                                await loadTabData('roles');
-                                notify('Admin access revoked', 'success');
-                              } catch (err) {
-                                notify(err instanceof Error ? err.message : 'Revoke failed', 'error');
-                              }
-                            }}
+                            onClick={() => setConfirmAction({ kind: 'revoke_role_assignment', assignment: as })}
                             className="h-8 px-3 rounded-lg bg-red-950/60 border border-red-800/50 text-red-200"
                           >
                             Revoke
@@ -3686,6 +4504,40 @@ export function AdminPage() {
             'If this broadcast currently drives the top marketplace announcement banner, the banner is also cleared.',
           ];
           confirmLabel = 'Delete Broadcast';
+        } else if (confirmAction.kind === 'delete_promotion') {
+          title = `Delete Promotion "${String(confirmAction.promo.title || '')}"`;
+          description = 'Permanently delete this non-active promotion campaign.';
+          consequences = [
+            'Any unpaid pending Telegram Stars checkout invoices for this promotion are cancelled.',
+            'Paid Telegram Stars promotions and active campaigns are protected from deletion.',
+          ];
+          confirmLabel = 'Delete Promotion';
+        } else if (confirmAction.kind === 'cancel_subscription') {
+          title = `${confirmAction.status === 'cancelled' ? 'Cancel' : 'Expire'} Seller Subscription`;
+          description = `Set subscription for "${String(confirmAction.sub.seller_name || '')}" to ${confirmAction.status}?`;
+          consequences = [
+            'The seller loses paid tier limits immediately and receives a Telegram notification.',
+          ];
+          confirmLabel = confirmAction.status === 'cancelled' ? 'Cancel Subscription' : 'Expire Subscription';
+          variant = 'warning';
+        } else if (confirmAction.kind === 'expire_stars_payment') {
+          title = 'Expire Pending Telegram Stars Invoice';
+          description = `Mark invoice (${String(confirmAction.payment.stars_amount)} XTR) as expired?`;
+          consequences = [
+            'The unpaid pending invoice will no longer fulfill via webhook and pending revenue counters update.',
+          ];
+          confirmLabel = 'Mark Expired';
+          variant = 'warning';
+        } else if (confirmAction.kind === 'delete_role') {
+          title = `Delete Custom Role "${String(confirmAction.role.name || '')}"`;
+          description = 'Permanently remove this custom RBAC role and its permission mappings.';
+          consequences = ['Only custom roles with zero assigned administrators can be deleted.'];
+          confirmLabel = 'Delete Role';
+        } else if (confirmAction.kind === 'revoke_role_assignment') {
+          title = `Revoke Admin Access for TG ${String(confirmAction.assignment.telegram_id || '')}`;
+          description = 'Remove administrative role assignment for this Telegram account.';
+          consequences = ['The user immediately loses Governance Console permissions on next API call.'];
+          confirmLabel = 'Revoke Access';
         } else if (confirmAction.kind === 'archive_audit_selected') {
           title = `Archive ${confirmAction.ids.length} Audit Log(s)`;
           description = 'Move selected audit logs into the compliance archive view.';
@@ -3790,6 +4642,43 @@ export function AdminPage() {
                   await loadTabData('notifications');
                   await refreshBootstrap();
                   notify('Broadcast notification deleted.', 'info');
+                } else if (confirmAction.kind === 'delete_promotion') {
+                  await apiFetch(`/api/admin/promotions/${String(confirmAction.promo.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('promotions');
+                  notify('Promotion deleted.', 'info');
+                } else if (confirmAction.kind === 'cancel_subscription') {
+                  await apiFetch(`/api/admin/subscriptions/${String(confirmAction.sub.id)}`, {
+                    method: 'PATCH',
+                    isAdmin: true,
+                    body: JSON.stringify({ status: confirmAction.status }),
+                  });
+                  await loadTabData('subscriptions');
+                  notify(`Subscription ${confirmAction.status}.`, 'info');
+                } else if (confirmAction.kind === 'expire_stars_payment') {
+                  await apiFetch(`/api/admin/stars-payments/${String(confirmAction.payment.id)}`, {
+                    method: 'PATCH',
+                    isAdmin: true,
+                    body: JSON.stringify({ status: 'expired' }),
+                  });
+                  await loadTabData('revenue');
+                  notify('Pending Stars invoice marked expired.', 'info');
+                } else if (confirmAction.kind === 'delete_role') {
+                  await apiFetch(`/api/admin/roles/${String(confirmAction.role.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('roles');
+                  notify('Custom role deleted.', 'success');
+                } else if (confirmAction.kind === 'revoke_role_assignment') {
+                  await apiFetch(`/api/admin/role-assignments/${String(confirmAction.assignment.id)}`, {
+                    method: 'DELETE',
+                    isAdmin: true,
+                  });
+                  await loadTabData('roles');
+                  notify('Admin access revoked.', 'success');
                 } else if (confirmAction.kind === 'archive_audit_selected') {
                   const res = await apiFetch<{ archivedCount: number }>('/api/admin/audit-logs/archive', {
                     method: 'POST',

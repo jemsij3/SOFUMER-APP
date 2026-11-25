@@ -752,8 +752,11 @@ export default {
     try {
       const url = new URL(request.url);
 
-      if (env.DB && url.pathname.startsWith('/api/')) {
-        await ensureD1Schema(env.DB);
+      if (env.DB && url.pathname.startsWith('/api/') && url.pathname !== '/api/health') {
+        const schemaOk = await ensureD1Schema(env.DB);
+        if (!schemaOk) {
+          return json({ error: 'Database schema initialization failed. Please retry shortly.' }, 503);
+        }
       }
 
       if (url.pathname === '/api/health') {

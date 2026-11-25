@@ -54,6 +54,108 @@ export async function getTelegramBotInfo(): Promise<{
   }
 }
 
+export function resolveSafeMiniAppUrlLocal(fallbackOrigin: string): string {
+  const candidates = [process.env.MINI_APP_URL, process.env.APP_URL, fallbackOrigin];
+  for (const raw of candidates) {
+    const val = (raw || '').trim();
+    if (!val) continue;
+    try {
+      const parsed = new URL(val);
+      if (parsed.protocol === 'https:') {
+        return parsed.origin;
+      }
+    } catch {
+      // Ignore malformed candidate URL
+    }
+  }
+  return '';
+}
+
+export async function ensureTelegramMenuButtonLocal(
+  miniAppUrl: string
+): Promise<{ ok: boolean; error?: string }> {
+  const { botToken } = getTelegramBotConfig();
+  if (!botToken || !miniAppUrl || !miniAppUrl.startsWith('https://')) {
+    return { ok: false, error: 'Missing HTTPS miniAppUrl or TELEGRAM_BOT_TOKEN.' };
+  }
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        menu_button: {
+          type: 'web_app',
+          text: 'Open SOFUMER',
+          web_app: { url: miniAppUrl },
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; description?: string };
+    if (!resp.ok || !data?.ok) {
+      return { ok: false, error: data.description || `setChatMenuButton failed (${resp.status})` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Telegram Bot API error.' };
+  }
+}
+
+export async function getTelegramBotLaunchDiagnosticsLocal(fallbackOrigin: string) {
+  const cfg = getTelegramBotConfig();
+  const miniAppUrl = resolveSafeMiniAppUrlLocal(fallbackOrigin);
+  const botInfo = await getTelegramBotInfo();
+
+  if (!cfg.botToken) {
+    return {
+      telegramConfigured: false,
+      jwtConfigured: Boolean((process.env.JWT_SECRET || '').trim()),
+      webhookSecretConfigured: Boolean(cfg.webhookSecret),
+      botName: null,
+      botUsername: null,
+      miniAppUrl,
+      menuButton: null,
+      webhookInfo: null,
+    };
+  }
+
+  const [menuRes, webhookRes] = await Promise.all([
+    fetch(`https://api.telegram.org/bot${cfg.botToken}/getChatMenuButton`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(5000),
+    })
+      .then((r) => r.json() as Promise<{ ok?: boolean; result?: Record<string, unknown> }>)
+      .catch(() => null),
+    fetch(`https://api.telegram.org/bot${cfg.botToken}/getWebhookInfo`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5000),
+    })
+      .then((r) => r.json() as Promise<{ ok?: boolean; result?: Record<string, unknown> }>)
+      .catch(() => null),
+  ]);
+
+  const webhookResult = webhookRes?.ok ? webhookRes.result || null : null;
+  return {
+    telegramConfigured: true,
+    jwtConfigured: Boolean((process.env.JWT_SECRET || '').trim()),
+    webhookSecretConfigured: Boolean(cfg.webhookSecret),
+    botName: botInfo.botName,
+    botUsername: botInfo.botUsername,
+    miniAppUrl,
+    directMiniAppLink: botInfo.botUsername ? `https://t.me/${botInfo.botUsername}?startapp` : null,
+    menuButton: menuRes?.ok ? menuRes.result || null : null,
+    webhookInfo: webhookResult
+      ? {
+          url: webhookResult.url || '',
+          pendingUpdateCount: webhookResult.pending_update_count || 0,
+          lastErrorMessage: webhookResult.last_error_message || null,
+        }
+      : null,
+  };
+}
+
 export async function sendTelegramBotMessage(
   chatId: string | number,
   text: string,

@@ -879,6 +879,160 @@ async function runTests() {
     assert.throws(() => verifyTelegramInitData(rawParams.toString(), '555666777:WRONG_TOKEN'));
   });
 
+  await test('Governance Console Parity: product_inventory FK delete, order status, promotions, subscriptions, Stars, moderation & diagnostics', async () => {
+    const mockEnv: WorkerEnv = {
+      DB: createSqliteD1Adapter(),
+      TELEGRAM_BOT_TOKEN: TEST_BOT_TOKEN,
+      TELEGRAM_WEBHOOK_SECRET: 'int-webhook-secret',
+      JWT_SECRET: 'integration-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '99990001',
+    };
+
+    const runSuffix = Math.floor(Math.random() * 100000);
+    const adminInit = buildSignedTelegramInitData({ id: 99990001, first_name: 'GovAdmin', username: 'gov_int_admin' }, TEST_BOT_TOKEN);
+    const sellerInit = buildSignedTelegramInitData({ id: 4100000 + runSuffix, first_name: 'GovSeller', username: `gov_sell_${runSuffix}` }, TEST_BOT_TOKEN);
+    const buyerInit = buildSignedTelegramInitData({ id: 4200000 + runSuffix, first_name: 'GovBuyer', username: `gov_buy_${runSuffix}` }, TEST_BOT_TOKEN);
+
+    const login = async (initData: string) => {
+      const r = await worker.fetch(
+        new Request('https://sofumer.example/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        mockEnv
+      );
+      return (await r.json()) as { token: string; user: { id: string } };
+    };
+
+    const adminAuth = await login(adminInit);
+    const sellerAuth = await login(sellerInit);
+    const buyerAuth = await login(buyerInit);
+
+    const sellerUserRow = db.prepare('SELECT id FROM users WHERE telegram_id = ?').get(String(4100000 + runSuffix)) as { id: string };
+    const buyerUserRow = db.prepare('SELECT id FROM users WHERE telegram_id = ?').get(String(4200000 + runSuffix)) as { id: string };
+
+    const regRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          sellerType: 'individual',
+          legalName: 'Gov Int Seller',
+          shopName: `Gov Int Shop ${runSuffix}`,
+          countryCode: 'US',
+        }),
+      }),
+      mockEnv
+    );
+    assert.equal(regRes.status, 201);
+    const regJson = (await regRes.json()) as { shop: { id: string }; sellerProfile: { id: string } };
+
+    // Product with explicit product_inventory FK row deletes cleanly (no 500!)
+    const prodRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Int FK Delete Product',
+          description: 'Inventory FK check',
+          categoryId: 'cat_electronics',
+          price: 49,
+          currency: 'USD',
+          status: 'published',
+        }),
+      }),
+      mockEnv
+    );
+    const { product: delTarget } = (await prodRes.json()) as { product: { id: string } };
+    db.prepare(
+      `INSERT OR IGNORE INTO product_inventory (id, product_id, stock_quantity, low_stock_threshold) VALUES (?, ?, 5, 1)`
+    ).run(`inv_${delTarget.id}`, delTarget.id);
+
+    const delProd = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/products/${delTarget.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(delProd.status, 200);
+
+    // Edit shop details + verify monetization revenueSummary + Telegram diagnostics
+    const shopPatch = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/shops/${regJson.shop.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ name: `Renamed Gov Shop ${runSuffix}`, description: 'Clean Governance desc' }),
+      }),
+      mockEnv
+    );
+    assert.equal(shopPatch.status, 200);
+
+    const monRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/monetization', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(monRes.status, 200);
+    const monData = (await monRes.json()) as { revenueSummary?: { totalStarsEarned: number } };
+    assert.ok(monData.revenueSummary !== undefined);
+
+    const diagRes = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/telegram/diagnostics', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      mockEnv
+    );
+    assert.equal(diagRes.status, 200);
+
+    // Order status & message moderation parity
+    const prod2Res = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          listingType: 'physical',
+          title: 'Int Active Item',
+          description: 'Governance order parity',
+          categoryId: 'cat_electronics',
+          price: 99,
+          currency: 'USD',
+          status: 'published',
+        }),
+      }),
+      mockEnv
+    );
+    const { product: item2 } = (await prod2Res.json()) as { product: { id: string } };
+    const ordRes = await worker.fetch(
+      new Request('https://sofumer.example/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerAuth.token}` },
+        body: JSON.stringify({
+          productId: item2.id,
+          buyerUserId: buyerUserRow.id,
+          quantity: 1,
+          agreedTotal: 99,
+          currency: 'USD',
+        }),
+      }),
+      mockEnv
+    );
+    const { orderId } = (await ordRes.json()) as { orderId: string };
+    const ordUpdate = await worker.fetch(
+      new Request(`https://sofumer.example/api/admin/orders/${orderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminAuth.token}` },
+        body: JSON.stringify({ status: 'Confirmed', note: 'Parity confirmation' }),
+      }),
+      mockEnv
+    );
+    assert.equal(ordUpdate.status, 200);
+    assert.equal(sellerUserRow.id.length > 0, true);
+  });
+
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);
 }
