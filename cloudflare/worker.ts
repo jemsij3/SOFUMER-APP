@@ -406,15 +406,15 @@ async function handleAuthRoutes(
           userId = String(existing.id);
         }
 
+        await env.DB.prepare(`INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`)
+          .bind(userId)
+          .run();
+
         if (!isAdmin) {
           await env.DB.prepare(
             `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
           )
             .bind(newId('role'), userId)
-            .run();
-
-          await env.DB.prepare(`INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`)
-            .bind(userId)
             .run();
         }
       } else {
@@ -619,27 +619,7 @@ async function handleAuthRoutes(
     const user = sessionRes.user;
     const db = env.DB;
 
-    if (user.isAdmin) {
-      return json(
-        {
-          authenticated: true,
-          mode: 'admin',
-          user: {
-            ...user,
-            mode: 'admin',
-            roles: [],
-            aiEnabled: false,
-          },
-          sellerProfile: null,
-          shop: null,
-          unreadMessages: 0,
-          unreadNotifications: 0,
-          favoriteProductIds: [],
-        },
-        200,
-        AUTH_NO_STORE_HEADERS
-      );
-    }
+
 
     const safeQuery = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
       try {

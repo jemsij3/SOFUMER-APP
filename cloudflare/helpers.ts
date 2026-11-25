@@ -942,20 +942,7 @@ export async function requireEdgeNonAdminUser(
   request: Request,
   env: Env
 ): Promise<{ user: EdgeAuthUser } | { error: Response }> {
-  const auth = await requireEdgeUser(request, env);
-  if ('error' in auth) return auth;
-  if (auth.user.isAdmin) {
-    return {
-      error: json(
-        {
-          error: ADMIN_EXCLUSIVE_MODE_ERROR,
-          code: 'ADMIN_MODE_EXCLUSIVE',
-        },
-        403
-      ),
-    };
-  }
-  return auth;
+  return await requireEdgeUser(request, env);
 }
 
 export async function requireEdgeSeller(

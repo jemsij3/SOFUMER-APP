@@ -4162,25 +4162,16 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
       .first();
     expect(legacyBuyerRow).toBeNull();
 
-    // /api/auth/me for admin returns exclusive admin payload
+    // /api/auth/me for admin returns full marketplace capabilities alongside admin privileges
     const adminMeRes = await callWorker('/api/auth/me', {
       headers: { Authorization: `Bearer ${adminToken}` },
     });
     expect(adminMeRes.status).toBe(200);
     const adminMe = await adminMeRes.json();
     expect(adminMe.authenticated).toBe(true);
-    expect(adminMe.mode).toBe('admin');
     expect(adminMe.user.isAdmin).toBe(true);
-    expect(adminMe.user.mode).toBe('admin');
-    expect(adminMe.user.roles).toEqual([]);
-    expect(adminMe.user.aiEnabled).toBe(false);
-    expect(adminMe.sellerProfile).toBeNull();
-    expect(adminMe.shop).toBeNull();
-    expect(adminMe.unreadMessages).toBe(0);
-    expect(adminMe.unreadNotifications).toBe(0);
-    expect(adminMe.favoriteProductIds).toEqual([]);
 
-    // Admin can access /api/admin/* and /api/marketplace/bootstrap
+    // Admin can access /api/admin/* and marketplace/buyer/AI endpoints
     const adminOverviewRes = await callWorker('/api/admin/overview', {
       headers: { Authorization: `Bearer ${adminToken}` },
     });
@@ -4207,34 +4198,17 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     expect(JSON.stringify(adminSettingsJson)).not.toContain('quoted_secret_456');
     expect(JSON.stringify(adminSettingsJson)).not.toContain('quoted_key_123');
 
-    // Admin is blocked (403 ADMIN_MODE_EXCLUSIVE) from all marketplace buyer/seller/AI endpoints
-    const blockedForAdmin = [
-      { path: '/api/marketplace/home', method: 'GET' },
-      { path: '/api/marketplace/favorites', method: 'GET' },
-      { path: '/api/seller/media/config?scope=shop', method: 'GET' },
-      {
-        path: '/api/seller/register',
-        method: 'POST',
-        body: JSON.stringify({ sellerType: 'individual', legalName: 'Admin', shopName: 'Nope', countryCode: 'US' }),
-      },
-      { path: '/api/orders', method: 'GET' },
-      { path: '/api/conversations', method: 'GET' },
-      { path: '/api/account/notifications', method: 'GET' },
-      { path: '/api/ai/status', method: 'GET' },
-    ];
-    for (const item of blockedForAdmin) {
-      const r = await callWorker(item.path, {
-        method: item.method,
-        headers: {
-          Authorization: `Bearer ${adminToken}`,
-          ...(item.body ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: item.body,
-      });
-      expect(r.status).toBe(403);
-      const body = await r.json();
-      expect(body.code).toBe('ADMIN_MODE_EXCLUSIVE');
-    }
+    const rHome = await callWorker('/api/marketplace/home', { headers: { Authorization: `Bearer ${adminToken}` } });
+    if (rHome.status !== 200) console.error('home status:', rHome.status, await rHome.text());
+    expect(rHome.status).toBe(200);
+
+    const rFav = await callWorker('/api/marketplace/favorites', { headers: { Authorization: `Bearer ${adminToken}` } });
+    if (rFav.status !== 200) console.error('fav status:', rFav.status, await rFav.text());
+    expect(rFav.status).toBe(200);
+
+    const rAi = await callWorker('/api/ai/status', { headers: { Authorization: `Bearer ${adminToken}` } });
+    if (rAi.status !== 200) console.error('ai status:', rAi.status, await rAi.text());
+    expect(rAi.status).toBe(200);
 
     // 2. Non-admin buyer retains normal marketplace mode and is blocked from /api/admin/*
     const buyerInit = await signTelegramInitData(

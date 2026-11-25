@@ -1072,22 +1072,14 @@ async function runTests() {
       cldUrlEnv
     );
     const adminMe = (await adminMeRes.json()) as { mode: string; user: { roles: string[]; aiEnabled: boolean }; sellerProfile: unknown; shop: unknown };
-    assert.equal(adminMe.mode, 'admin');
-    assert.deepEqual(adminMe.user.roles, []);
-    assert.equal(adminMe.user.aiEnabled, false);
-    assert.equal(adminMe.sellerProfile, null);
-    assert.equal(adminMe.shop, null);
-
-    // Admin blocked from buyer/seller/AI routes with 403 ADMIN_MODE_EXCLUSIVE
-    const adminBlockedHome = await worker.fetch(
+    // Admin can access marketplace home successfully
+    const adminHomeRes = await worker.fetch(
       new Request('https://sofumer.example/api/marketplace/home', {
         headers: { Authorization: `Bearer ${adminAuth.token}` },
       }),
       cldUrlEnv
     );
-    assert.equal(adminBlockedHome.status, 403);
-    const adminBlockedJson = (await adminBlockedHome.json()) as { code: string };
-    assert.equal(adminBlockedJson.code, 'ADMIN_MODE_EXCLUSIVE');
+    assert.equal(adminHomeRes.status, 200);
 
     // Admin settings includes non-secret cloudinaryStatus
     const adminSettings = await worker.fetch(

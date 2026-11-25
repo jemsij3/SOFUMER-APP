@@ -81,15 +81,7 @@ export async function handleMarketplaceRoutes(
     });
   }
 
-  if (authUser.isAdmin) {
-    return json(
-      {
-        error: ADMIN_EXCLUSIVE_MODE_ERROR,
-        code: 'ADMIN_MODE_EXCLUSIVE',
-      },
-      403
-    );
-  }
+
 
   if (sub === '/home') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);

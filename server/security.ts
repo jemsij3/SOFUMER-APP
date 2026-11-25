@@ -597,12 +597,6 @@ export const ADMIN_EXCLUSIVE_MODE_ERROR =
 
 export function requireNonAdminMarketplaceUser(req: Request, res: Response, next: NextFunction) {
   requireAuth(req, res, () => {
-    if (req.authUser?.isAdmin) {
-      return res.status(403).json({
-        error: ADMIN_EXCLUSIVE_MODE_ERROR,
-        code: 'ADMIN_MODE_EXCLUSIVE',
-      });
-    }
     next();
   });
 }

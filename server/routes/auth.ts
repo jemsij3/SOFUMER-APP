@@ -64,13 +64,13 @@ function createSessionForTelegramUser(
       safePhotoUrl,
       sanitizeText(tgUser.language_code || 'en', 10)
     );
+    db.prepare(
+      `INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`
+    ).run(userId);
     if (!isAdmin) {
       db.prepare(
         `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
       ).run(newId('role'), userId);
-      db.prepare(
-        `INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`
-      ).run(userId);
     }
   } else {
     userId = String(existing.id);
@@ -246,23 +246,7 @@ authRouter.get('/me', (req, res) => {
   }
   const user = sessionRes.user;
 
-  if (user.isAdmin) {
-    return res.json({
-      authenticated: true,
-      mode: 'admin',
-      user: {
-        ...user,
-        mode: 'admin',
-        roles: [],
-        aiEnabled: false,
-      },
-      sellerProfile: null,
-      shop: null,
-      unreadMessages: 0,
-      unreadNotifications: 0,
-      favoriteProductIds: [],
-    });
-  }
+
 
   const sellerProfile = db
     .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
