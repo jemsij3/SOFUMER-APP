@@ -3,7 +3,7 @@ import multer from 'multer';
 import path from 'path';
 import crypto from 'crypto';
 import { db, getUploadDir, newId } from '../db.ts';
-import { rateLimit, requireAuth, sanitizeText } from '../security.ts';
+import { rateLimit, requireNonAdminMarketplaceUser, sanitizeText } from '../security.ts';
 import {
   checkAiPermission,
   runBuyerCompareAi,
@@ -43,7 +43,7 @@ const upload = multer({
   },
 });
 
-accountAiRouter.post('/uploads', requireAuth, rateLimit(20, 60_000, 'upload'), (req, res) => {
+accountAiRouter.post('/uploads', requireNonAdminMarketplaceUser, rateLimit(20, 60_000, 'upload'), (req, res) => {
   upload.single('file')(req, res, (err) => {
     if (err) {
       return res.status(400).json({ error: err instanceof Error ? err.message : 'Upload failed' });
@@ -60,7 +60,7 @@ accountAiRouter.post('/uploads', requireAuth, rateLimit(20, 60_000, 'upload'), (
 // USER ACCOUNT, PREFERENCES, NOTIFICATIONS, SUPPORT
 // ============================================================================
 
-accountAiRouter.patch('/account/profile', requireAuth, (req, res) => {
+accountAiRouter.patch('/account/profile', requireNonAdminMarketplaceUser, (req, res) => {
   const user = req.authUser!;
   const displayName = sanitizeText(req.body?.displayName ?? user.display_name, 80);
   const bio = sanitizeText(req.body?.bio ?? user.bio, 500);
@@ -87,7 +87,7 @@ accountAiRouter.patch('/account/profile', requireAuth, (req, res) => {
   res.json({ updated: true });
 });
 
-accountAiRouter.get('/account/notifications', requireAuth, (req, res) => {
+accountAiRouter.get('/account/notifications', requireNonAdminMarketplaceUser, (req, res) => {
   const items = db
     .prepare(
       `SELECT * FROM notifications
@@ -98,19 +98,19 @@ accountAiRouter.get('/account/notifications', requireAuth, (req, res) => {
   res.json({ notifications: items });
 });
 
-accountAiRouter.patch('/account/notifications/read', requireAuth, (req, res) => {
+accountAiRouter.patch('/account/notifications/read', requireNonAdminMarketplaceUser, (req, res) => {
   db.prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ?").run(req.authUser!.id);
   res.json({ read: true });
 });
 
-accountAiRouter.delete('/account/notifications/read', requireAuth, (req, res) => {
+accountAiRouter.delete('/account/notifications/read', requireNonAdminMarketplaceUser, (req, res) => {
   const del = db
     .prepare("DELETE FROM notifications WHERE user_id = ? AND is_read = 1 AND scope = 'user'")
     .run(req.authUser!.id);
   res.json({ deletedCount: del.changes });
 });
 
-accountAiRouter.delete('/account/notifications/:id', requireAuth, (req, res) => {
+accountAiRouter.delete('/account/notifications/:id', requireNonAdminMarketplaceUser, (req, res) => {
   const notif = db
     .prepare('SELECT id, user_id, scope FROM notifications WHERE id = ?')
     .get(req.params.id) as { id: string; user_id: string | null; scope: string } | undefined;
@@ -128,14 +128,14 @@ accountAiRouter.delete('/account/notifications/:id', requireAuth, (req, res) => 
   res.json({ deleted: true, id: req.params.id });
 });
 
-accountAiRouter.get('/account/support', requireAuth, (req, res) => {
+accountAiRouter.get('/account/support', requireNonAdminMarketplaceUser, (req, res) => {
   const tickets = db
     .prepare('SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC')
     .all(req.authUser!.id);
   res.json({ tickets });
 });
 
-accountAiRouter.post('/account/support', requireAuth, (req, res) => {
+accountAiRouter.post('/account/support', requireNonAdminMarketplaceUser, (req, res) => {
   const category = sanitizeText(req.body?.category || 'general', 40);
   const subject = sanitizeText(req.body?.subject || '', 140);
   const message = sanitizeText(req.body?.message || '', 2000);
@@ -149,7 +149,7 @@ accountAiRouter.post('/account/support', requireAuth, (req, res) => {
   res.status(201).json({ ticketId, status: 'open' });
 });
 
-accountAiRouter.delete('/account/support/:id', requireAuth, (req, res) => {
+accountAiRouter.delete('/account/support/:id', requireNonAdminMarketplaceUser, (req, res) => {
   const ticket = db
     .prepare('SELECT id, user_id, status FROM support_tickets WHERE id = ? AND user_id = ?')
     .get(req.params.id, req.authUser!.id) as { id: string; user_id: string; status: string } | undefined;
@@ -165,7 +165,7 @@ accountAiRouter.delete('/account/support/:id', requireAuth, (req, res) => {
 // SERVER-SIDE AI ENDPOINTS (PROTECTED BY BACKEND GOVERNANCE)
 // ============================================================================
 
-accountAiRouter.get('/ai/status', requireAuth, (req, res) => {
+accountAiRouter.get('/ai/status', requireNonAdminMarketplaceUser, (req, res) => {
   const features = db
     .prepare('SELECT feature_key, label, is_enabled, daily_limit_per_user, model_name FROM ai_feature_settings')
     .all();
@@ -180,7 +180,7 @@ accountAiRouter.get('/ai/status', requireAuth, (req, res) => {
   });
 });
 
-accountAiRouter.post('/ai/buyer/discover', requireAuth, rateLimit(20, 60_000, 'ai'), async (req, res) => {
+accountAiRouter.post('/ai/buyer/discover', requireNonAdminMarketplaceUser, rateLimit(20, 60_000, 'ai'), async (req, res) => {
   const query = sanitizeText(req.body?.query || '', 600);
   if (!query) {
     return res.status(400).json({ error: 'Search prompt is required.' });
@@ -194,7 +194,7 @@ accountAiRouter.post('/ai/buyer/discover', requireAuth, rateLimit(20, 60_000, 'a
   }
 });
 
-accountAiRouter.post('/ai/buyer/compare', requireAuth, rateLimit(15, 60_000, 'ai'), async (req, res) => {
+accountAiRouter.post('/ai/buyer/compare', requireNonAdminMarketplaceUser, rateLimit(15, 60_000, 'ai'), async (req, res) => {
   const productIds = Array.isArray(req.body?.productIds)
     ? req.body.productIds.map((id: unknown) => sanitizeText(id, 64)).filter(Boolean)
     : [];
@@ -208,7 +208,7 @@ accountAiRouter.post('/ai/buyer/compare', requireAuth, rateLimit(15, 60_000, 'ai
   }
 });
 
-accountAiRouter.post('/ai/seller/assist', requireAuth, rateLimit(20, 60_000, 'ai'), async (req, res) => {
+accountAiRouter.post('/ai/seller/assist', requireNonAdminMarketplaceUser, rateLimit(20, 60_000, 'ai'), async (req, res) => {
   const action = req.body?.action;
   if (!['generate_listing', 'translate', 'analytics'].includes(action)) {
     return res.status(400).json({ error: 'Invalid seller AI action.' });
@@ -234,7 +234,7 @@ accountAiRouter.post('/ai/seller/assist', requireAuth, rateLimit(20, 60_000, 'ai
   }
 });
 
-accountAiRouter.post('/ai/platform/support', requireAuth, rateLimit(20, 60_000, 'ai'), async (req, res) => {
+accountAiRouter.post('/ai/platform/support', requireNonAdminMarketplaceUser, rateLimit(20, 60_000, 'ai'), async (req, res) => {
   const question = sanitizeText(req.body?.question || '', 800);
   if (!question) {
     return res.status(400).json({ error: 'Question is required.' });

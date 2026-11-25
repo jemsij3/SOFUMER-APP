@@ -6,7 +6,7 @@ import {
   methodNotAllowed,
   newId,
   parseJsonBody,
-  requireEdgeUser,
+  requireEdgeNonAdminUser,
   sanitizeText,
 } from './helpers.ts';
 import {
@@ -189,7 +189,7 @@ export async function handleAiRoutes(
   url: URL
 ): Promise<Response | null> {
   if (!url.pathname.startsWith('/api/ai/')) return null;
-  const auth = await requireEdgeUser(request, env);
+  const auth = await requireEdgeNonAdminUser(request, env);
   if ('error' in auth) return auth.error;
   const userId = auth.user.id;
 

@@ -310,6 +310,7 @@ export interface AuthUser {
   preferred_language: string;
   status: string;
   isAdmin: boolean;
+  mode?: 'admin' | 'marketplace';
   adminRole?: string;
   adminPermissions?: string[];
   roles: string[];
@@ -534,10 +535,11 @@ export function resolveUserSessionDetailed(req: Request): NodeSessionResolution 
     }
 
     const tgId = String(row.telegram_id);
-    const roleRows = db
-      .prepare('SELECT role FROM user_roles WHERE user_id = ?')
-      .all(row.id) as { role: string }[];
     const adminCtx = resolveAdminContext(tgId);
+    const isAdmin = Boolean(adminCtx);
+    const roleRows = isAdmin
+      ? []
+      : (db.prepare('SELECT role FROM user_roles WHERE user_id = ?').all(row.id) as { role: string }[]);
 
     const user: AuthUser = {
       id: String(row.id),
@@ -553,10 +555,11 @@ export function resolveUserSessionDetailed(req: Request): NodeSessionResolution 
       preferred_currency: String(row.preferred_currency || 'USD'),
       preferred_language: String(row.preferred_language || 'en'),
       status: String(row.status || 'active'),
-      isAdmin: Boolean(adminCtx),
+      isAdmin,
+      mode: isAdmin ? 'admin' : 'marketplace',
       adminRole: adminCtx?.roleCode,
       adminPermissions: adminCtx?.permissions,
-      roles: roleRows.map((r) => r.role),
+      roles: isAdmin ? [] : roleRows.map((r) => r.role),
       sessionType: String(row.session_type || 'telegram'),
       sessionId: String(row.session_id),
     };
@@ -589,8 +592,23 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-export function requireSeller(req: Request, res: Response, next: NextFunction) {
+export const ADMIN_EXCLUSIVE_MODE_ERROR =
+  'Administrator accounts operate exclusively in Governance Mode and cannot use buyer or seller marketplace endpoints.';
+
+export function requireNonAdminMarketplaceUser(req: Request, res: Response, next: NextFunction) {
   requireAuth(req, res, () => {
+    if (req.authUser?.isAdmin) {
+      return res.status(403).json({
+        error: ADMIN_EXCLUSIVE_MODE_ERROR,
+        code: 'ADMIN_MODE_EXCLUSIVE',
+      });
+    }
+    next();
+  });
+}
+
+export function requireSeller(req: Request, res: Response, next: NextFunction) {
+  requireNonAdminMarketplaceUser(req, res, () => {
     const user = req.authUser!;
     const seller = db
       .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')

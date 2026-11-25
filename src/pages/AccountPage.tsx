@@ -9,7 +9,6 @@ import {
   LogOut,
   MessageSquare,
   Package,
-  Shield,
   Store,
   Trash2,
   User as UserIcon,
@@ -54,6 +53,10 @@ export function AccountPage() {
       setBio(user.bio);
     }
   }, [user]);
+
+  if (user?.isAdmin || user?.mode === 'admin') {
+    return null;
+  }
 
   async function savePreferences(nextCur?: string, nextLang?: string, nextCountry?: string) {
     const c = nextCur || displayCurrency;
@@ -207,9 +210,6 @@ export function AccountPage() {
           { icon: Bell, label: 'Notifications', sub: `${unreadNotifications} unread alerts`, action: () => navigate({ type: 'notifications' }) },
           { icon: HelpCircle, label: 'Help and Support', sub: 'Submit & track support tickets', action: () => navigate({ type: 'support' }) },
           { icon: FileText, label: 'Terms and Policies', sub: 'Direct transaction & prohibited item rules', action: () => navigate({ type: 'policies' }) },
-          ...(user?.isAdmin
-            ? [{ icon: Shield, label: 'Admin Portal (Authorized Personnel)', sub: 'Independent marketplace governance dashboard', action: () => navigate({ type: 'admin' }) }]
-            : []),
         ].map((row) => (
           <button
             key={row.label}

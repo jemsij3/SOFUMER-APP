@@ -224,7 +224,8 @@ function AppShell() {
     return <TelegramOnlyGate />;
   }
 
-  const isAdminView = view.type === 'admin';
+  const isAdminUser = Boolean(user.isAdmin || user.mode === 'admin');
+  const isAdminView = isAdminUser || view.type === 'admin';
   const activeTab: NavTab | null = view.type === 'tab' ? view.tab : null;
 
   const navItems: Array<{ key: NavTab; label: string; icon: typeof Home; badge?: number }> = [
@@ -310,21 +311,27 @@ function AppShell() {
 
       {/* Main Content Container */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-24 lg:pb-12">
-        {view.type === 'tab' && view.tab === 'home' && <HomePage />}
-        {view.type === 'tab' && view.tab === 'explore' && <ExplorePage />}
-        {view.type === 'tab' && view.tab === 'ai' && <AiAssistantPage />}
-        {view.type === 'tab' && view.tab === 'messages' && <MessagesPage />}
-        {view.type === 'tab' && view.tab === 'account' && <AccountPage />}
-        {view.type === 'product' && <ProductDetailPage productId={view.productId} />}
-        {view.type === 'shop' && <ShopPage slug={view.slug} />}
-        {view.type === 'seller' && <SellerCenterPage initialSection={view.section} />}
-        {view.type === 'orders' && <OrdersPage initialOrderId={view.orderId} />}
-        {view.type === 'wishlist' && <WishlistOrRecentPage mode="wishlist" />}
-        {view.type === 'recently_viewed' && <WishlistOrRecentPage mode="recently_viewed" />}
-        {view.type === 'notifications' && <NotificationsSupportPoliciesPage mode="notifications" />}
-        {view.type === 'support' && <NotificationsSupportPoliciesPage mode="support" />}
-        {view.type === 'policies' && <NotificationsSupportPoliciesPage mode="policies" />}
-        {view.type === 'admin' && <AdminPage />}
+        {isAdminUser ? (
+          <AdminPage />
+        ) : (
+          <>
+            {view.type === 'tab' && view.tab === 'home' && <HomePage />}
+            {view.type === 'tab' && view.tab === 'explore' && <ExplorePage />}
+            {view.type === 'tab' && view.tab === 'ai' && <AiAssistantPage />}
+            {view.type === 'tab' && view.tab === 'messages' && <MessagesPage />}
+            {view.type === 'tab' && view.tab === 'account' && <AccountPage />}
+            {view.type === 'product' && <ProductDetailPage productId={view.productId} />}
+            {view.type === 'shop' && <ShopPage slug={view.slug} />}
+            {view.type === 'seller' && <SellerCenterPage initialSection={view.section} />}
+            {view.type === 'orders' && <OrdersPage initialOrderId={view.orderId} />}
+            {view.type === 'wishlist' && <WishlistOrRecentPage mode="wishlist" />}
+            {view.type === 'recently_viewed' && <WishlistOrRecentPage mode="recently_viewed" />}
+            {view.type === 'notifications' && <NotificationsSupportPoliciesPage mode="notifications" />}
+            {view.type === 'support' && <NotificationsSupportPoliciesPage mode="support" />}
+            {view.type === 'policies' && <NotificationsSupportPoliciesPage mode="policies" />}
+            {view.type === 'admin' && <AdminPage />}
+          </>
+        )}
       </main>
 
       {/* 5 Permanent Bottom Navigation Destinations (Mobile & Telegram Mini App) */}
@@ -364,7 +371,7 @@ function AppShell() {
         </nav>
       )}
 
-      <AuthGateModal />
+      {!isAdminUser && <AuthGateModal />}
     </div>
   );
 }

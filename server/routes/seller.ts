@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import multer from 'multer';
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import { db, getDigitalDir, newId, resolveConfinedDigitalPath, slugify } from '../db.ts';
 import {
   PAID_ORDER_STATUSES,
@@ -12,7 +12,7 @@ import {
   getStarsPerUsdLocal,
   isSafeUrlOrEmpty,
   recordAdminAudit,
-  requireAuth,
+  requireNonAdminMarketplaceUser,
   requireSeller,
   sanitizeSafeUrl,
   sanitizeText,
@@ -330,7 +330,13 @@ const uploadDigital = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-sellerRouter.get('/media/config', requireSeller, (_req, res) => {
+const mediaConfigGuard: RequestHandler = (req, res, next) =>
+  req.query.scope === 'shop' ? requireNonAdminMarketplaceUser(req, res, next) : requireSeller(req, res, next);
+
+const mediaScopeGuard: RequestHandler = (req, res, next) =>
+  req.body?.scope === 'shop' ? requireNonAdminMarketplaceUser(req, res, next) : requireSeller(req, res, next);
+
+sellerRouter.get('/media/config', mediaConfigGuard, (_req, res) => {
   const config = getCloudinaryConfigState();
   const limits = getMediaLimitsFromLocalDb();
   res.json({
@@ -346,7 +352,7 @@ sellerRouter.get('/media/config', requireSeller, (_req, res) => {
   });
 });
 
-sellerRouter.post('/media/sign', requireSeller, (req, res) => {
+sellerRouter.post('/media/sign', mediaScopeGuard, (req, res) => {
   const config = getCloudinaryConfigState();
   if (!config.configured) {
     return res.status(503).json({ error: 'Cloudinary media credentials are not configured on the server.' });
@@ -361,7 +367,7 @@ sellerRouter.post('/media/sign', requireSeller, (req, res) => {
   const productId = sanitizeText(req.body?.productId || '', 64);
   const replaceMediaId = sanitizeText(req.body?.replaceMediaId || '', 64);
 
-  if (productId) {
+  if (productId && validated.scope !== 'shop') {
     const product = db
       .prepare('SELECT id FROM products WHERE id = ? AND seller_user_id = ?')
       .get(productId, userId);
@@ -420,7 +426,7 @@ sellerRouter.post('/media/sign', requireSeller, (req, res) => {
   });
 });
 
-sellerRouter.post('/media/verify', requireSeller, async (req, res) => {
+sellerRouter.post('/media/verify', mediaScopeGuard, async (req, res) => {
   const limits = getMediaLimitsFromLocalDb();
   const result = await verifyUploadedCloudinaryAsset({
     sellerUserId: req.authUser!.id,
@@ -434,7 +440,7 @@ sellerRouter.post('/media/verify', requireSeller, async (req, res) => {
   res.json({ verifiedMedia: result.media });
 });
 
-sellerRouter.post('/register', requireAuth, (req, res) => {
+sellerRouter.post('/register', requireNonAdminMarketplaceUser, (req, res) => {
   const regSetting = db
     .prepare("SELECT value FROM platform_settings WHERE key = 'seller_registration_enabled'")
     .get() as { value: string } | undefined;

@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { db, newId, resolveConfinedDigitalPath, slugify } from '../db.ts';
 import { invokeCloudflareWorkersAiJson, logAiUsage } from '../ai.ts';
 import { coerceAiString, resolveActiveCfAiModel, sanitizeAiErrorForUser } from '../../cloudflare/ai-normalizer.ts';
-import { destroyUnreferencedCloudinaryAssetsLocal } from '../cloudinary.ts';
+import { destroyUnreferencedCloudinaryAssetsLocal, getCloudinaryPublicDiagnostics } from '../cloudinary.ts';
 import { executeLocalShopSoftDelete } from './seller.ts';
 import {
   ADMIN_PERMISSION_CATALOG,
@@ -1691,6 +1691,7 @@ adminRouter.get('/settings', requireAdminPermission(['settings.manage', 'rbac.ma
     roleAssignments,
     permissionCatalog: ADMIN_PERMISSION_CATALOG,
     envOwnerTelegramIds: getEnvOwnerTelegramIds(),
+    cloudinaryStatus: getCloudinaryPublicDiagnostics(),
   });
 });
 

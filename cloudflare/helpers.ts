@@ -65,6 +65,7 @@ export interface Env {
   CLOUDINARY_CLOUD_NAME?: string;
   CLOUDINARY_API_KEY?: string;
   CLOUDINARY_API_SECRET?: string;
+  CLOUDINARY_URL?: string;
 }
 
 export const ADMIN_PERMISSION_CATALOG = [
@@ -135,6 +136,8 @@ export interface EdgeAuthUser {
   preferred_language: string;
   status: string;
   isAdmin: boolean;
+  mode?: 'admin' | 'marketplace';
+  roles?: string[];
   adminRole?: string;
   adminPermissions?: string[];
   sessionId: string;
@@ -862,6 +865,7 @@ export async function resolveEdgeUserSessionDetailed(
       preferred_currency: String(row.preferred_currency || 'USD'),
       preferred_language: String(row.preferred_language || 'en'),
       status: String(row.status || 'active'),
+      mode: adminCtx ? 'admin' : 'marketplace',
       isAdmin: Boolean(adminCtx),
       adminRole: adminCtx?.roleCode,
       adminPermissions: adminCtx?.permissions,
@@ -931,6 +935,29 @@ export async function requireEdgeUser(
   return { user: res.user };
 }
 
+export const ADMIN_EXCLUSIVE_MODE_ERROR =
+  'Administrator accounts operate exclusively in Governance Mode and cannot use buyer or seller marketplace endpoints.';
+
+export async function requireEdgeNonAdminUser(
+  request: Request,
+  env: Env
+): Promise<{ user: EdgeAuthUser } | { error: Response }> {
+  const auth = await requireEdgeUser(request, env);
+  if ('error' in auth) return auth;
+  if (auth.user.isAdmin) {
+    return {
+      error: json(
+        {
+          error: ADMIN_EXCLUSIVE_MODE_ERROR,
+          code: 'ADMIN_MODE_EXCLUSIVE',
+        },
+        403
+      ),
+    };
+  }
+  return auth;
+}
+
 export async function requireEdgeSeller(
   request: Request,
   env: Env
@@ -938,7 +965,7 @@ export async function requireEdgeSeller(
   | { user: EdgeAuthUser; seller: Record<string, unknown>; shop: Record<string, unknown> }
   | { error: Response }
 > {
-  const auth = await requireEdgeUser(request, env);
+  const auth = await requireEdgeNonAdminUser(request, env);
   if ('error' in auth) return auth;
   const seller = await env.DB!.prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
     .bind(auth.user.id)

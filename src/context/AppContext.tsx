@@ -47,6 +47,7 @@ export interface AuthDiagnostics {
 
 interface AppContextValue {
   user: User | null;
+  isAdminMode: boolean;
   sellerProfile: SellerProfile | null;
   shop: Shop | null;
   authLoading: boolean;
@@ -150,6 +151,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       ? { type: 'admin' }
       : { type: 'tab', tab: 'home' };
 
+  const isAdminMode = Boolean(user?.isAdmin || user?.mode === 'admin');
+  const isAdminModeRef = useRef(isAdminMode);
+  isAdminModeRef.current = isAdminMode;
+
   const [history, setHistory] = useState<SubView[]>([initialView]);
   const view = history[history.length - 1];
 
@@ -163,17 +168,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const navigate = useCallback((next: SubView) => {
     triggerHaptic('light');
+    if (isAdminModeRef.current) {
+      setHistory([{ type: 'admin' }]);
+      return;
+    }
     setHistory((prev) => [...prev.slice(-15), next]);
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
 
   const goBack = useCallback(() => {
     triggerHaptic('light');
+    if (isAdminModeRef.current) {
+      setHistory([{ type: 'admin' }]);
+      return;
+    }
     setHistory((prev) => (prev.length > 1 ? prev.slice(0, -1) : [{ type: 'tab', tab: 'home' }]));
   }, []);
 
   const switchTab = useCallback((tab: NavTab) => {
     triggerHaptic('light');
+    if (isAdminModeRef.current) {
+      setHistory([{ type: 'admin' }]);
+      return;
+    }
     setHistory([{ type: 'tab', tab }]);
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
@@ -215,6 +232,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       const me = await apiFetch<{
         authenticated: boolean;
+        mode?: 'admin' | 'marketplace';
         user: User | null;
         reason?: string;
         error?: string;
@@ -226,7 +244,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }>('/api/auth/me');
 
       if (me.authenticated && me.user) {
-        setUser(me.user);
+        const adminActive = Boolean(me.user.isAdmin || me.mode === 'admin' || me.user.mode === 'admin');
+        isAdminModeRef.current = adminActive;
+        const normalizedUser: User = {
+          ...me.user,
+          mode: adminActive ? 'admin' : 'marketplace',
+        };
+        setUser(normalizedUser);
+        if (adminActive) {
+          setSellerProfile(null);
+          setShop(null);
+          setUnreadMessages(0);
+          setUnreadNotifications(0);
+          setFavoriteIds(new Set());
+          setHistory([{ type: 'admin' }]);
+          await refreshBootstrap();
+          return { authenticated: true, status: 200 };
+        }
         setSellerProfile(me.sellerProfile || null);
         setShop(me.shop || null);
         setUnreadMessages(me.unreadMessages || 0);
@@ -238,6 +272,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return { authenticated: true, status: 200 };
       }
 
+      isAdminModeRef.current = false;
       setUser(null);
       setSellerProfile(null);
       setShop(null);
@@ -251,6 +286,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         error: me.error || null,
       };
     } catch (err) {
+      isAdminModeRef.current = false;
       setUser(null);
       setSellerProfile(null);
       setShop(null);
@@ -454,6 +490,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [authenticateTelegram]);
 
   const requireUserOrPrompt = useCallback(() => {
+    if (isAdminModeRef.current) return false;
     if (user) return true;
     setShowAuthModal(true);
     return false;
@@ -461,7 +498,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const toggleFavorite = useCallback(
     async (productId: string) => {
-      if (!requireUserOrPrompt()) return;
+      if (isAdminModeRef.current || !requireUserOrPrompt()) return;
       try {
         const res = await apiFetch<{ favorited: boolean }>(`/api/marketplace/favorites/${productId}`, {
           method: 'POST',
@@ -486,11 +523,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Ignore
     }
+    isAdminModeRef.current = false;
     setUserToken(null);
     setUser(null);
     setSellerProfile(null);
     setShop(null);
+    setUnreadMessages(0);
+    setUnreadNotifications(0);
     setFavoriteIds(new Set());
+    setHistory([{ type: 'tab', tab: 'home' }]);
     notify('Signed out of SOFUMER', 'info');
   }, [notify]);
 
@@ -498,6 +539,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider
       value={{
         user,
+        isAdminMode,
         sellerProfile,
         shop,
         authLoading,

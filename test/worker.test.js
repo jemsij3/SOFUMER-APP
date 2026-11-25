@@ -4086,6 +4086,344 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     const badJson = await badRes.json();
     expect(badJson.diagnostics.signatureVerified).toBe(false);
   });
+
+  it('30. Enforces Exclusive Admin Mode, strips legacy buyer role, normalizes Cloudinary credentials/URL, supports Dynamic Folders & shop onboarding uploads', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+      CLOUDINARY_CLOUD_NAME: '  "sofumer-quoted-cloud"  ',
+      CLOUDINARY_API_KEY: " 'quoted_key_123' ",
+      CLOUDINARY_API_SECRET: ' "quoted_secret_456" ',
+    };
+
+    const callWorker = (path, init = {}, customEnv = testEnv) => {
+      const ctx = createExecutionContext();
+      return worker
+        .fetch(new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init), customEnv, ctx)
+        .then(async (res) => {
+          await waitOnExecutionContext(ctx);
+          return res;
+        });
+    };
+
+    const sha1Hex = async (value) => {
+      const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(value));
+      return Array.from(new Uint8Array(buf))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    };
+
+    // 1. Seed a legacy 'buyer' role on admin 999001 if present, then log in as admin
+    const adminInit = await signTelegramInitData(
+      { id: 999001, first_name: 'Owner', username: 'sofumer_owner' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const firstAdminLogin = await callWorker('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: adminInit }),
+    });
+    expect(firstAdminLogin.status).toBe(200);
+    const firstAdminJson = await firstAdminLogin.json();
+    expect(firstAdminJson.isAdmin).toBe(true);
+    expect(firstAdminJson.mode).toBe('admin');
+
+    const firstAdminMeRes = await callWorker('/api/auth/me', {
+      headers: { Authorization: `Bearer ${firstAdminJson.token}` },
+    });
+    const firstAdminMeJson = await firstAdminMeRes.json();
+    const adminUserId = firstAdminMeJson.user.id;
+
+    // Inject a legacy 'buyer' role manually, re-authenticate, and verify cleanup
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO user_roles (id, user_id, role) VALUES (?, ?, 'buyer')"
+    )
+      .bind('ur_legacy_admin_buyer', adminUserId)
+      .run();
+
+    const adminLoginRes = await callWorker('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: adminInit }),
+    });
+    expect(adminLoginRes.status).toBe(200);
+    const adminLoginJson = await adminLoginRes.json();
+    const adminToken = adminLoginJson.token;
+    expect(adminLoginJson.isAdmin).toBe(true);
+    expect(adminLoginJson.mode).toBe('admin');
+
+    const legacyBuyerRow = await env.DB.prepare(
+      "SELECT id FROM user_roles WHERE user_id = ? AND role = 'buyer'"
+    )
+      .bind(adminUserId)
+      .first();
+    expect(legacyBuyerRow).toBeNull();
+
+    // /api/auth/me for admin returns exclusive admin payload
+    const adminMeRes = await callWorker('/api/auth/me', {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    expect(adminMeRes.status).toBe(200);
+    const adminMe = await adminMeRes.json();
+    expect(adminMe.authenticated).toBe(true);
+    expect(adminMe.mode).toBe('admin');
+    expect(adminMe.user.isAdmin).toBe(true);
+    expect(adminMe.user.mode).toBe('admin');
+    expect(adminMe.user.roles).toEqual([]);
+    expect(adminMe.user.aiEnabled).toBe(false);
+    expect(adminMe.sellerProfile).toBeNull();
+    expect(adminMe.shop).toBeNull();
+    expect(adminMe.unreadMessages).toBe(0);
+    expect(adminMe.unreadNotifications).toBe(0);
+    expect(adminMe.favoriteProductIds).toEqual([]);
+
+    // Admin can access /api/admin/* and /api/marketplace/bootstrap
+    const adminOverviewRes = await callWorker('/api/admin/overview', {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    expect(adminOverviewRes.status).toBe(200);
+
+    const adminBootRes = await callWorker('/api/marketplace/bootstrap', {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    expect(adminBootRes.status).toBe(200);
+
+    const adminSettingsRes = await callWorker('/api/admin/settings', {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    expect(adminSettingsRes.status).toBe(200);
+    const adminSettingsJson = await adminSettingsRes.json();
+    expect(adminSettingsJson.cloudinaryStatus).toEqual({
+      configured: true,
+      cloudName: 'sofumer-quoted-cloud',
+      hasCloudName: true,
+      hasApiKey: true,
+      hasApiSecret: true,
+      source: 'individual_vars',
+    });
+    expect(JSON.stringify(adminSettingsJson)).not.toContain('quoted_secret_456');
+    expect(JSON.stringify(adminSettingsJson)).not.toContain('quoted_key_123');
+
+    // Admin is blocked (403 ADMIN_MODE_EXCLUSIVE) from all marketplace buyer/seller/AI endpoints
+    const blockedForAdmin = [
+      { path: '/api/marketplace/home', method: 'GET' },
+      { path: '/api/marketplace/favorites', method: 'GET' },
+      { path: '/api/seller/media/config?scope=shop', method: 'GET' },
+      {
+        path: '/api/seller/register',
+        method: 'POST',
+        body: JSON.stringify({ sellerType: 'individual', legalName: 'Admin', shopName: 'Nope', countryCode: 'US' }),
+      },
+      { path: '/api/orders', method: 'GET' },
+      { path: '/api/conversations', method: 'GET' },
+      { path: '/api/account/notifications', method: 'GET' },
+      { path: '/api/ai/status', method: 'GET' },
+    ];
+    for (const item of blockedForAdmin) {
+      const r = await callWorker(item.path, {
+        method: item.method,
+        headers: {
+          Authorization: `Bearer ${adminToken}`,
+          ...(item.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: item.body,
+      });
+      expect(r.status).toBe(403);
+      const body = await r.json();
+      expect(body.code).toBe('ADMIN_MODE_EXCLUSIVE');
+    }
+
+    // 2. Non-admin buyer retains normal marketplace mode and is blocked from /api/admin/*
+    const buyerInit = await signTelegramInitData(
+      { id: 981111, first_name: 'NormalBuyer', username: 'normal_buyer_981' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const buyerLoginRes = await callWorker('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: buyerInit }),
+    });
+    expect(buyerLoginRes.status).toBe(200);
+    const buyerLoginJson = await buyerLoginRes.json();
+    expect(buyerLoginJson.isAdmin).toBe(false);
+    expect(buyerLoginJson.mode).toBe('marketplace');
+
+    const buyerMeRes = await callWorker('/api/auth/me', {
+      headers: { Authorization: `Bearer ${buyerLoginJson.token}` },
+    });
+    const buyerMe = await buyerMeRes.json();
+    expect(buyerMe.mode).toBe('marketplace');
+    expect(buyerMe.user.roles).toContain('buyer');
+    const buyerUserId = buyerMe.user.id;
+
+    const buyerAdminDeny = await callWorker('/api/admin/overview', {
+      headers: { Authorization: `Bearer ${buyerLoginJson.token}` },
+    });
+    expect(buyerAdminDeny.status).toBe(403);
+
+    // 3. Health reports cloudinaryConfigured cleanly for quoted env vars and CLOUDINARY_URL fallback
+    const healthQuoted = await callWorker('/api/health');
+    const healthQuotedJson = await healthQuoted.json();
+    expect(healthQuotedJson.cloudinaryConfigured).toBe(true);
+    expect(JSON.stringify(healthQuotedJson)).not.toContain('quoted_secret_456');
+
+    const cldUrlEnv = {
+      ...testEnv,
+      CLOUDINARY_CLOUD_NAME: '',
+      CLOUDINARY_API_KEY: '',
+      CLOUDINARY_API_SECRET: '',
+      CLOUDINARY_URL: 'cloudinary://url_api_key:url_api_secret@url-cloud-name',
+    };
+    const healthUrl = await callWorker('/api/health', {}, cldUrlEnv);
+    expect((await healthUrl.json()).cloudinaryConfigured).toBe(true);
+
+    // 4. Non-seller buyer gets 403 on /api/seller/media/config (product scope), but 200 with ?scope=shop
+    const noScopeCfg = await callWorker('/api/seller/media/config', {
+      headers: { Authorization: `Bearer ${buyerLoginJson.token}` },
+    });
+    expect(noScopeCfg.status).toBe(403);
+
+    const shopScopeCfg = await callWorker(
+      '/api/seller/media/config?scope=shop',
+      { headers: { Authorization: `Bearer ${buyerLoginJson.token}` } },
+      cldUrlEnv
+    );
+    expect(shopScopeCfg.status).toBe(200);
+    const shopScopeCfgJson = await shopScopeCfg.json();
+    expect(shopScopeCfgJson.configured).toBe(true);
+
+    // Non-seller buyer can sign shop logo & banner uploads during onboarding using CLOUDINARY_URL
+    const shopSignRes = await callWorker(
+      '/api/seller/media/sign',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerLoginJson.token}` },
+        body: JSON.stringify({
+          scope: 'shop',
+          mediaType: 'image',
+          mimeType: 'image/png',
+          fileName: 'shop-logo.png',
+          fileSize: 64000,
+        }),
+      },
+      cldUrlEnv
+    );
+    expect(shopSignRes.status).toBe(200);
+    const shopSignJson = await shopSignRes.json();
+    expect(shopSignJson.cloudName).toBe('url-cloud-name');
+    expect(shopSignJson.apiKey).toBe('url_api_key');
+    expect(shopSignJson.folder).toBe(`sofumer/shops/${buyerUserId}`);
+    const expectedUrlSig = await sha1Hex(
+      `folder=${shopSignJson.folder}&public_id=${shopSignJson.publicId}&timestamp=${shopSignJson.timestamp}url_api_secret`
+    );
+    expect(shopSignJson.signature).toBe(expectedUrlSig);
+
+    // Dynamic Folders verify support: Cloudinary returns bare publicId + asset_folder
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const target = typeof input === 'string' ? input : input.url;
+      if (target.includes('https://api.cloudinary.com/v1_1/url-cloud-name/resources/image/upload/')) {
+        if (target.includes('other_folder_img')) {
+          return new Response(
+            JSON.stringify({
+              public_id: 'other_folder_img',
+              asset_folder: 'sofumer/shops/usr_someone_else',
+              resource_type: 'image',
+              format: 'png',
+              bytes: 64000,
+              width: 512,
+              height: 512,
+              secure_url: 'https://res.cloudinary.com/url-cloud-name/image/upload/v1/other_folder_img.png',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            public_id: shopSignJson.publicId,
+            asset_folder: `sofumer/shops/${buyerUserId}`,
+            resource_type: 'image',
+            format: 'png',
+            bytes: 64000,
+            width: 512,
+            height: 512,
+            secure_url: `https://res.cloudinary.com/url-cloud-name/image/upload/v1/${shopSignJson.publicId}.png`,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return originalFetch(input, init);
+    };
+
+    try {
+      const dynamicLogoSig = await sha1Hex(`public_id=${shopSignJson.publicId}&version=2url_api_secret`);
+      const dynamicVerifyRes = await callWorker(
+        '/api/seller/media/verify',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerLoginJson.token}` },
+          body: JSON.stringify({
+            scope: 'shop',
+            mediaType: 'image',
+            resourceType: 'image',
+            publicId: shopSignJson.publicId,
+            assetFolder: `sofumer/shops/${buyerUserId}`,
+            version: 2,
+            signature: dynamicLogoSig,
+          }),
+        },
+        cldUrlEnv
+      );
+      expect(dynamicVerifyRes.status).toBe(200);
+      const dynamicVerifyJson = await dynamicVerifyRes.json();
+      const uploadedLogoUrl = dynamicVerifyJson.verifiedMedia.secureUrl;
+      expect(uploadedLogoUrl).toContain('https://res.cloudinary.com/url-cloud-name/');
+
+      // Dynamic Folders asset from another user's asset_folder is rejected with 403
+      const intruderSig = await sha1Hex('public_id=other_folder_img&version=2url_api_secret');
+      const crossFolderVerify = await callWorker(
+        '/api/seller/media/verify',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerLoginJson.token}` },
+          body: JSON.stringify({
+            scope: 'shop',
+            mediaType: 'image',
+            resourceType: 'image',
+            publicId: 'other_folder_img',
+            assetFolder: `sofumer/shops/${buyerUserId}`,
+            version: 2,
+            signature: intruderSig,
+          }),
+        },
+        cldUrlEnv
+      );
+      expect(crossFolderVerify.status).toBe(403);
+
+      // Register shop with Cloudinary logoUrl & bannerUrl
+      const regWithMedia = await callWorker('/api/seller/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${buyerLoginJson.token}` },
+        body: JSON.stringify({
+          sellerType: 'business',
+          legalName: 'Dynamic Folder Studio',
+          shopName: 'Dynamic Folder Studio',
+          countryCode: 'US',
+          logoUrl: uploadedLogoUrl,
+          bannerUrl: uploadedLogoUrl,
+        }),
+      });
+      expect(regWithMedia.status).toBe(201);
+      const regWithMediaJson = await regWithMedia.json();
+      expect(regWithMediaJson.shop.logo_url).toBe(uploadedLogoUrl);
+      expect(regWithMediaJson.shop.banner_url).toBe(uploadedLogoUrl);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 

@@ -1033,6 +1033,117 @@ async function runTests() {
     assert.equal(sellerUserRow.id.length > 0, true);
   });
 
+  await test('Exclusive Admin Mode & Cloudinary onboarding/Dynamic Folder/CLOUDINARY_URL integration checks', async () => {
+    const sha1Hex = (v: string) => crypto.createHash('sha1').update(v).digest('hex');
+    const cldUrlEnv: WorkerEnv = {
+      DB: createSqliteD1Adapter(),
+      TELEGRAM_BOT_TOKEN: TEST_BOT_TOKEN,
+      TELEGRAM_WEBHOOK_SECRET: 'int-webhook-secret',
+      JWT_SECRET: 'integration-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '99990001',
+      CLOUDINARY_URL: 'cloudinary://int_url_key:int_url_secret@int-url-cloud',
+    };
+
+    const runSuffix = Number(crypto.randomInt(100000, 899999));
+    const adminInit = buildSignedTelegramInitData({ id: 99990001, first_name: 'ExclAdmin', username: 'excl_admin' }, TEST_BOT_TOKEN);
+    const shopApplicantInit = buildSignedTelegramInitData({ id: 5300000 + runSuffix, first_name: 'ShopApplicant', username: `shop_app_${runSuffix}` }, TEST_BOT_TOKEN);
+
+    const login = async (initData: string) => {
+      const r = await worker.fetch(
+        new Request('https://sofumer.example/api/auth/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData }),
+        }),
+        cldUrlEnv
+      );
+      assert.equal(r.status, 200);
+      return (await r.json()) as { token: string; isAdmin: boolean; mode: string; user: { id: string } };
+    };
+
+    const adminAuth = await login(adminInit);
+    assert.equal(adminAuth.isAdmin, true);
+    assert.equal(adminAuth.mode, 'admin');
+
+    const adminMeRes = await worker.fetch(
+      new Request('https://sofumer.example/api/auth/me', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      cldUrlEnv
+    );
+    const adminMe = (await adminMeRes.json()) as { mode: string; user: { roles: string[]; aiEnabled: boolean }; sellerProfile: unknown; shop: unknown };
+    assert.equal(adminMe.mode, 'admin');
+    assert.deepEqual(adminMe.user.roles, []);
+    assert.equal(adminMe.user.aiEnabled, false);
+    assert.equal(adminMe.sellerProfile, null);
+    assert.equal(adminMe.shop, null);
+
+    // Admin blocked from buyer/seller/AI routes with 403 ADMIN_MODE_EXCLUSIVE
+    const adminBlockedHome = await worker.fetch(
+      new Request('https://sofumer.example/api/marketplace/home', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      cldUrlEnv
+    );
+    assert.equal(adminBlockedHome.status, 403);
+    const adminBlockedJson = (await adminBlockedHome.json()) as { code: string };
+    assert.equal(adminBlockedJson.code, 'ADMIN_MODE_EXCLUSIVE');
+
+    // Admin settings includes non-secret cloudinaryStatus
+    const adminSettings = await worker.fetch(
+      new Request('https://sofumer.example/api/admin/settings', {
+        headers: { Authorization: `Bearer ${adminAuth.token}` },
+      }),
+      cldUrlEnv
+    );
+    assert.equal(adminSettings.status, 200);
+    const adminSettingsJson = (await adminSettings.json()) as {
+      cloudinaryStatus: { configured: boolean; cloudName: string; source: string };
+    };
+    assert.equal(adminSettingsJson.cloudinaryStatus.configured, true);
+    assert.equal(adminSettingsJson.cloudinaryStatus.cloudName, 'int-url-cloud');
+    assert.equal(adminSettingsJson.cloudinaryStatus.source, 'cloudinary_url');
+    assert.ok(!JSON.stringify(adminSettingsJson).includes('int_url_secret'));
+
+    // Non-seller buyer can access ?scope=shop config & sign upload
+    const appAuth = await login(shopApplicantInit);
+    assert.equal(appAuth.mode, 'marketplace');
+
+    const shopCfgRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/media/config?scope=shop', {
+        headers: { Authorization: `Bearer ${appAuth.token}` },
+      }),
+      cldUrlEnv
+    );
+    assert.equal(shopCfgRes.status, 200);
+
+    const shopSignRes = await worker.fetch(
+      new Request('https://sofumer.example/api/seller/media/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${appAuth.token}` },
+        body: JSON.stringify({
+          scope: 'shop',
+          mediaType: 'image',
+          mimeType: 'image/webp',
+          fileName: 'banner.webp',
+          fileSize: 12000,
+        }),
+      }),
+      cldUrlEnv
+    );
+    assert.equal(shopSignRes.status, 200);
+    const signJson = (await shopSignRes.json()) as {
+      cloudName: string;
+      apiKey: string;
+      folder: string;
+      publicId: string;
+      timestamp: number;
+      signature: string;
+    };
+    assert.equal(signJson.cloudName, 'int-url-cloud');
+    assert.equal(signJson.signature, sha1Hex(`folder=${signJson.folder}&public_id=${signJson.publicId}&timestamp=${signJson.timestamp}int_url_secret`));
+  });
+
   console.log(`\nTest Summary: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);
 }

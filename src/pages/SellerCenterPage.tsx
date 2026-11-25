@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  AlertCircle,
   ArrowLeft,
   Bot,
   Eye,
   ImagePlus,
   KeyRound,
+  Loader2,
   Package,
   Pencil,
   Plus,
   Sparkles,
   Store,
   Trash2,
+  X,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
@@ -19,6 +22,7 @@ import {
   type SellerMediaConfig,
   DEFAULT_MEDIA_CONFIG,
   fetchSellerMediaConfig,
+  fetchShopMediaConfig,
   uploadSignedMediaToCloudinary,
   validateImageFile,
 } from '../lib/cloudinary';
@@ -113,6 +117,9 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [regDesc, setRegDesc] = useState('');
   const [regEmail, setRegEmail] = useState('');
   const [regPhone, setRegPhone] = useState('');
+  const [regLogoUrl, setRegLogoUrl] = useState('');
+  const [regBannerUrl, setRegBannerUrl] = useState('');
+  const [regMediaBusy, setRegMediaBusy] = useState<'logo' | 'banner' | null>(null);
   const [regBusy, setRegBusy] = useState(false);
 
   // Add / Edit Product form state
@@ -140,6 +147,8 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [pReturnPolicy, setPReturnPolicy] = useState('');
   const [pKeywords, setPKeywords] = useState('');
   const [mediaConfig, setMediaConfig] = useState<SellerMediaConfig>(DEFAULT_MEDIA_CONFIG);
+  const [mediaConfigLoading, setMediaConfigLoading] = useState(true);
+  const [mediaConfigError, setMediaConfigError] = useState<string | null>(null);
   const [mediaItems, setMediaItems] = useState<DraftMediaItem[]>([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -151,6 +160,7 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [editShippingPolicy, setEditShippingPolicy] = useState('');
   const [editLogo, setEditLogo] = useState('');
   const [editBanner, setEditBanner] = useState('');
+  const [shopMediaBusy, setShopMediaBusy] = useState<'logo' | 'banner' | null>(null);
   const [verDocType, setVerDocType] = useState('Business Registration / National ID');
   const [verDocRef, setVerDocRef] = useState('');
 
@@ -188,8 +198,26 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
   const [deleteShopReason, setDeleteShopReason] = useState('');
   const [actionBusy, setActionBusy] = useState(false);
 
+  const reloadMediaConfig = useCallback(async () => {
+    if (!user || user.isAdmin || user.mode === 'admin') {
+      setMediaConfigLoading(false);
+      return;
+    }
+    setMediaConfigLoading(true);
+    setMediaConfigError(null);
+    try {
+      const mc = sellerProfile && shop ? await fetchSellerMediaConfig() : await fetchShopMediaConfig();
+      setMediaConfig(mc);
+    } catch (err) {
+      setMediaConfig(DEFAULT_MEDIA_CONFIG);
+      setMediaConfigError(err instanceof Error ? err.message : 'Unable to load Cloudinary upload configuration.');
+    } finally {
+      setMediaConfigLoading(false);
+    }
+  }, [user, sellerProfile, shop]);
+
   const loadSellerData = useCallback(async () => {
-    if (!user || !sellerProfile || !shop) {
+    if (!user || user.isAdmin || user.mode === 'admin' || !sellerProfile || !shop) {
       setDash(null);
       setProducts([]);
       setLoading(false);
@@ -197,14 +225,12 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     }
     setLoading(true);
     try {
-      const [d, p, mc] = await Promise.all([
+      const [d, p] = await Promise.all([
         apiFetch<SellerDashboardData>('/api/seller/dashboard'),
         apiFetch<{ products: Product[] }>('/api/seller/products'),
-        fetchSellerMediaConfig().catch(() => DEFAULT_MEDIA_CONFIG),
       ]);
       setDash(d);
       setProducts(p.products);
-      setMediaConfig(mc);
       setEditShopName(d.shop.name);
       setEditShopDesc(d.shop.description);
       setEditReturnPolicy(d.shop.return_policy);
@@ -223,6 +249,10 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     loadSellerData();
   }, [loadSellerData]);
 
+  useEffect(() => {
+    reloadMediaConfig();
+  }, [reloadMediaConfig]);
+
   if (!user) {
     return (
       <div className="p-8 rounded-2xl bg-[#0E1525] border border-slate-800 text-center space-y-3">
@@ -234,6 +264,10 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
         </button>
       </div>
     );
+  }
+
+  if (user.isAdmin || user.mode === 'admin') {
+    return null;
   }
 
   async function handleRegisterSeller(e: React.FormEvent) {
@@ -250,6 +284,8 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
           description: regDesc,
           contactEmail: regEmail,
           contactPhone: regPhone,
+          logoUrl: regLogoUrl,
+          bannerUrl: regBannerUrl,
         }),
       });
       await refreshSession();
@@ -364,9 +400,124 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
             />
           </div>
 
+          <div className="p-4 rounded-xl bg-[#070B14] border border-slate-800 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-white">Shop Logo & Banner (Optional)</div>
+                <div className="text-[11px] text-slate-400">JPG, JPEG, PNG, or WebP stored on Cloudinary</div>
+              </div>
+              {mediaConfigLoading ? (
+                <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Checking Cloudinary...
+                </span>
+              ) : mediaConfigError ? (
+                <button
+                  type="button"
+                  onClick={reloadMediaConfig}
+                  className="text-[11px] text-red-300 hover:text-white underline"
+                >
+                  Retry media check
+                </button>
+              ) : !mediaConfig.configured ? (
+                <span className="text-[11px] text-amber-300">Cloudinary not configured yet</span>
+              ) : null}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                {regLogoUrl && (
+                  <div className="relative w-20 h-20 rounded-xl overflow-hidden border border-slate-700 bg-[#0E1525]">
+                    <ImageWithFallback src={regLogoUrl} alt="Shop logo preview" className="w-full h-full object-cover" />
+                    <button
+                      type="button"
+                      aria-label="Remove shop logo"
+                      onClick={() => setRegLogoUrl('')}
+                      className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/75 text-white flex items-center justify-center"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+                <label className="h-10 px-3.5 rounded-xl bg-[#0E1525] border border-slate-800 hover:border-slate-700 text-xs text-slate-200 flex items-center justify-center gap-2 cursor-pointer">
+                  {regMediaBusy === 'logo' ? (
+                    <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                  ) : (
+                    <ImagePlus className="w-4 h-4 text-blue-400" />
+                  )}
+                  <span>{regMediaBusy === 'logo' ? 'Uploading Logo...' : regLogoUrl ? 'Replace Logo' : 'Upload Logo'}</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                    disabled={regMediaBusy !== null}
+                    className="hidden"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = '';
+                      if (!f) return;
+                      setRegMediaBusy('logo');
+                      try {
+                        setRegLogoUrl(await uploadShopImage(f));
+                        notify('Shop logo uploaded to Cloudinary.', 'success');
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Logo upload failed', 'error');
+                      } finally {
+                        setRegMediaBusy(null);
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+
+              <div className="space-y-2">
+                {regBannerUrl && (
+                  <div className="relative w-full h-20 rounded-xl overflow-hidden border border-slate-700 bg-[#0E1525]">
+                    <ImageWithFallback src={regBannerUrl} alt="Shop banner preview" className="w-full h-full object-cover" />
+                    <button
+                      type="button"
+                      aria-label="Remove shop banner"
+                      onClick={() => setRegBannerUrl('')}
+                      className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/75 text-white flex items-center justify-center"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+                <label className="h-10 px-3.5 rounded-xl bg-[#0E1525] border border-slate-800 hover:border-slate-700 text-xs text-slate-200 flex items-center justify-center gap-2 cursor-pointer">
+                  {regMediaBusy === 'banner' ? (
+                    <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                  ) : (
+                    <ImagePlus className="w-4 h-4 text-blue-400" />
+                  )}
+                  <span>{regMediaBusy === 'banner' ? 'Uploading Banner...' : regBannerUrl ? 'Replace Banner' : 'Upload Banner'}</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                    disabled={regMediaBusy !== null}
+                    className="hidden"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = '';
+                      if (!f) return;
+                      setRegMediaBusy('banner');
+                      try {
+                        setRegBannerUrl(await uploadShopImage(f));
+                        notify('Shop banner uploaded to Cloudinary.', 'success');
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : 'Banner upload failed', 'error');
+                      } finally {
+                        setRegMediaBusy(null);
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
+          </div>
+
           <button
             type="submit"
-            disabled={regBusy}
+            disabled={regBusy || regMediaBusy !== null}
             className="w-full h-12 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition-colors disabled:opacity-60"
           >
             {regBusy ? 'Creating Storefront...' : 'Create Seller Account & Shop'}
@@ -474,6 +625,12 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
     const check = validateImageFile(file, mediaConfig.maxImageBytes);
     if (check.ok === false) {
       throw new Error(check.error);
+    }
+    if (!mediaConfigLoading && !mediaConfig.configured) {
+      throw new Error(
+        mediaConfigError ||
+          'Cloudinary media uploads are not configured on this Worker yet. Check CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.'
+      );
     }
     const uploaded = await uploadSignedMediaToCloudinary({
       file,
@@ -1464,6 +1621,9 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                 items={mediaItems}
                 onChange={setMediaItems}
                 config={mediaConfig}
+                configLoading={mediaConfigLoading}
+                configError={mediaConfigError}
+                onRetryConfig={reloadMediaConfig}
                 productId={editingProductId || undefined}
                 notify={notify}
               />
@@ -1794,39 +1954,108 @@ export function SellerCenterPage({ initialSection }: { initialSection?: string }
                   <label className="block text-xs text-slate-400 mb-1">Return Policy</label>
                   <input type="text" value={editReturnPolicy} onChange={(e) => setEditReturnPolicy(e.target.value)} className="w-full h-11 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-sm text-white" />
                 </div>
-                <div className="flex flex-wrap gap-3">
-                  <label className="h-10 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-200 flex items-center gap-2 cursor-pointer">
-                    <ImagePlus className="w-4 h-4" />
-                    <span>Upload Logo</span>
-                    <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" className="hidden" onChange={async (e) => {
-                      const f = e.target.files?.[0];
-                      e.target.value = '';
-                      if (!f) return;
-                      try {
-                        setEditLogo(await uploadShopImage(f));
-                        notify('Logo uploaded to Cloudinary. Click Save Settings to apply.', 'success');
-                      } catch (err) {
-                        notify(err instanceof Error ? err.message : 'Logo upload failed', 'error');
-                      }
-                    }} />
-                  </label>
-                  <label className="h-10 px-3.5 rounded-xl bg-[#070B14] border border-slate-800 text-xs text-slate-200 flex items-center gap-2 cursor-pointer">
-                    <ImagePlus className="w-4 h-4" />
-                    <span>Upload Banner</span>
-                    <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" className="hidden" onChange={async (e) => {
-                      const f = e.target.files?.[0];
-                      e.target.value = '';
-                      if (!f) return;
-                      try {
-                        setEditBanner(await uploadShopImage(f));
-                        notify('Banner uploaded to Cloudinary. Click Save Settings to apply.', 'success');
-                      } catch (err) {
-                        notify(err instanceof Error ? err.message : 'Banner upload failed', 'error');
-                      }
-                    }} />
-                  </label>
+                {!mediaConfigLoading && (mediaConfigError || !mediaConfig.configured) && (
+                  <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-700/60 text-xs text-amber-200 flex items-center justify-between gap-2">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>
+                        {mediaConfigError
+                          ? `Cloudinary check failed: ${mediaConfigError}`
+                          : 'Cloudinary is not configured on this Worker yet. Logo and banner uploads require CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.'}
+                      </span>
+                    </div>
+                    {mediaConfigError && (
+                      <button
+                        type="button"
+                        onClick={reloadMediaConfig}
+                        className="h-7 px-2.5 rounded-lg bg-amber-800/70 hover:bg-amber-700 text-white shrink-0"
+                      >
+                        Retry
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  <div className="p-3 rounded-xl bg-[#070B14] border border-slate-800 space-y-2.5">
+                    <div className="text-xs font-medium text-slate-300">Shop Logo</div>
+                    {editLogo && (
+                      <div className="relative w-20 h-20 rounded-xl overflow-hidden border border-slate-700 bg-[#0E1525]">
+                        <ImageWithFallback src={editLogo} alt="Shop logo" className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          aria-label="Remove logo"
+                          onClick={() => setEditLogo('')}
+                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/75 text-white flex items-center justify-center"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    )}
+                    <label className="h-10 px-3.5 rounded-xl bg-[#0E1525] border border-slate-800 hover:border-slate-700 text-xs text-slate-200 flex items-center justify-center gap-2 cursor-pointer">
+                      {shopMediaBusy === 'logo' ? (
+                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                      ) : (
+                        <ImagePlus className="w-4 h-4 text-blue-400" />
+                      )}
+                      <span>{shopMediaBusy === 'logo' ? 'Uploading Logo...' : editLogo ? 'Replace Logo' : 'Upload Logo'}</span>
+                      <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={shopMediaBusy !== null} className="hidden" onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!f) return;
+                        setShopMediaBusy('logo');
+                        try {
+                          setEditLogo(await uploadShopImage(f));
+                          notify('Logo uploaded to Cloudinary. Click Save Settings to apply.', 'success');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Logo upload failed', 'error');
+                        } finally {
+                          setShopMediaBusy(null);
+                        }
+                      }} />
+                    </label>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-[#070B14] border border-slate-800 space-y-2.5">
+                    <div className="text-xs font-medium text-slate-300">Shop Banner</div>
+                    {editBanner && (
+                      <div className="relative w-full h-20 rounded-xl overflow-hidden border border-slate-700 bg-[#0E1525]">
+                        <ImageWithFallback src={editBanner} alt="Shop banner" className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          aria-label="Remove banner"
+                          onClick={() => setEditBanner('')}
+                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/75 text-white flex items-center justify-center"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    )}
+                    <label className="h-10 px-3.5 rounded-xl bg-[#0E1525] border border-slate-800 hover:border-slate-700 text-xs text-slate-200 flex items-center justify-center gap-2 cursor-pointer">
+                      {shopMediaBusy === 'banner' ? (
+                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                      ) : (
+                        <ImagePlus className="w-4 h-4 text-blue-400" />
+                      )}
+                      <span>{shopMediaBusy === 'banner' ? 'Uploading Banner...' : editBanner ? 'Replace Banner' : 'Upload Banner'}</span>
+                      <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={shopMediaBusy !== null} className="hidden" onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!f) return;
+                        setShopMediaBusy('banner');
+                        try {
+                          setEditBanner(await uploadShopImage(f));
+                          notify('Banner uploaded to Cloudinary. Click Save Settings to apply.', 'success');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Banner upload failed', 'error');
+                        } finally {
+                          setShopMediaBusy(null);
+                        }
+                      }} />
+                    </label>
+                  </div>
                 </div>
-                <button type="submit" className="h-11 px-5 rounded-xl bg-blue-600 text-white text-sm font-semibold">
+                <button type="submit" disabled={shopMediaBusy !== null} className="h-11 px-5 rounded-xl bg-blue-600 text-white text-sm font-semibold disabled:opacity-60">
                   Save Settings
                 </button>
               </form>

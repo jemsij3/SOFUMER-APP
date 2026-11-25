@@ -5,7 +5,7 @@ import {
   PAID_ORDER_STATUSES,
   isSafeUrlOrEmpty,
   rateLimit,
-  requireAuth,
+  requireNonAdminMarketplaceUser,
   sanitizeSafeUrl,
   sanitizeText,
 } from '../security.ts';
@@ -17,7 +17,7 @@ export const messagingOrdersRouter = Router();
 // MESSAGING & INQUIRIES
 // ============================================================================
 
-messagingOrdersRouter.get('/conversations', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/conversations', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const rows = db
     .prepare(
@@ -40,7 +40,7 @@ messagingOrdersRouter.get('/conversations', requireAuth, (req, res) => {
   res.json({ conversations: rows });
 });
 
-messagingOrdersRouter.post('/conversations', requireAuth, rateLimit(20, 60_000, 'msg'), async (req, res) => {
+messagingOrdersRouter.post('/conversations', requireNonAdminMarketplaceUser, rateLimit(20, 60_000, 'msg'), async (req, res) => {
   const buyerId = req.authUser!.id;
   const productId = sanitizeText(req.body?.productId || '', 64) || null;
   const shopIdInput = sanitizeText(req.body?.shopId || '', 64) || null;
@@ -187,7 +187,7 @@ messagingOrdersRouter.post('/conversations', requireAuth, rateLimit(20, 60_000, 
   res.status(201).json({ conversationId });
 });
 
-messagingOrdersRouter.get('/conversations/:id/messages', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/conversations/:id/messages', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const convId = req.params.id;
 
@@ -217,7 +217,7 @@ messagingOrdersRouter.get('/conversations/:id/messages', requireAuth, (req, res)
   res.json({ messages });
 });
 
-messagingOrdersRouter.post('/conversations/:id/messages', requireAuth, rateLimit(40, 60_000, 'msg'), async (req, res) => {
+messagingOrdersRouter.post('/conversations/:id/messages', requireNonAdminMarketplaceUser, rateLimit(40, 60_000, 'msg'), async (req, res) => {
   const userId = req.authUser!.id;
   const convId = req.params.id;
 
@@ -300,7 +300,7 @@ messagingOrdersRouter.post('/conversations/:id/messages', requireAuth, rateLimit
   res.status(201).json({ message: created });
 });
 
-messagingOrdersRouter.delete('/conversations/:id/messages/:messageId', requireAuth, (req, res) => {
+messagingOrdersRouter.delete('/conversations/:id/messages/:messageId', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const { id: convId, messageId } = req.params;
 
@@ -354,7 +354,7 @@ messagingOrdersRouter.delete('/conversations/:id/messages/:messageId', requireAu
   res.json({ deleted: true, messageId });
 });
 
-messagingOrdersRouter.delete('/conversations/:id', requireAuth, (req, res) => {
+messagingOrdersRouter.delete('/conversations/:id', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const convId = req.params.id;
   const part = db
@@ -370,7 +370,7 @@ messagingOrdersRouter.delete('/conversations/:id', requireAuth, (req, res) => {
   res.json({ hidden: true, deleted: true, conversationId: convId });
 });
 
-messagingOrdersRouter.get('/users/blocks', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/users/blocks', requireNonAdminMarketplaceUser, (req, res) => {
   const blocks = db
     .prepare(
       `SELECT ub.*, u.display_name, u.telegram_username
@@ -382,7 +382,7 @@ messagingOrdersRouter.get('/users/blocks', requireAuth, (req, res) => {
   res.json({ blocks });
 });
 
-messagingOrdersRouter.post('/users/block', requireAuth, (req, res) => {
+messagingOrdersRouter.post('/users/block', requireNonAdminMarketplaceUser, (req, res) => {
   const targetUserId = sanitizeText(req.body?.userId || '', 64);
   const reason = sanitizeText(req.body?.reason || '', 200);
   if (!targetUserId || targetUserId === req.authUser!.id) {
@@ -395,7 +395,7 @@ messagingOrdersRouter.post('/users/block', requireAuth, (req, res) => {
   res.json({ blocked: true });
 });
 
-messagingOrdersRouter.delete('/users/block/:userId', requireAuth, (req, res) => {
+messagingOrdersRouter.delete('/users/block/:userId', requireNonAdminMarketplaceUser, (req, res) => {
   db.prepare('DELETE FROM user_blocks WHERE blocker_user_id = ? AND blocked_user_id = ?').run(
     req.authUser!.id,
     req.params.userId
@@ -407,7 +407,7 @@ messagingOrdersRouter.delete('/users/block/:userId', requireAuth, (req, res) => 
 // DIRECT TRANSACTION ORDERS & STATUS HISTORY
 // ============================================================================
 
-messagingOrdersRouter.get('/orders', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/orders', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const role = String(req.query.role || 'all');
 
@@ -442,7 +442,7 @@ messagingOrdersRouter.get('/orders', requireAuth, (req, res) => {
   res.json({ orders });
 });
 
-messagingOrdersRouter.get('/orders/:id', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/orders/:id', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const order = db
     .prepare(
@@ -478,7 +478,7 @@ messagingOrdersRouter.get('/orders/:id', requireAuth, (req, res) => {
 });
 
 // Seller records the agreed direct transaction order (Step 5)
-messagingOrdersRouter.post('/orders', requireAuth, async (req, res) => {
+messagingOrdersRouter.post('/orders', requireNonAdminMarketplaceUser, async (req, res) => {
   const userId = req.authUser!.id;
   const productId = sanitizeText(req.body?.productId || '', 64);
   const buyerUserId = sanitizeText(req.body?.buyerUserId || '', 64);
@@ -574,7 +574,7 @@ messagingOrdersRouter.post('/orders', requireAuth, async (req, res) => {
   res.status(201).json({ orderId, orderNumber, status: 'Pending Confirmation' });
 });
 
-messagingOrdersRouter.patch('/orders/:id/status', requireAuth, async (req, res) => {
+messagingOrdersRouter.patch('/orders/:id/status', requireNonAdminMarketplaceUser, async (req, res) => {
   const userId = req.authUser!.id;
   const newStatus = String(req.body?.status || '');
   const note = sanitizeText(req.body?.note || '', 500);
@@ -663,7 +663,7 @@ messagingOrdersRouter.patch('/orders/:id/status', requireAuth, async (req, res) 
   res.json({ orderId: order.id, oldStatus: currentStatus, newStatus });
 });
 
-messagingOrdersRouter.post('/orders/:id/review', requireAuth, (req, res) => {
+messagingOrdersRouter.post('/orders/:id/review', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const rating = Math.round(Number(req.body?.rating || 0));
   const comment = sanitizeText(req.body?.comment || '', 1200);
@@ -730,7 +730,7 @@ function resolveLicenseKeyLocal(template: string, orderNumber: string): string {
   return `${clean}-${orderNumber}`;
 }
 
-messagingOrdersRouter.get('/orders/:id/digital', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/orders/:id/digital', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const order = db
     .prepare('SELECT * FROM orders WHERE id = ? AND (buyer_user_id = ? OR seller_user_id = ?)')
@@ -786,7 +786,7 @@ messagingOrdersRouter.get('/orders/:id/digital', requireAuth, (req, res) => {
   });
 });
 
-messagingOrdersRouter.get('/orders/:id/digital/:productId/download', requireAuth, (req, res) => {
+messagingOrdersRouter.get('/orders/:id/digital/:productId/download', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const order = db
     .prepare('SELECT * FROM orders WHERE id = ? AND (buyer_user_id = ? OR seller_user_id = ?)')

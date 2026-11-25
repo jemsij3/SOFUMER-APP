@@ -20,6 +20,7 @@ import {
   methodNotAllowed,
   newId,
   parseJsonBody,
+  requireEdgeNonAdminUser,
   requireEdgeUser,
   resolveEdgeAdminContext,
   resolveEdgeUserSessionDetailed,
@@ -32,6 +33,7 @@ import {
   verifyCookieCsrfEdge,
   verifyTelegramInitDataEdge,
 } from './helpers.ts';
+import { getCloudinaryConfigState } from './cloudinary.ts';
 import { handleMarketplaceRoutes } from './routes-marketplace.ts';
 import { handleSellerRoutes } from './routes-seller.ts';
 import { handleCommerceAndAccountRoutes } from './routes-commerce.ts';
@@ -404,15 +406,17 @@ async function handleAuthRoutes(
           userId = String(existing.id);
         }
 
-        await env.DB.prepare(
-          `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
-        )
-          .bind(newId('role'), userId)
-          .run();
+        if (!isAdmin) {
+          await env.DB.prepare(
+            `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
+          )
+            .bind(newId('role'), userId)
+            .run();
 
-        await env.DB.prepare(`INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`)
-          .bind(userId)
-          .run();
+          await env.DB.prepare(`INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`)
+            .bind(userId)
+            .run();
+        }
       } else {
         userId = String(existing.id);
         if (existing.status === 'suspended') {
@@ -444,6 +448,12 @@ async function handleAuthRoutes(
             safePhotoUrl,
             userId
           )
+          .run();
+      }
+
+      if (isAdmin) {
+        await env.DB.prepare("DELETE FROM user_roles WHERE user_id = ? AND role = 'buyer'")
+          .bind(userId)
           .run();
       }
 
@@ -512,6 +522,7 @@ async function handleAuthRoutes(
           token: jwtToken,
           expiresAt,
           isAdmin,
+          mode: isAdmin ? 'admin' : 'marketplace',
           diagnostics: {
             receivedInitData: true,
             initDataLength: rawInitData.length,
@@ -608,6 +619,28 @@ async function handleAuthRoutes(
     const user = sessionRes.user;
     const db = env.DB;
 
+    if (user.isAdmin) {
+      return json(
+        {
+          authenticated: true,
+          mode: 'admin',
+          user: {
+            ...user,
+            mode: 'admin',
+            roles: [],
+            aiEnabled: false,
+          },
+          sellerProfile: null,
+          shop: null,
+          unreadMessages: 0,
+          unreadNotifications: 0,
+          favoriteProductIds: [],
+        },
+        200,
+        AUTH_NO_STORE_HEADERS
+      );
+    }
+
     const safeQuery = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
       try {
         return await fn();
@@ -637,7 +670,7 @@ async function handleAuthRoutes(
         )
       : null;
 
-    const [unreadMsgs, unreadNotifs, favorites, aiPerm] = await Promise.all([
+    const [unreadMsgs, unreadNotifs, favorites, aiPerm, roleRows] = await Promise.all([
       safeQuery(async () => {
         try {
           return await db
@@ -681,13 +714,24 @@ async function handleAuthRoutes(
             .first<{ ai_enabled: number }>(),
         null
       ),
+      safeQuery(
+        () =>
+          db
+            .prepare('SELECT role FROM user_roles WHERE user_id = ?')
+            .bind(user.id)
+            .all<{ role: string }>(),
+        { results: [] as Array<{ role: string }> }
+      ),
     ]);
 
     return json(
       {
         authenticated: true,
+        mode: 'marketplace',
         user: {
           ...user,
+          mode: 'marketplace',
+          roles: (roleRows?.results || []).map((r) => r.role),
           aiEnabled: aiPerm ? Boolean(aiPerm.ai_enabled) : true,
         },
         sellerProfile: sellerProfile || null,
@@ -739,7 +783,7 @@ async function handleMediaRoutes(
 
   if (url.pathname === '/api/uploads') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     return json(
       { error: 'Media upload storage (R2) is temporarily disabled and will be added later.' },
@@ -817,6 +861,7 @@ export default {
             ? env.CLOUDFLARE_AI_MODEL
             : DEFAULT_CF_AI_MODEL,
           telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
+          cloudinaryConfigured: getCloudinaryConfigState(env).configured,
           dbBound: Boolean(env.DB),
           dbInitialized,
           aiBound: Boolean(env.AI),

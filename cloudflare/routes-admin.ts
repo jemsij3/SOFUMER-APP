@@ -23,7 +23,7 @@ import {
   sanitizeText,
   slugify,
 } from './helpers.ts';
-import { destroyUnreferencedCloudinaryAssets } from './cloudinary.ts';
+import { destroyUnreferencedCloudinaryAssets, getCloudinaryPublicDiagnostics } from './cloudinary.ts';
 import { executeEdgeShopSoftDelete } from './routes-seller.ts';
 import {
   coerceAiString,
@@ -1914,6 +1914,7 @@ async function handleAdminRoutesInner(
         roleAssignments: roleAssignments.results,
         permissionCatalog: ADMIN_PERMISSION_CATALOG,
         envOwnerTelegramIds: getEnvOwnerTelegramIds(env),
+        cloudinaryStatus: getCloudinaryPublicDiagnostics(env),
       });
     }
 

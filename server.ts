@@ -12,6 +12,7 @@ import { accountAiRouter } from './server/routes/account_ai.ts';
 import { adminRouter } from './server/routes/admin.ts';
 import { processTelegramWebhookUpdate, verifyWebhookSecret } from './server/telegram.ts';
 import { verifyCookieCsrf } from './server/security.ts';
+import { getCloudinaryConfigState } from './server/cloudinary.ts';
 
 async function startServer() {
   runMigrations();
@@ -50,6 +51,7 @@ async function startServer() {
     res.json({
       service: 'SOFUMER',
       status: 'ok',
+      cloudinaryConfigured: getCloudinaryConfigState().configured,
       timestamp: new Date().toISOString(),
     });
   });

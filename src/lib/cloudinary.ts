@@ -71,6 +71,10 @@ export async function fetchSellerMediaConfig(): Promise<SellerMediaConfig> {
   return apiFetch<SellerMediaConfig>('/api/seller/media/config');
 }
 
+export async function fetchShopMediaConfig(): Promise<SellerMediaConfig> {
+  return apiFetch<SellerMediaConfig>('/api/seller/media/config?scope=shop');
+}
+
 function getExtension(name: string): string {
   const cleaned = String(name || '').trim().toLowerCase();
   const idx = cleaned.lastIndexOf('.');
@@ -227,6 +231,10 @@ export async function uploadSignedMediaToCloudinary(options: {
     }),
   });
 
+  if (!signParams.apiKey || !signParams.signature || !signParams.uploadUrl) {
+    throw new Error('Cloudinary upload signing did not return valid upload credentials.');
+  }
+
   if (signal?.aborted) {
     throw new Error('Upload cancelled.');
   }
@@ -296,6 +304,7 @@ export async function uploadSignedMediaToCloudinary(options: {
       body: JSON.stringify({
         scope,
         publicId,
+        assetFolder: cloudinaryPayload.asset_folder,
         version,
         signature: responseSignature,
         secureUrl: cloudinaryPayload.secure_url,

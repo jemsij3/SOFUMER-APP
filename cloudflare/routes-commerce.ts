@@ -8,7 +8,7 @@ import {
   newId,
   notifyUserAndTelegramEdge,
   parseJsonBody,
-  requireEdgeUser,
+  requireEdgeNonAdminUser,
   sanitizeText,
 } from './helpers.ts';
 
@@ -43,7 +43,7 @@ export async function handleCommerceAndAccountRoutes(
   // Conversations list / create
   if (path === '/api/conversations') {
     if (request.method === 'GET') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const rows = await env.DB.prepare(
         `SELECT c.*, cp.unread_count, cp.role as my_role,
@@ -67,7 +67,7 @@ export async function handleCommerceAndAccountRoutes(
     }
 
     if (request.method === 'POST') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
       if (limited) return limited;
@@ -225,7 +225,7 @@ export async function handleCommerceAndAccountRoutes(
   if (path.startsWith('/api/conversations/') && path.endsWith('/messages')) {
     const convId = decodeURIComponent(path.slice('/api/conversations/'.length, -'/messages'.length));
     if (request.method === 'GET') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const participant = await env.DB.prepare(
         'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?'
@@ -252,7 +252,7 @@ export async function handleCommerceAndAccountRoutes(
     }
 
     if (request.method === 'POST') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
       if (limited) return limited;
@@ -346,7 +346,7 @@ export async function handleCommerceAndAccountRoutes(
   const convMsgMatch = path.match(/^\/api\/conversations\/([^/]+)\/messages\/([^/]+)$/);
   if (convMsgMatch) {
     if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const convId = decodeURIComponent(convMsgMatch[1]);
     const messageId = decodeURIComponent(convMsgMatch[2]);
@@ -403,7 +403,7 @@ export async function handleCommerceAndAccountRoutes(
   const singleConvMatch = path.match(/^\/api\/conversations\/([^/]+)$/);
   if (singleConvMatch) {
     if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const convId = decodeURIComponent(singleConvMatch[1]);
     const part = await env.DB.prepare(
@@ -424,7 +424,7 @@ export async function handleCommerceAndAccountRoutes(
   // User blocks
   if (path === '/api/users/blocks') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const blocks = await env.DB.prepare(
       `SELECT ub.*, u.display_name, u.telegram_username
@@ -438,7 +438,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path === '/api/users/block') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
     if (limited) return limited;
@@ -461,7 +461,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/users/block/')) {
     if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const targetId = decodeURIComponent(path.slice('/api/users/block/'.length));
     await env.DB.prepare('DELETE FROM user_blocks WHERE blocker_user_id = ? AND blocked_user_id = ?')
@@ -473,7 +473,7 @@ export async function handleCommerceAndAccountRoutes(
   // Direct Orders
   if (path === '/api/orders') {
     if (request.method === 'GET') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const role = String(url.searchParams.get('role') || 'all');
       let where = '(o.buyer_user_id = ? OR o.seller_user_id = ?)';
@@ -500,7 +500,7 @@ export async function handleCommerceAndAccountRoutes(
     }
 
     if (request.method === 'POST') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
       if (limited) return limited;
@@ -608,7 +608,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/orders/') && path.endsWith('/status')) {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
     if (limited) return limited;
@@ -685,7 +685,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/orders/') && path.endsWith('/review')) {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const limited = await checkEdgeRateLimit(request, env, 'commerce', 120, 60, auth.user.id);
     if (limited) return limited;
@@ -745,7 +745,7 @@ export async function handleCommerceAndAccountRoutes(
   // Protected Digital Product Delivery for confirmed/completed orders
   if (path.startsWith('/api/orders/') && path.endsWith('/digital')) {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const orderId = decodeURIComponent(path.slice('/api/orders/'.length, -'/digital'.length));
 
@@ -804,7 +804,7 @@ export async function handleCommerceAndAccountRoutes(
   const digitalDlMatch = path.match(/^\/api\/orders\/([^/]+)\/digital\/([^/]+)\/download$/);
   if (digitalDlMatch) {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const orderId = decodeURIComponent(digitalDlMatch[1]);
     const productId = decodeURIComponent(digitalDlMatch[2]);
@@ -910,7 +910,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/orders/')) {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const orderId = decodeURIComponent(path.slice('/api/orders/'.length));
     const order = await env.DB.prepare(
@@ -942,7 +942,7 @@ export async function handleCommerceAndAccountRoutes(
   // Account routes
   if (path === '/api/account/profile') {
     if (request.method !== 'PATCH') return methodNotAllowed(['PATCH']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
@@ -979,7 +979,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path === '/api/account/notifications') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const items = await env.DB.prepare(
       `SELECT * FROM notifications WHERE user_id = ? OR scope = 'global' ORDER BY created_at DESC LIMIT 50`
@@ -991,13 +991,13 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path === '/api/account/notifications/read') {
     if (request.method === 'PATCH') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       await env.DB.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').bind(auth.user.id).run();
       return json({ read: true });
     }
     if (request.method === 'DELETE') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const del = await env.DB.prepare(
         "DELETE FROM notifications WHERE user_id = ? AND is_read = 1 AND scope = 'user'"
@@ -1011,7 +1011,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/account/notifications/')) {
     if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const notifId = decodeURIComponent(path.slice('/api/account/notifications/'.length));
     const notif = await env.DB.prepare('SELECT id, user_id, scope FROM notifications WHERE id = ?')
@@ -1032,7 +1032,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path === '/api/account/support') {
     if (request.method === 'GET') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const tickets = await env.DB.prepare(
         'SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC'
@@ -1042,7 +1042,7 @@ export async function handleCommerceAndAccountRoutes(
       return json({ tickets: tickets.results });
     }
     if (request.method === 'POST') {
-      const auth = await requireEdgeUser(request, env);
+      const auth = await requireEdgeNonAdminUser(request, env);
       if ('error' in auth) return auth.error;
       const body = await parseJsonBody(request);
       if (!body.ok) return body.error;
@@ -1063,7 +1063,7 @@ export async function handleCommerceAndAccountRoutes(
 
   if (path.startsWith('/api/account/support/')) {
     if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const ticketId = decodeURIComponent(path.slice('/api/account/support/'.length));
     const ticket = await env.DB.prepare('SELECT id, user_id, status FROM support_tickets WHERE id = ? AND user_id = ?')

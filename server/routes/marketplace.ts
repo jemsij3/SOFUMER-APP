@@ -1,9 +1,11 @@
 import { Router } from 'express';
 import { db, newId } from '../db.ts';
-import { escapeSqlLike, requireAuth, sanitizeText } from '../security.ts';
+import { escapeSqlLike, requireAuth, requireNonAdminMarketplaceUser, sanitizeText } from '../security.ts';
 
 export const marketplaceRouter = Router();
-marketplaceRouter.use(requireAuth);
+marketplaceRouter.use((req, res, next) =>
+  req.path === '/bootstrap' ? requireAuth(req, res, next) : requireNonAdminMarketplaceUser(req, res, next)
+);
 
 const PRODUCT_SELECT = `
   SELECT p.*,
@@ -382,7 +384,7 @@ marketplaceRouter.get('/shops/:slug', (req, res) => {
   res.json({ shop, products, reviews });
 });
 
-marketplaceRouter.post('/favorites/:productId', requireAuth, (req, res) => {
+marketplaceRouter.post('/favorites/:productId', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const productId = req.params.productId;
   const prod = db
@@ -415,7 +417,7 @@ marketplaceRouter.post('/favorites/:productId', requireAuth, (req, res) => {
   }
 });
 
-marketplaceRouter.delete('/favorites/:productId', requireAuth, (req, res) => {
+marketplaceRouter.delete('/favorites/:productId', requireNonAdminMarketplaceUser, (req, res) => {
   const userId = req.authUser!.id;
   const productId = req.params.productId;
   const existing = db
@@ -428,7 +430,7 @@ marketplaceRouter.delete('/favorites/:productId', requireAuth, (req, res) => {
   res.json({ favorited: false, removed: true });
 });
 
-marketplaceRouter.get('/favorites', requireAuth, (req, res) => {
+marketplaceRouter.get('/favorites', requireNonAdminMarketplaceUser, (req, res) => {
   const items = db
     .prepare(
       `${PRODUCT_SELECT}
@@ -440,7 +442,7 @@ marketplaceRouter.get('/favorites', requireAuth, (req, res) => {
   res.json({ items });
 });
 
-marketplaceRouter.get('/recently-viewed', requireAuth, (req, res) => {
+marketplaceRouter.get('/recently-viewed', requireNonAdminMarketplaceUser, (req, res) => {
   const items = db
     .prepare(
       `${PRODUCT_SELECT}
@@ -453,12 +455,12 @@ marketplaceRouter.get('/recently-viewed', requireAuth, (req, res) => {
   res.json({ items });
 });
 
-marketplaceRouter.delete('/recently-viewed', requireAuth, (req, res) => {
+marketplaceRouter.delete('/recently-viewed', requireNonAdminMarketplaceUser, (req, res) => {
   const info = db.prepare('DELETE FROM recently_viewed WHERE user_id = ?').run(req.authUser!.id);
   res.json({ cleared: true, deletedCount: info.changes });
 });
 
-marketplaceRouter.delete('/recently-viewed/:productId', requireAuth, (req, res) => {
+marketplaceRouter.delete('/recently-viewed/:productId', requireNonAdminMarketplaceUser, (req, res) => {
   db.prepare('DELETE FROM recently_viewed WHERE user_id = ? AND product_id = ?').run(
     req.authUser!.id,
     req.params.productId
@@ -466,7 +468,7 @@ marketplaceRouter.delete('/recently-viewed/:productId', requireAuth, (req, res) 
   res.json({ removed: true });
 });
 
-marketplaceRouter.post('/reports', requireAuth, (req, res) => {
+marketplaceRouter.post('/reports', requireNonAdminMarketplaceUser, (req, res) => {
   const targetType = String(req.body?.targetType || '');
   const targetId = sanitizeText(req.body?.targetId || '', 64);
   const reason = sanitizeText(req.body?.reason || '', 120);

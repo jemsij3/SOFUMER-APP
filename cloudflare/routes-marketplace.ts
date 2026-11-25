@@ -1,5 +1,6 @@
 import {
   type Env,
+  ADMIN_EXCLUSIVE_MODE_ERROR,
   escapeSqlLike,
   json,
   methodNotAllowed,
@@ -78,6 +79,16 @@ export async function handleMarketplaceRoutes(
       announcement: announcementRow?.value || '',
       sellerRegistrationEnabled: regEnabled?.value !== 'false',
     });
+  }
+
+  if (authUser.isAdmin) {
+    return json(
+      {
+        error: ADMIN_EXCLUSIVE_MODE_ERROR,
+        code: 'ADMIN_MODE_EXCLUSIVE',
+      },
+      403
+    );
   }
 
   if (sub === '/home') {

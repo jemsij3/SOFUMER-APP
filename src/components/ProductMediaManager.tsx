@@ -36,6 +36,9 @@ interface Props {
   items: DraftMediaItem[];
   onChange: React.Dispatch<React.SetStateAction<DraftMediaItem[]>>;
   config: SellerMediaConfig;
+  configLoading?: boolean;
+  configError?: string | null;
+  onRetryConfig?: () => void;
   productId?: string;
   notify: (msg: string, type?: 'success' | 'error' | 'info') => void;
 }
@@ -44,6 +47,9 @@ export function ProductMediaManager({
   items,
   onChange,
   config,
+  configLoading = false,
+  configError = null,
+  onRetryConfig,
   productId,
   notify,
 }: Props) {
@@ -424,14 +430,35 @@ export function ProductMediaManager({
         </div>
       </div>
 
-      {!config.configured && (
+      {configLoading ? (
+        <div className="p-3 rounded-xl bg-[#0E1525] border border-slate-800 text-xs text-slate-300 flex items-center gap-2">
+          <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+          <span>Checking Cloudinary media configuration...</span>
+        </div>
+      ) : configError ? (
+        <div className="p-3 rounded-xl bg-red-950/40 border border-red-700/60 text-xs text-red-200 flex items-center justify-between gap-2">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>Could not load Cloudinary upload configuration: {configError}</span>
+          </div>
+          {onRetryConfig && (
+            <button
+              type="button"
+              onClick={onRetryConfig}
+              className="h-7 px-2.5 rounded-lg bg-red-800/70 hover:bg-red-700 text-white font-medium shrink-0"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      ) : !config.configured ? (
         <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-700/60 text-xs text-amber-200 flex items-start gap-2">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <span>
-            Cloudinary media uploads are not available on this environment yet. Contact the marketplace administrator if uploads remain disabled.
+            Cloudinary media uploads are not available on this environment yet. Check CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in Worker settings.
           </span>
         </div>
-      )}
+      ) : null}
 
       {validationError && (
         <div className="p-3 rounded-xl bg-red-950/50 border border-red-700/70 text-xs text-red-200 flex items-start justify-between gap-2">

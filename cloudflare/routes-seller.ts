@@ -15,8 +15,8 @@ import {
   notifyUserAndTelegramEdge,
   parseJsonBody,
   recordEdgeAdminAudit,
+  requireEdgeNonAdminUser,
   requireEdgeSeller,
-  requireEdgeUser,
   sanitizeSafeUrl,
   sanitizeText,
   slugify,
@@ -374,7 +374,10 @@ export async function handleSellerRoutes(
 
   if (sub === '/media/config') {
     if (request.method !== 'GET') return methodNotAllowed(['GET']);
-    const auth = await requireEdgeSeller(request, env);
+    const isShopOnboarding = url.searchParams.get('scope') === 'shop';
+    const auth = isShopOnboarding
+      ? await requireEdgeNonAdminUser(request, env)
+      : await requireEdgeSeller(request, env);
     if ('error' in auth) return auth.error;
     const config = getCloudinaryConfigState(env);
     const limits = await getMediaLimitsFromDb(env.DB);
@@ -393,10 +396,15 @@ export async function handleSellerRoutes(
 
   if (sub === '/media/sign') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeSeller(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
+
+    if (body.data.scope !== 'shop') {
+      const sellerAuth = await requireEdgeSeller(request, env);
+      if ('error' in sellerAuth) return sellerAuth.error;
+    }
 
     const config = getCloudinaryConfigState(env);
     if (!config.configured) {
@@ -414,7 +422,7 @@ export async function handleSellerRoutes(
 
     const productId = sanitizeText(body.data.productId || '', 64);
     const replaceMediaId = sanitizeText(body.data.replaceMediaId || '', 64);
-    if (productId) {
+    if (productId && validated.scope !== 'shop') {
       const product = await env.DB.prepare(
         'SELECT id FROM products WHERE id = ? AND seller_user_id = ?'
       )
@@ -504,16 +512,22 @@ export async function handleSellerRoutes(
 
   if (sub === '/media/verify') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeSeller(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;
+
+    const scope = body.data.scope === 'shop' ? 'shop' : 'product';
+    if (scope !== 'shop') {
+      const sellerAuth = await requireEdgeSeller(request, env);
+      if ('error' in sellerAuth) return sellerAuth.error;
+    }
 
     const limits = await getMediaLimitsFromDb(env.DB);
     const result = await verifyUploadedCloudinaryAsset({
       env,
       sellerUserId: auth.user.id,
-      scope: body.data.scope === 'shop' ? 'shop' : 'product',
+      scope,
       input: body.data as SubmittedMediaInput,
       limits,
     });
@@ -527,7 +541,7 @@ export async function handleSellerRoutes(
 
   if (sub === '/register') {
     if (request.method !== 'POST') return methodNotAllowed(['POST']);
-    const auth = await requireEdgeUser(request, env);
+    const auth = await requireEdgeNonAdminUser(request, env);
     if ('error' in auth) return auth.error;
     const body = await parseJsonBody(request);
     if (!body.ok) return body.error;

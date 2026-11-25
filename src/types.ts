@@ -69,6 +69,7 @@ export interface User {
   preferred_language: string;
   status: string;
   roles: string[];
+  mode?: 'admin' | 'marketplace';
   isAdmin?: boolean;
   aiEnabled?: boolean;
 }

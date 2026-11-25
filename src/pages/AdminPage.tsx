@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Archive, ArrowLeft, Bot, Lock, RefreshCw, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, Bot, CheckCircle2, Lock, LogOut, RefreshCw, ShieldAlert, ShieldCheck, Trash2, XCircle } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiFetch } from '../lib/api';
 import { safeStringArray, safeText } from '../lib/aiFormat';
@@ -227,7 +227,7 @@ interface AiFeatureDraft {
 }
 
 export function AdminPage() {
-  const { user, switchTab, refreshBootstrap, notify } = useApp();
+  const { user, switchTab, refreshBootstrap, logout, notify } = useApp();
 
   const [adminSession, setAdminSession] = useState<AdminSession | null>(null);
   const [permissionCatalog, setPermissionCatalog] = useState<PermissionCatalogItem[]>([]);
@@ -335,6 +335,14 @@ export function AdminPage() {
     permissions: Array<Record<string, unknown>>;
     roleAssignments?: Array<Record<string, unknown>>;
     envOwnerTelegramIds?: string[];
+    cloudinaryStatus?: {
+      configured: boolean;
+      cloudName: string;
+      hasCloudName: boolean;
+      hasApiKey: boolean;
+      hasApiSecret: boolean;
+      source: 'individual_vars' | 'cloudinary_url' | 'mixed' | 'missing';
+    };
   } | null>(null);
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [savingSettings, setSavingSettings] = useState(false);
@@ -714,12 +722,15 @@ export function AdminPage() {
   }
 
   if (!adminSession) {
+    const isAdminAccount = Boolean(user?.isAdmin || user?.mode === 'admin');
     return (
       <div className="max-w-md mx-auto py-10 space-y-5">
-        <button type="button" onClick={() => switchTab('home')} className="inline-flex items-center gap-2 text-sm text-slate-300 hover:text-white">
-          <ArrowLeft className="w-4 h-4" />
-          <span>Return to Marketplace</span>
-        </button>
+        {!isAdminAccount && (
+          <button type="button" onClick={() => switchTab('home')} className="inline-flex items-center gap-2 text-sm text-slate-300 hover:text-white">
+            <ArrowLeft className="w-4 h-4" />
+            <span>Return to Marketplace</span>
+          </button>
+        )}
 
         <div className="p-6 sm:p-7 rounded-2xl bg-[#0E1525] border border-slate-800 space-y-4">
           <div className="flex items-center gap-3">
@@ -742,13 +753,24 @@ export function AdminPage() {
             </div>
           )}
 
-          <button
-            type="button"
-            onClick={() => switchTab('home')}
-            className="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold"
-          >
-            Return to Marketplace
-          </button>
+          {isAdminAccount ? (
+            <button
+              type="button"
+              onClick={() => logout()}
+              className="w-full h-11 rounded-xl bg-red-950/70 hover:bg-red-900/70 border border-red-800/60 text-red-100 text-sm font-semibold inline-flex items-center justify-center gap-2"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Logout</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => switchTab('home')}
+              className="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold"
+            >
+              Return to Marketplace
+            </button>
+          )}
         </div>
       </div>
     );
@@ -757,23 +779,47 @@ export function AdminPage() {
   const activeRoleObj = rbacData?.roles.find((r) => String(r.id) === selectedRoleId);
   const isOwnerRoleSelected =
     selectedRoleId === 'role_owner' || String(activeRoleObj?.code || '') === 'OWNER';
+  const isExclusiveAdmin = Boolean(user?.isAdmin || user?.mode === 'admin');
 
   return (
     <div className="space-y-6 pb-12">
       {/* Admin Top Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-800">
         <div className="flex items-center gap-3">
-          <ShieldCheck className="w-6 h-6 text-purple-400" />
+          <ShieldCheck className="w-6 h-6 text-purple-400 shrink-0" />
           <div>
-            <h1 className="text-lg font-bold text-white">SOFUMER Governance Console</h1>
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-lg font-bold text-white">SOFUMER Governance Console</h1>
+              <span className="px-2 py-0.5 rounded-md bg-purple-950/70 border border-purple-700/60 text-[10px] font-semibold uppercase tracking-wider text-purple-200">
+                Exclusive Admin Mode
+              </span>
+            </div>
             <p className="text-xs text-slate-400">
               Signed in via Telegram as {adminSession.adminIdentifier} · Role: {adminSession.roleName || adminSession.role} ({adminSession.role})
             </p>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button type="button" onClick={() => switchTab('home')} className="h-9 px-3.5 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-slate-200 hover:border-slate-700">
-            Marketplace View
+          <button
+            type="button"
+            onClick={() => loadTabData(tab)}
+            className="h-9 px-3 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-slate-200 hover:border-slate-700 inline-flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Refresh</span>
+          </button>
+          {!isExclusiveAdmin && (
+            <button type="button" onClick={() => switchTab('home')} className="h-9 px-3.5 rounded-lg bg-[#0E1525] border border-slate-800 text-xs text-slate-200 hover:border-slate-700">
+              Marketplace View
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => logout()}
+            className="h-9 px-3 rounded-lg bg-red-950/50 border border-red-800/60 text-xs text-red-200 hover:bg-red-900/60 inline-flex items-center gap-1.5"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Logout</span>
           </button>
         </div>
       </div>
@@ -3637,6 +3683,84 @@ export function AdminPage() {
                     >
                       {savingSettings ? 'Saving...' : 'Save Settings'}
                     </button>
+                  </div>
+                </div>
+              )}
+
+              {settingsData.cloudinaryStatus && (
+                <div className="bg-[#0E1525] border border-slate-800 rounded-2xl p-4 space-y-3 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-semibold text-white">Cloudinary Media Upload Status</div>
+                      <div className="text-slate-400 mt-0.5">
+                        Signed uploads for product photos, short videos, shop logos, and banners.
+                      </div>
+                    </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-lg border font-semibold inline-flex items-center gap-1.5 ${
+                        settingsData.cloudinaryStatus.configured
+                          ? 'bg-emerald-950/60 border-emerald-700/60 text-emerald-200'
+                          : 'bg-red-950/60 border-red-700/60 text-red-200'
+                      }`}
+                    >
+                      {settingsData.cloudinaryStatus.configured ? (
+                        <>
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Configured</span>
+                        </>
+                      ) : (
+                        <>
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Not Configured</span>
+                        </>
+                      )}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                    <div className="p-2.5 rounded-xl bg-[#070B14] border border-slate-800">
+                      <div className="text-slate-400">Cloud Name</div>
+                      <div className="text-slate-100 font-mono-nums mt-0.5 truncate">
+                        {settingsData.cloudinaryStatus.cloudName || 'Not set'}
+                      </div>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-[#070B14] border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-300 font-mono-nums">CLOUDINARY_CLOUD_NAME</span>
+                      {settingsData.cloudinaryStatus.hasCloudName ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-400 shrink-0" />
+                      )}
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-[#070B14] border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-300 font-mono-nums">CLOUDINARY_API_KEY</span>
+                      {settingsData.cloudinaryStatus.hasApiKey ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-400 shrink-0" />
+                      )}
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-[#070B14] border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-300 font-mono-nums">CLOUDINARY_API_SECRET</span>
+                      {settingsData.cloudinaryStatus.hasApiSecret ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-400 shrink-0" />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="text-[11px] text-slate-400">
+                    Credential source:{' '}
+                    <span className="text-slate-200 font-medium">
+                      {settingsData.cloudinaryStatus.source === 'individual_vars'
+                        ? 'Worker environment variables'
+                        : settingsData.cloudinaryStatus.source === 'cloudinary_url'
+                        ? 'CLOUDINARY_URL'
+                        : settingsData.cloudinaryStatus.source === 'mixed'
+                        ? 'Mixed Worker variables + CLOUDINARY_URL'
+                        : 'Missing / incomplete'}
+                    </span>
                   </div>
                 </div>
               )}

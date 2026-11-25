@@ -36,6 +36,7 @@ function createSessionForTelegramUser(
   userAgent: string
 ) {
   const tgId = String(tgUser.id);
+  const isAdmin = Boolean(resolveAdminContext(tgId));
   const existing = db
     .prepare('SELECT * FROM users WHERE telegram_id = ?')
     .get(tgId) as Record<string, unknown> | undefined;
@@ -63,12 +64,14 @@ function createSessionForTelegramUser(
       safePhotoUrl,
       sanitizeText(tgUser.language_code || 'en', 10)
     );
-    db.prepare(
-      `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
-    ).run(newId('role'), userId);
-    db.prepare(
-      `INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`
-    ).run(userId);
+    if (!isAdmin) {
+      db.prepare(
+        `INSERT OR IGNORE INTO user_roles (id, user_id, role, granted_by) VALUES (?, ?, 'buyer', 'telegram_auth')`
+      ).run(newId('role'), userId);
+      db.prepare(
+        `INSERT OR IGNORE INTO ai_permissions (user_id, ai_enabled) VALUES (?, 1)`
+      ).run(userId);
+    }
   } else {
     userId = String(existing.id);
     if (existing.status === 'suspended') {
@@ -88,6 +91,10 @@ function createSessionForTelegramUser(
       safePhotoUrl,
       userId
     );
+  }
+
+  if (isAdmin) {
+    db.prepare("DELETE FROM user_roles WHERE user_id = ? AND role = 'buyer'").run(userId);
   }
 
   const existingSess = resolveUserSessionDetailed(req);
@@ -124,7 +131,6 @@ function createSessionForTelegramUser(
     ).run(sessionId, userId, tokenHash, ipAddress, userAgent.slice(0, 200), expiresAt);
   }
 
-  const isAdmin = Boolean(resolveAdminContext(tgId));
   const jwtToken = signJwt({ sub: userId, tid: tgId, sid: sessionId, adm: isAdmin }, 7 * 86400);
 
   return { userId, jwtToken, expiresAt, isAdmin };
@@ -187,6 +193,7 @@ authRouter.post('/telegram', rateLimit(30, 60_000, 'auth'), (req, res) => {
       token: jwtToken,
       expiresAt,
       isAdmin,
+      mode: isAdmin ? 'admin' : 'marketplace',
       diagnostics: {
         receivedInitData: initData.length > 0,
         initDataLength: initData.length,
@@ -239,6 +246,24 @@ authRouter.get('/me', (req, res) => {
   }
   const user = sessionRes.user;
 
+  if (user.isAdmin) {
+    return res.json({
+      authenticated: true,
+      mode: 'admin',
+      user: {
+        ...user,
+        mode: 'admin',
+        roles: [],
+        aiEnabled: false,
+      },
+      sellerProfile: null,
+      shop: null,
+      unreadMessages: 0,
+      unreadNotifications: 0,
+      favoriteProductIds: [],
+    });
+  }
+
   const sellerProfile = db
     .prepare('SELECT * FROM seller_profiles WHERE user_id = ?')
     .get(user.id) as Record<string, unknown> | undefined;
@@ -267,8 +292,10 @@ authRouter.get('/me', (req, res) => {
 
   res.json({
     authenticated: true,
+    mode: 'marketplace',
     user: {
       ...user,
+      mode: 'marketplace',
       aiEnabled: aiPerm ? Boolean(aiPerm.ai_enabled) : true,
     },
     sellerProfile: sellerProfile || null,

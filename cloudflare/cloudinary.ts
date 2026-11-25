@@ -68,15 +68,87 @@ export interface VerifiedMediaRecord {
   altText: string;
 }
 
+export interface CloudinaryPublicDiagnostics {
+  configured: boolean;
+  cloudName: string;
+  hasCloudName: boolean;
+  hasApiKey: boolean;
+  hasApiSecret: boolean;
+  source: 'individual_vars' | 'cloudinary_url' | 'mixed' | 'missing';
+}
+
+function cleanCloudinaryCredential(value: unknown): string {
+  let s = String(value ?? '').trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"') && s.length >= 2) ||
+    (s.startsWith("'") && s.endsWith("'") && s.length >= 2)
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function parseCloudinaryUrl(rawUrl: string): { cloudName: string; apiKey: string; apiSecret: string } | null {
+  if (!rawUrl) return null;
+  const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/?#]+)/i);
+  if (!match) return null;
+  try {
+    return {
+      apiKey: decodeURIComponent(match[1]).trim(),
+      apiSecret: decodeURIComponent(match[2]).trim(),
+      cloudName: decodeURIComponent(match[3]).trim(),
+    };
+  } catch {
+    return {
+      apiKey: match[1].trim(),
+      apiSecret: match[2].trim(),
+      cloudName: match[3].trim(),
+    };
+  }
+}
+
 export function getCloudinaryConfigState(env: Env): CloudinaryConfigState {
-  const cloudName = String(env.CLOUDINARY_CLOUD_NAME || '').trim();
-  const apiKey = String(env.CLOUDINARY_API_KEY || '').trim();
-  const apiSecret = String(env.CLOUDINARY_API_SECRET || '').trim();
+  const rawCloudName = cleanCloudinaryCredential(env.CLOUDINARY_CLOUD_NAME);
+  const rawApiKey = cleanCloudinaryCredential(env.CLOUDINARY_API_KEY);
+  const rawApiSecret = cleanCloudinaryCredential(env.CLOUDINARY_API_SECRET);
+  const urlParsed = parseCloudinaryUrl(cleanCloudinaryCredential(env.CLOUDINARY_URL));
+
+  const cloudName = rawCloudName || urlParsed?.cloudName || '';
+  const apiKey = rawApiKey || urlParsed?.apiKey || '';
+  const apiSecret = rawApiSecret || urlParsed?.apiSecret || '';
+
   return {
     configured: Boolean(cloudName && apiKey && apiSecret),
     cloudName,
     apiKey,
     apiSecret,
+  };
+}
+
+export function getCloudinaryPublicDiagnostics(env: Env): CloudinaryPublicDiagnostics {
+  const rawCloudName = cleanCloudinaryCredential(env.CLOUDINARY_CLOUD_NAME);
+  const rawApiKey = cleanCloudinaryCredential(env.CLOUDINARY_API_KEY);
+  const rawApiSecret = cleanCloudinaryCredential(env.CLOUDINARY_API_SECRET);
+  const urlParsed = parseCloudinaryUrl(cleanCloudinaryCredential(env.CLOUDINARY_URL));
+  const state = getCloudinaryConfigState(env);
+
+  const hasIndividual = Boolean(rawCloudName || rawApiKey || rawApiSecret);
+  const hasUrl = Boolean(urlParsed);
+  const source: CloudinaryPublicDiagnostics['source'] = !state.configured
+    ? 'missing'
+    : hasIndividual && hasUrl
+    ? 'mixed'
+    : hasUrl
+    ? 'cloudinary_url'
+    : 'individual_vars';
+
+  return {
+    configured: state.configured,
+    cloudName: state.cloudName,
+    hasCloudName: Boolean(state.cloudName),
+    hasApiKey: Boolean(state.apiKey),
+    hasApiSecret: Boolean(state.apiSecret),
+    source,
   };
 }
 
@@ -291,6 +363,7 @@ function encodePublicIdSegments(publicId: string): string {
 
 export interface CloudinaryResourceDetails {
   public_id: string;
+  asset_folder?: string;
   resource_type: 'image' | 'video';
   format: string;
   bytes: number;
@@ -337,6 +410,7 @@ export async function fetchCloudinaryResourceMetadata(
       ok: true,
       resource: {
         public_id: String(data.public_id || publicId),
+        asset_folder: typeof data.asset_folder === 'string' ? data.asset_folder.trim() : undefined,
         resource_type: data.resource_type === 'video' ? 'video' : 'image',
         format: String(data.format || '').toLowerCase(),
         bytes: Number(data.bytes || 0),
@@ -415,10 +489,13 @@ export async function verifyUploadedCloudinaryAsset(options: {
   }
 
   const publicId = sanitizeText(input.publicId || '', 260);
-  const expectedPrefix =
-    scope === 'shop' ? `sofumer/shops/${sellerUserId}/` : `sofumer/products/${sellerUserId}/`;
+  const expectedFolder =
+    scope === 'shop' ? `sofumer/shops/${sellerUserId}` : `sofumer/products/${sellerUserId}`;
+  const expectedPrefix = `${expectedFolder}/`;
+  const hasExpectedPrefix = publicId.startsWith(expectedPrefix);
+  const isBareGeneratedId = /^(img|vid)_[a-f0-9]+$/i.test(publicId);
 
-  if (!publicId || !publicId.startsWith(expectedPrefix) || !/^[a-zA-Z0-9_/-]+$/.test(publicId)) {
+  if (!publicId || (!hasExpectedPrefix && !isBareGeneratedId) || !/^[a-zA-Z0-9_/-]+$/.test(publicId)) {
     return { ok: false, status: 403, error: 'Invalid or unauthorized Cloudinary asset identifier.' };
   }
 
@@ -445,8 +522,12 @@ export async function verifyUploadedCloudinaryAsset(options: {
   }
   const verified = metaRes.resource;
 
+  if (!hasExpectedPrefix && verified.asset_folder !== expectedFolder) {
+    return { ok: false, status: 403, error: 'Invalid or unauthorized Cloudinary asset folder.' };
+  }
+
   if (!isCloudinaryAssetUrlValid(verified.secure_url, config.cloudName)) {
-    await destroyCloudinaryAsset(config, resourceType, publicId);
+    await destroyCloudinaryAsset(config, resourceType, verified.public_id);
     return { ok: false, status: 400, error: 'Cloudinary asset delivery URL did not match the configured cloud.' };
   }
 
