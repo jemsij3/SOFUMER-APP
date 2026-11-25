@@ -52,6 +52,13 @@ function TelegramOnlyGate() {
     {
       label: 'Cloudflare Worker signature verified',
       ok: authDiagnostics.stageF_signatureVerified,
+      detail:
+        authDiagnostics.stageF_signatureVerified === null &&
+        authDiagnostics.stageD_sentToWorker &&
+        authDiagnostics.meStatus &&
+        authDiagnostics.meStatus >= 500
+          ? `skipped (HTTP ${authDiagnostics.meStatus})`
+          : undefined,
     },
     {
       label: 'Authenticated session active',

@@ -307,8 +307,58 @@ async function handleAuthRoutes(
       })
     );
 
+    let verified: Awaited<ReturnType<typeof verifyTelegramInitDataEdge>>;
     try {
-      const verified = await verifyTelegramInitDataEdge(rawInitData, botToken);
+      verified = await verifyTelegramInitDataEdge(rawInitData, botToken);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Telegram authentication failed';
+      console.warn(
+        '[SOFUMER Worker Auth]',
+        JSON.stringify({
+          stage: 'F_verification_failed',
+          receivedInitData,
+          initDataLength: rawInitData.length,
+          signatureVerified: false,
+          reason: msg,
+        })
+      );
+      if (msg === 'Telegram initData signature mismatch') {
+        const botInfo = await getTelegramBotInfoEdge(env);
+        if (botInfo.botUsername) {
+          return json(
+            {
+              error: `Telegram initData signature mismatch. Server bot token belongs to @${botInfo.botUsername} — verify the Mini App was launched from @${botInfo.botUsername}.`,
+              reason: 'signature_mismatch',
+              diagnostics: {
+                receivedInitData,
+                initDataLength: rawInitData.length,
+                signatureVerified: false,
+                sessionCreated: false,
+                botUsername: botInfo.botUsername,
+              },
+            },
+            401,
+            AUTH_NO_STORE_HEADERS
+          );
+        }
+      }
+      return json(
+        {
+          error: msg,
+          reason: 'telegram_verification_failed',
+          diagnostics: {
+            receivedInitData,
+            initDataLength: rawInitData.length,
+            signatureVerified: false,
+            sessionCreated: false,
+          },
+        },
+        401,
+        AUTH_NO_STORE_HEADERS
+      );
+    }
+
+    try {
       const tgUser = verified.user;
       const tgId = String(tgUser.id);
       const adminCtx = await resolveEdgeAdminContext(env, tgId);
@@ -367,7 +417,16 @@ async function handleAuthRoutes(
         userId = String(existing.id);
         if (existing.status === 'suspended') {
           return json(
-            { error: 'This account has been suspended by platform moderation.' },
+            {
+              error: 'This account has been suspended by platform moderation.',
+              reason: 'user_suspended',
+              diagnostics: {
+                receivedInitData: true,
+                initDataLength: rawInitData.length,
+                signatureVerified: true,
+                sessionCreated: false,
+              },
+            },
             403,
             AUTH_NO_STORE_HEADERS
           );
@@ -466,48 +525,23 @@ async function handleAuthRoutes(
           'Set-Cookie': buildSessionCookie(jwtToken, isHttps, 604800),
         }
       );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Telegram authentication failed';
-      console.warn(
-        '[SOFUMER Worker Auth]',
-        JSON.stringify({
-          stage: 'F_verification_failed',
-          receivedInitData,
-          initDataLength: rawInitData.length,
-          signatureVerified: false,
-          reason: msg,
-        })
+    } catch (dbErr) {
+      console.error(
+        '[SOFUMER Worker Auth DB Error]',
+        dbErr instanceof Error ? dbErr.message : 'unknown'
       );
-      if (msg === 'Telegram initData signature mismatch') {
-        const botInfo = await getTelegramBotInfoEdge(env);
-        if (botInfo.botUsername) {
-          return json(
-            {
-              error: `Telegram initData signature mismatch. Server bot token belongs to @${botInfo.botUsername} — verify the Mini App was launched from @${botInfo.botUsername}.`,
-              diagnostics: {
-                receivedInitData,
-                initDataLength: rawInitData.length,
-                signatureVerified: false,
-                sessionCreated: false,
-                botUsername: botInfo.botUsername,
-              },
-            },
-            401,
-            AUTH_NO_STORE_HEADERS
-          );
-        }
-      }
       return json(
         {
-          error: msg,
+          error: 'Telegram signature verified, but user session storage failed. Please retry shortly.',
+          reason: 'session_db_error',
           diagnostics: {
-            receivedInitData,
+            receivedInitData: true,
             initDataLength: rawInitData.length,
-            signatureVerified: false,
+            signatureVerified: true,
             sessionCreated: false,
           },
         },
-        401,
+        503,
         AUTH_NO_STORE_HEADERS
       );
     }
@@ -752,10 +786,22 @@ export default {
     try {
       const url = new URL(request.url);
 
-      if (env.DB && url.pathname.startsWith('/api/') && url.pathname !== '/api/health') {
+      if (
+        env.DB &&
+        url.pathname.startsWith('/api/') &&
+        url.pathname !== '/api/health' &&
+        url.pathname !== '/api/auth/config'
+      ) {
         const schemaOk = await ensureD1Schema(env.DB);
         if (!schemaOk) {
-          return json({ error: 'Database schema initialization failed. Please retry shortly.' }, 503);
+          return json(
+            {
+              error: 'Database schema initialization failed. Please retry shortly.',
+              reason: 'schema_init_failed',
+            },
+            503,
+            url.pathname.startsWith('/api/auth/') ? AUTH_NO_STORE_HEADERS : {}
+          );
         }
       }
 

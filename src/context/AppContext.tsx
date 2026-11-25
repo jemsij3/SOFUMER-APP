@@ -364,11 +364,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             postAuthError = 'Telegram verification succeeded, but no session token was issued.';
           }
         } catch (err) {
-          clearCachedTelegramInitData();
           setUserToken(null);
-          diag.stageE_workerReceivedInitData = true;
-          diag.stageF_signatureVerified = false;
-          postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
+          if (err instanceof ApiError) {
+            const serverDiag = err.data?.diagnostics as
+              | { receivedInitData?: boolean; signatureVerified?: boolean }
+              | undefined;
+            if (typeof serverDiag?.receivedInitData === 'boolean') {
+              diag.stageE_workerReceivedInitData = serverDiag.receivedInitData;
+            } else if (err.status < 500) {
+              diag.stageE_workerReceivedInitData = true;
+            }
+            if (typeof serverDiag?.signatureVerified === 'boolean') {
+              diag.stageF_signatureVerified = serverDiag.signatureVerified;
+            } else {
+              diag.stageF_signatureVerified = err.status >= 500 ? null : false;
+            }
+            if (err.status < 500 && diag.stageF_signatureVerified === false) {
+              clearCachedTelegramInitData();
+            }
+            postAuthError = err.message;
+          } else {
+            diag.stageF_signatureVerified = null;
+            postAuthError = err instanceof Error ? err.message : 'Telegram Mini App verification failed.';
+          }
         }
       }
 

@@ -3963,6 +3963,129 @@ describe('SOFUMER Cloudflare Worker (sofumer-app)', () => {
     });
     expect(softShopDelRes.status).toBe(200);
   });
+
+  it('29. Legacy pre-0008 production D1 database upgrades cleanly without 503, preserves all existing data, and completes Telegram login + /api/auth/me', async () => {
+    const testEnv = {
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_FOR_VITEST',
+      TELEGRAM_WEBHOOK_SECRET: 'test-webhook-secret-32chars',
+      JWT_SECRET: 'test-jwt-secret-key-at-least-32-chars',
+      ADMIN_TELEGRAM_IDS: '999001',
+    };
+
+    const callWorker = (path, init = {}) => {
+      const ctx = createExecutionContext();
+      return worker
+        .fetch(new Request(`https://sofumer-app.derartuaman8.workers.dev${path}`, init), testEnv, ctx)
+        .then(async (res) => {
+          await waitOnExecutionContext(ctx);
+          return res;
+        });
+    };
+
+    // Count existing production records before reverting schema to pre-0008 state
+    const beforeUsers = await env.DB.prepare('SELECT COUNT(*) as cnt FROM users').first();
+    const beforeShops = await env.DB.prepare('SELECT COUNT(*) as cnt FROM shops').first();
+    const beforeProducts = await env.DB.prepare('SELECT COUNT(*) as cnt FROM products').first();
+    const beforeOrders = await env.DB.prepare('SELECT COUNT(*) as cnt FROM orders').first();
+    expect(Number(beforeUsers.cnt)).toBeGreaterThan(0);
+    expect(Number(beforeShops.cnt)).toBeGreaterThan(0);
+
+    // Revert DB to exact pre-0008 state (indexes + columns missing) while preserving all existing rows
+    await env.DB.prepare('DROP INDEX IF EXISTS idx_shops_deleted_at').run();
+    await env.DB.prepare('ALTER TABLE shops DROP COLUMN deleted_at').run();
+    await env.DB.prepare('ALTER TABLE shops DROP COLUMN deleted_by').run();
+    await env.DB.prepare('ALTER TABLE shops DROP COLUMN deletion_reason').run();
+
+    await env.DB.prepare('DROP INDEX IF EXISTS idx_admin_audit_logs_is_archived').run();
+    await env.DB.prepare('DROP INDEX IF EXISTS idx_admin_audit_logs_is_protected').run();
+    await env.DB.prepare('ALTER TABLE admin_audit_logs DROP COLUMN is_protected').run();
+    await env.DB.prepare('ALTER TABLE admin_audit_logs DROP COLUMN is_archived').run();
+    await env.DB.prepare('ALTER TABLE admin_audit_logs DROP COLUMN archived_at').run();
+    await env.DB.prepare('ALTER TABLE admin_audit_logs DROP COLUMN archived_by').run();
+
+    await env.DB.prepare('DROP INDEX IF EXISTS idx_conversation_participants_hidden').run();
+    await env.DB.prepare('ALTER TABLE conversation_participants DROP COLUMN is_hidden').run();
+
+    await env.DB.prepare('ALTER TABLE reports DROP COLUMN reviewed_by').run();
+    await env.DB.prepare('ALTER TABLE reports DROP COLUMN updated_at').run();
+    await env.DB.prepare('DROP TABLE IF EXISTS admin_audit_log_archives').run();
+    await env.DB.prepare("DELETE FROM platform_settings WHERE key = 'audit_retention_days'").run();
+
+    resetD1BootstrapCacheForTests();
+
+    // 1. /api/health reports dbInitialized: false before upgrade, /api/auth/config still returns 200
+    const healthBefore = await callWorker('/api/health');
+    expect(healthBefore.status).toBe(200);
+    const healthBeforeJson = await healthBefore.json();
+    expect(healthBeforeJson.dbBound).toBe(true);
+    expect(healthBeforeJson.dbInitialized).toBe(false);
+
+    const cfgRes = await callWorker('/api/auth/config');
+    expect(cfgRes.status).toBe(200);
+    const cfgJson = await cfgRes.json();
+    expect(cfgJson.telegramConfigured).toBe(true);
+    expect(cfgJson.jwtConfigured).toBe(true);
+
+    // 2. First Telegram login triggers safe idempotent schema upgrade (NEVER 503!)
+    const initData = await signTelegramInitData(
+      { id: 980001, first_name: 'ProdUser', username: 'prod_migrated_user' },
+      testEnv.TELEGRAM_BOT_TOKEN
+    );
+    const authRes = await callWorker('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData }),
+    });
+    expect(authRes.status).toBe(200);
+    const authJson = await authRes.json();
+    expect(authJson.authenticated).toBe(true);
+    expect(authJson.diagnostics.signatureVerified).toBe(true);
+    expect(authJson.diagnostics.sessionCreated).toBe(true);
+    expect(typeof authJson.token).toBe('string');
+
+    // 3. /api/auth/me and /api/marketplace/home succeed cleanly
+    const meRes = await callWorker('/api/auth/me', {
+      headers: { Authorization: `Bearer ${authJson.token}` },
+    });
+    expect(meRes.status).toBe(200);
+    const meJson = await meRes.json();
+    expect(meJson.authenticated).toBe(true);
+    expect(meJson.user.telegram_id).toBe('980001');
+
+    const homeRes = await callWorker('/api/marketplace/home', {
+      headers: { Authorization: `Bearer ${authJson.token}` },
+    });
+    expect(homeRes.status).toBe(200);
+
+    // 4. Health confirms schema is now initialized and all pre-existing rows were preserved
+    const healthAfter = await callWorker('/api/health');
+    expect(healthAfter.status).toBe(200);
+    expect((await healthAfter.json()).dbInitialized).toBe(true);
+
+    const afterUsers = await env.DB.prepare('SELECT COUNT(*) as cnt FROM users').first();
+    const afterShops = await env.DB.prepare('SELECT COUNT(*) as cnt FROM shops').first();
+    const afterProducts = await env.DB.prepare('SELECT COUNT(*) as cnt FROM products').first();
+    const afterOrders = await env.DB.prepare('SELECT COUNT(*) as cnt FROM orders').first();
+    expect(Number(afterUsers.cnt)).toBe(Number(beforeUsers.cnt) + 1);
+    expect(Number(afterShops.cnt)).toBe(Number(beforeShops.cnt));
+    expect(Number(afterProducts.cnt)).toBe(Number(beforeProducts.cnt));
+    expect(Number(afterOrders.cnt)).toBe(Number(beforeOrders.cnt));
+
+    // 5. Wrong bot token still cleanly fails Telegram HMAC with 401 signature mismatch (not 503)
+    const badTokenInit = await signTelegramInitData(
+      { id: 980002, first_name: 'WrongBot', username: 'wrong_bot' },
+      '999999:WRONG_BOT_TOKEN'
+    );
+    const badRes = await callWorker('/api/auth/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData: badTokenInit }),
+    });
+    expect(badRes.status).toBe(401);
+    const badJson = await badRes.json();
+    expect(badJson.diagnostics.signatureVerified).toBe(false);
+  });
 });
 
 

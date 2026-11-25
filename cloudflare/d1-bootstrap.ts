@@ -134,7 +134,6 @@ const SCHEMA_STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_shops_country_code ON shops(country_code)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_status ON shops(status)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_is_featured ON shops(is_featured)`,
-  `CREATE INDEX IF NOT EXISTS idx_shops_deleted_at ON shops(deleted_at)`,
   `CREATE INDEX IF NOT EXISTS idx_shops_created_at ON shops(created_at)`,
 
   `CREATE TABLE IF NOT EXISTS shop_verifications (
@@ -321,7 +320,6 @@ const SCHEMA_STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_conversation_participants_conversation_id ON conversation_participants(conversation_id)`,
   `CREATE INDEX IF NOT EXISTS idx_conversation_participants_user_id ON conversation_participants(user_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_conversation_participants_hidden ON conversation_participants(user_id, is_hidden)`,
 
   `CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -638,8 +636,6 @@ const SCHEMA_STATEMENTS: string[] = [
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at ON admin_audit_logs(created_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_archived ON admin_audit_logs(is_archived)`,
-  `CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_is_protected ON admin_audit_logs(is_protected)`,
 
   // 12. Support, Notifications & Telegram Bot Idempotency
   `CREATE TABLE IF NOT EXISTS notifications (
@@ -1023,8 +1019,15 @@ async function hasColumn(db: D1Database, table: string, column: string): Promise
 
 async function ensureColumn(db: D1Database, table: string, column: string, definition: string): Promise<void> {
   const exists = await hasColumn(db, table, column);
-  if (!exists) {
+  if (exists) return;
+  try {
     await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    if (msg.includes('duplicate column') || (await hasColumn(db, table, column))) {
+      return;
+    }
+    throw err;
   }
 }
 
@@ -1108,8 +1111,6 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
         await db.batch(chunk.map((sql) => db.prepare(sql)));
       }
 
-      await db.batch(UPGRADE_STATEMENTS.map((sql) => db.prepare(sql)));
-
       await ensureColumn(db, 'shops', 'deleted_at', 'TEXT');
       await ensureColumn(db, 'shops', 'deleted_by', "TEXT DEFAULT ''");
       await ensureColumn(db, 'shops', 'deletion_reason', "TEXT DEFAULT ''");
@@ -1120,6 +1121,8 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
       await ensureColumn(db, 'conversation_participants', 'is_hidden', 'INTEGER NOT NULL DEFAULT 0');
       await ensureColumn(db, 'reports', 'reviewed_by', "TEXT DEFAULT ''");
       await ensureColumn(db, 'reports', 'updated_at', "TEXT DEFAULT ''");
+
+      await db.batch(UPGRADE_STATEMENTS.map((sql) => db.prepare(sql)));
 
       await db.batch([
         db.prepare('CREATE INDEX IF NOT EXISTS idx_shops_deleted_at ON shops(deleted_at)'),
@@ -1141,8 +1144,11 @@ export async function ensureD1Schema(db?: D1Database): Promise<boolean> {
         ),
       ]);
 
-      schemaVerified = true;
-      return true;
+      const verified = await isD1Initialized(db);
+      if (verified) {
+        schemaVerified = true;
+      }
+      return verified;
     } catch (err) {
       console.error(
         'D1 schema auto-bootstrap error:',
